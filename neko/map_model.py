@@ -16,6 +16,15 @@ from typing import Optional
 
 # kind(组件类型名) → 语义
 # 键一律小写, 对应 SceneScanner.StationTypes 里的类型名。
+#
+# ⚠ 这张表**故意不全** —— `classify()` 是**两段式**的, 别把下面这 4 个键补进来:
+#     cookingstation / heatedcookingstation  → 要再看 `sub`(m_stationType) 才分得出
+#                                              Hob/Oven/DeepFatFryer/…, 直接映射成 "hob"
+#                                              会把烤箱炸锅全打死
+#     workstation                            → 恒为 board
+#     attachstation                          → 恒为 counter
+#   这 4 个走 `classify()` 里的显式分支(它们在 StationTypes 里必须**排在派生类之后**,
+#   见 SceneScanner.StationTypes 顶部的注释)。补进这张表 = 吞掉 sub 判断。
 _KIND_SEM = {
     # 盘子体系
     "platestation": "serve",          # 送餐口
@@ -86,6 +95,49 @@ def is_plate(name: str = "", tag: str = "") -> bool:
     return "plate" in (name or "").lower()
 
 
+def is_extinguisher(name: str = "", tag: str = "") -> bool:
+    """这东西是不是**灭火器 / 水枪**(能喷的厨具)。
+
+    为什么要有正面判据(用户提的"地图建模是否还有遗漏"):
+      原来只在 `is_pot()` 里**反向排除**它("别把灭火器当锅"), 于是它在内容清单里
+      归进"其他" —— 而**有的关卡必须靠它灭火**(s_balloon_5_2 开局就 5 处着火,
+      还有 `air_balloon_burner_flame_on` 持续点火)。引擎连"这是灭火器"都不知道。
+
+    判据只能靠**名字**: 它的 Unity Tag 是 `Untagged`(实测),
+    所以 tag 一点忙都帮不上 —— 而锅是 `CookingUtensil`、盘子是 `Plate`。
+
+    依据(反编译):
+      · `FireExtinguishSpray : SprayingUtensil`(FireExtinguishSpray.cs:3, m_exinguishTime=0.5)
+      · `ServerFireExtinguishSpray`(ServerFireExtinguishSpray.cs) 拿着它的人自己不会着火
+      · `WaterGunSpray : FireExtinguishSpray`(WaterGunSpray.cs:3) —— 水枪是它的亲兄弟,
+        除了灭火还能清洗和击退, 所以一并认进来。
+    """
+    n = (name or "").lower()
+    return ("extinguish" in n) or ("water_gun" in n) or ("watergun" in n) or ("hose" in n)
+
+
+def is_tool(name: str = "", tag: str = "") -> bool:
+    """能拿在手上"用"的厨具(锅/灭火器/水枪…)—— 给内容清单分类用。
+
+    注意**不是** `tag == CookingUtensil` 就够: 灭火器的 tag 是 Untagged。
+    """
+    return is_pot(name, tag) or is_extinguisher(name, tag)
+
+
+def _norm_name(s: str) -> str:
+    """只留字母数字, 用于比物品名(和 `engine.Engine._norm` 同一套约定)。
+
+    先剥掉实例编号后缀: 场里同类物品叫 "SushiPrawn (2)"、"Plate 5 (3)"、
+    "utensil_pot_01 (1)", 而计划里用的是 "SushiPrawn"。
+    不剥就只能靠子串包含兜底, 那会误判(SushiPrawn 与 SushiPrawnCooked 互相包含)。
+    """
+    import re as _re
+    t = (s or "").strip()
+    t = _re.sub(r"\s*\(\d+\)\s*$", "", t)
+    t = _re.sub(r"\s+\d+\s*$", "", t)
+    return "".join(ch for ch in t.lower() if ch.isalnum())
+
+
 @dataclass
 class Station:
     id: str                    # 语义 id: crate0/board0/serve0...
@@ -138,6 +190,24 @@ class Chef:
 
 
 @dataclass
+class Item:
+    """**全场景按 tag 找出来的食材** —— 游戏自己的 `GameUtils.GetAllIngredients()`
+    (`GameUtils.cs:504`: tag `Pre-Ingredient` ∪ `Ingredient`)那个视角。
+
+    为什么和 `Station.on` 并存: 两边的**范围不同**。
+      · `Station.on` = 挂在我们扫的那 25 个台面类型下的东西 —— 能知道"在哪个台面上"
+      · `Item`       = 游戏认为"场上有哪些食材"的全部 —— **包括掉在地上的、
+                       在移动平台/荷叶上的、任何不在台面下的**
+    所以拿它当"有没有漏"的对照: 某件食材在 `items` 里但不在任何 `Station.on` 里、
+    也不在任何厨师的 `held` 里 ⇒ 就是**我们地图看不见的东西**。
+    """
+    name: str
+    tag: str                   # Pre-Ingredient(生料) / Ingredient(处理过的)
+    x: float
+    z: float
+
+
+@dataclass
 class Cooking:
     """正在灶上的东西。state 为 Cooked 时才是订单要的状态(Raw/Burnt 都不匹配)。
 
@@ -186,6 +256,31 @@ class KitchenMap:
     stations: dict = field(default_factory=dict)   # semantic id -> Station
     chefs: list = field(default_factory=list)
     cooking: list = field(default_factory=list)
+    #: 全场景按 tag 找的食材(游戏 GetAllIngredients 的视角) —— 用来查"我们漏了什么"
+    items: list = field(default_factory=list)
+
+    def unseen_items(self) -> list:
+        """**我们地图看不见的食材**: 在 `items` 里, 但既不在任何台面的 `on`/`onhas` 里,
+        也不在任何厨师手上。
+
+        这是回答"地图建模还有遗漏吗"的直接手段 ——
+        比如掉在地上的料、放在移动平台上的料, 都会出现在这里。
+        """
+        seen = set()
+        for s in self.stations.values():
+            for i, o in enumerate(s.on or []):
+                seen.add(_norm_name(o))
+                for part in (s.has_of(i) or "").split("+"):
+                    if part.strip():
+                        seen.add(_norm_name(part))
+        for c in self.chefs:
+            if c.held:
+                seen.add(_norm_name(c.held))
+        out = []
+        for it in self.items:
+            if _norm_name(it.name) not in seen:
+                out.append(it)
+        return out
 
     # ---- 语义归类 ----
     @staticmethod
@@ -218,11 +313,36 @@ class KitchenMap:
             return "bin"
         return k or "unknown"
 
+    @staticmethod
+    def _station_sort_key(s: dict):
+        """给台面排一个**稳定**的序 —— 决定 `counter0/counter1/...` 谁是谁。
+
+        优先用游戏给的 `iid`(Unity instanceID, 物体存活期内不变);
+        老 dll 没有这个字段时退回 `名字+坐标`, 也比"枚举顺序"稳。
+        """
+        iid = s.get("iid")
+        if isinstance(iid, int):
+            return (0, iid, "", 0.0, 0.0)
+        return (1, 0, str(s.get("name", "")),
+                float(s.get("x", 0) or 0), float(s.get("z", 0) or 0))
+
     @classmethod
     def from_layout(cls, layout: dict) -> "KitchenMap":
         km = cls()
         counters = {}
-        for s in layout.get("stations") or []:
+        # ⚠ **先按游戏的 instanceID 排序, 再编号**。
+        #
+        # `sid` 是 `语义+序号`(counter0/counter1/...) 形式的, 而序号原来是"按 C# 数组
+        # 的出现顺序"编的 —— 那个顺序来自 `FindObjectsOfType`, **不保证稳定**。
+        # 台面增删(着火、关卡变形、物件被拆)都会让后面所有 sid 平移。
+        #
+        # 这不是洁癖: `engine._assemble_sid` 靠 `counter7` 认回"上一次放半成品的那个台面",
+        # sid 一漂它就会认到**另一个台面**上 —— 那正是"同一份材料反复取"的病根之一。
+        # 按 iid 排完序, 同一局内 sid 与物理台面就是一一对应的。
+        #
+        # 老 dll 没有 iid → 退回按 名字+坐标 排, 仍比枚举顺序稳。
+        stations = sorted(layout.get("stations") or [], key=cls._station_sort_key)
+        for s in stations:
             sem = cls.classify(s.get("name", ""), s.get("kind", ""),
                                s.get("sub", ""), s.get("spawn", ""))
             n = counters.get(sem, 0)
@@ -241,6 +361,10 @@ class KitchenMap:
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
                 held=c.get("held", ""), player=c.get("player", "")))
+        for it in layout.get("items") or []:
+            km.items.append(Item(
+                name=it.get("name", ""), tag=it.get("tag", ""),
+                x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0)))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),

@@ -133,6 +133,10 @@ namespace Overcooked2AI.Game
             // 机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 火 / 关卡变形
             if (line.Contains("\"dyn\""))
                 return _collector.RequestJob("dyn", 8000);
+            // 灭火器诊断: 喷雾的两个触发字符串(只在 prefab 里, 静态读不到) + 组件清单。
+            // 见 InteractiveScan.SprayDiag() 的注释。
+            if (line.Contains("\"spray\""))
+                return _collector.RequestJob("spray", 6000);
             // 游戏自己的网格: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。
             // 依据 GridManager.cs:9,64-92 与 QuadGridManager.cs:28-38 —— 这是"解析地图"的权威依据,
             // 不是我们自己采样推断的那套。

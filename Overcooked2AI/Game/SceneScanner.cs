@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 
@@ -63,13 +64,106 @@ namespace Overcooked2AI.Game
             "PlayerControls", "ChefAvatarSynchroniser",
         };
 
-        public static string Scan()
+        // ---------------------------------------------------------------- 静态缓存
+        //
+        // 为什么要拆(用户提的"实时地图"):
+        //   原实现每次 Scan() 都对 23 个类型各做一次 FindObjectsOfType
+        //   (= 23 次**全场景**遍历), 再加每台一次 DescribeStation(内含 3 次
+        //   GetComponentInChildren + 若干反射)。这个开销只能在 1Hz 下勉强跑,
+        //   而"台面上现在放着什么"恰恰是最需要新鲜的数据 ——
+        //   引擎靠它判断"这个材料已经放上去了没有"(见 engine._skip_already_on_spot)。
+        //
+        // 拆成两层:
+        //   · **静态**(身份/几何): 找对象那 23 次遍历 + tag/sub/spawn/plate ——
+        //     一关只做一次, 之后只做 5 秒一次的兜底重扫(应对会中途变形的关卡,
+        //     见 docs/关卡逆向/02)。**引用缓存下来, 不再重复找对象**。
+        //   · **动态**(内容): 每帧走一遍缓存的 Transform 读 childCount/子物体名 ——
+        //     微秒级, 不碰 FindObjectsOfType。
+        //
+        // ⚠ `onhas` 是动态层里最贵的一项: 它走反射(ItemKnowledge.ContentsNames
+        //   → GetContents() 的 MethodInfo.Invoke)。DynamicInterval 默认 0.1 秒
+        //   就是为它留的余量; 想更实时可以调到 0, 但 60Hz 下请先实测帧率。
+        private sealed class StationRef
         {
+            public GameObject go;
+            public Transform attach;      // 内容物挂点(Stack 优先, 否则 AttachStation.m_attachPoint)
+            public string typeName = "", name = "", tag = "", sub = "", spawn = "", plate = "";
+            public int iid;
+            /// <summary>静态部分已经拼好的 JSON 片段(tag/sub/spawn/plate)。**只有这些是缓存的** ——
+            /// 坐标不缓存(锅会被端走、可推物体会动), 每帧从 `go.transform.position` 现读。</summary>
+            public string staticJson = "";
+            /// <summary>上一次算出来的 onhas(反射贵, 所以节流)。</summary>
+            public string lastHas = "";
+            public float lastHasAt = -99f;
+        }
+
+        /// <summary>易变类型: 会中途出现/消失的。**每帧重扫** —— 只有这 3 个
+        /// (≈ 3 次全场景遍历), 剩下 20 个固定类型才走 5 秒兜底(23 次)。
+        /// 火会烧起来也会灭; 可推物体按设计就会动。</summary>
+        private static readonly string[] VolatileTypes =
+        {
+            "FireHazard", "SplatHazard", "PushableObject",
+        };
+
+        private static List<StationRef> _cache;
+        private static string _cacheScene = "";
+        private static float _cacheBuiltAt;
+
+        /// <summary>`on`/`ontags`/`onhas`/`ing` 每个台面最多报几件。
+        /// 原值是 3 —— 台面堆到第 4 件就看不见了(而传送带关卡很容易堆)。放宽到 6。
+        /// 上限存在的意义只是别让一个堆满的台面把整条状态撑爆。</summary>
+        public const int MaxOnShown = 6;
+
+        /// <summary>固定台面的重扫间隔(秒) —— 只为"发现新建的固定台面"和变形关卡兜底。</summary>
+        public static float StaticRescanInterval = 5f;
+        /// <summary>`onhas`(容器里装了什么, 走反射)的刷新间隔(秒)。0 = 每帧。
+        /// 其余动态字段(n/on/ontags)一律每帧 —— 它们只是走一遍 Transform。</summary>
+        public static float OnhasInterval = 0.1f;
+
+        /// <summary>每次都由 StateCollector **每帧**调 —— 静态身份走缓存, 动态内容/位置每帧读。
+        ///
+        /// ⚠ 用户指出的要点: **本游戏没有绝对静态的台面** —— 食材会放到台面上, 锅会被端走,
+        ///   可推物体本来就会动, 火会烧起来也会灭。所以:
+        ///     · **位置和存活每帧从缓存引用重读**(一次 transform.position 是微秒级的),
+        ///       缓存里焊死的只有"身份"(tag/sub/spawn/plate/名字)和引用本身。
+        ///     · **易变类型每帧重扫**(只有 3 个: 火/油渍/可推物体) —— 这样"新烧起来的火"
+        ///       当帧就能看见, 而不是等 5 秒兜底。
+        ///     · 被销毁的(`go == null`)每帧剔除。
+        /// </summary>
+        /// <summary>兼容接口: 台面 + 烹饪一起出。台面每帧、烹饪 0.1 秒由调用方各自控制。</summary>
+        public static string Scan(bool force = false)
+        {
+            return string.Format("{{\"stations\":{0},\"cooking\":{1}}}",
+                                 ScanStations(force), ScanCooking());
+        }
+
+        /// <summary>**只出台面数组** —— 由 StateCollector **每帧**调用。</summary>
+        public static string ScanStations(bool force = false)
+        {
+            float now = Time.realtimeSinceStartup;
+            EnsureStationCache(force);
+
             var stations = new StringBuilder();
-            int stationCount = 0;
+            stations.Append("[");
+            int n = 0;
             var seen = new Dictionary<int, int>();
 
-            foreach (var tn in StationTypes)
+            // ① 缓存的固定台面: 身份用缓存, 位置/内容/存活现读
+            var cache = _cache;
+            if (cache != null)
+            {
+                for (int i = 0; i < cache.Count; i++)
+                {
+                    var r = cache[i];
+                    if (r.go == null)          // 被销毁(换关/被拆) → 剔除
+                        continue;
+                    seen[r.iid] = 1;
+                    AppendRef(stations, ref n, r, now);
+                }
+            }
+
+            // ② 易变类型: 每帧重扫(3 个类型 ≈ 3 次全场景遍历, 不是 23 次)
+            foreach (var tn in VolatileTypes)
             {
                 var type = FindType(tn);
                 if (type == null)
@@ -82,29 +176,42 @@ namespace Overcooked2AI.Game
                         var go = GetGameObject(o);
                         if (go == null)
                             continue;
-                        // 去重: 同一物体只归入优先级更高的那个类型
                         int iid = go.GetInstanceID();
                         if (seen.ContainsKey(iid))
                             continue;
                         seen[iid] = 1;
-                        var pos = go.transform.position;
-                        string extra = DescribeStation(go, tn);
-                        if (stationCount > 0)
-                            stations.Append(",");
-                        stations.Append(string.Format(
-                            "{{\"id\":\"{0}_{1}\",\"kind\":\"{2}\",\"name\":\"{3}\",\"x\":{4:F2},\"y\":{5:F2},\"z\":{6:F2}{7}}}",
-                            tn, stationCount, tn, SafeName(go.name),
-                            pos.x, pos.y, pos.z, extra));
-                        stationCount++;
+                        AppendRef(stations, ref n, MakeRef(go, tn), now);
                     }
                 }
                 catch (Exception) { }
             }
 
             // 厨师位置单独走高频刷新(ScanChefs), 这里不再包含
-            return string.Format(
-                "{{\"stations\":[{0}],\"cooking\":[{1}]}}",
-                stations, ScanCooking());
+            stations.Append("]");
+            return stations.ToString();
+        }
+
+        /// <summary>把一条台面记录拼成 JSON(位置每帧现读, 内容按 DynamicInterval 节流)。</summary>
+        private static void AppendRef(StringBuilder stations, ref int n, StationRef r, float now)
+        {
+            if (r.go == null)
+                return;
+            float x, y, z;
+            try
+            {
+                var pos = r.go.transform.position;   // ← 每帧重读, 不缓存坐标
+                x = pos.x; y = pos.y; z = pos.z;
+            }
+            catch (Exception) { return; }
+
+            if (n > 0)
+                stations.Append(",");
+            stations.Append(string.Format(
+                System.Globalization.CultureInfo.InvariantCulture,
+                "{{\"id\":\"{0}_{1}\",\"iid\":{2},\"kind\":\"{3}\",\"name\":\"{4}\",\"x\":{5:F2},\"y\":{6:F2},\"z\":{7:F2}{8}{9}}}",
+                r.typeName, n, r.iid, r.typeName, SafeName(r.name), x, y, z,
+                r.staticJson, DescribeDynamic(r, now)));
+            n++;
         }
 
         /// <summary>只扫厨师(含手持物)。很轻, 给高频刷新用 ——
@@ -357,7 +464,63 @@ namespace Overcooked2AI.Game
         /// <summary>正在烹饪的物体: 进度/状态/是否烧焦/需要的灶台。
         /// 依据 CookingHandler.GetCookedOrderState: progress<=cookTime 为 Raw, >2*cookTime 为 Burnt,
         /// 中间的 Cooked 才是订单要的 —— 所以"什么时候从灶上取下"必须依据这里的实时进度。</summary>
-        private static string ScanCooking()
+        /// <summary>**全场景按 tag 找食材** —— 照抄游戏自己的 `GameUtils.GetAllIngredients()`
+        /// (`GameUtils.cs:504-509`: `FindGameObjectsWithTag("Pre-Ingredient")
+        ///                      .Union(FindGameObjectsWithTag("Ingredient"))`)。
+        ///
+        /// 为什么必须有这一条(用户提的"地图建模是否还有遗漏"):
+        ///   我们原来的食材只从三个地方来 —— `station.on` / `station.onhas` / `chef.held`。
+        ///   **不在台面上的食材完全看不见**: 掉在地上的、在移动平台/荷叶上的、
+        ///   任何不在我们扫的那 25 个台面类型下的。
+        ///   而"场上有哪些食材"的权威定义就是游戏那两个 tag。
+        ///
+        /// 成本: 2 次 `FindGameObjectsWithTag`(比 `FindObjectsOfType` 便宜, 走 tag 索引),
+        ///       所以挂在 0.1 秒档, 不跟台面一起每帧跑。
+        /// </summary>
+        public static string ScanItems()
+        {
+            var sb = new StringBuilder();
+            sb.Append("[");
+            int n = 0;
+            var seen = new Dictionary<int, int>();
+            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient" })
+            {
+                GameObject[] objs = null;
+                try { objs = GameObject.FindGameObjectsWithTag(tag); }
+                catch (Exception) { continue; }
+                if (objs == null)
+                    continue;
+                foreach (var go in objs)
+                {
+                    if (go == null)
+                        continue;
+                    int iid = go.GetInstanceID();
+                    if (seen.ContainsKey(iid))
+                        continue;
+                    seen[iid] = 1;
+                    float x, z;
+                    try
+                    {
+                        var pos = go.transform.position;
+                        x = pos.x; z = pos.z;
+                    }
+                    catch (Exception) { continue; }
+                    if (n > 0)
+                        sb.Append(",");
+                    sb.Append(string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{{\"name\":\"{0}\",\"tag\":\"{1}\",\"x\":{2:F2},\"z\":{3:F2}}}",
+                        SafeName(go.name), SafeName(tag), x, z));
+                    n++;
+                }
+            }
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        /// <summary>烹饪进度(1× FindObjectsOfType + 每口锅几次反射)。由调用方定节奏 ——
+        /// 现在挂在 StateCollector 的 0.1 秒档, 不跟台面一起每帧跑。</summary>
+        public static string ScanCooking()
         {
             var sb = new StringBuilder();
             int n = 0;
@@ -658,7 +821,239 @@ namespace Overcooked2AI.Game
 
         private static readonly Dictionary<string, Type> _typeCache = new Dictionary<string, Type>();
 
-        private static string DescribeStation(GameObject go, string typeName)
+        /// <summary>建/刷新**固定**台面缓存。贵的那 20 次 FindObjectsOfType 只在这里做。
+        /// 易变类型(火/油渍/可推物体)不进缓存 —— 它们由 Scan() 每帧另扫。</summary>
+        private static void EnsureStationCache(bool force)
+        {
+            string scene = "";
+            try { scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name; }
+            catch (Exception) { }
+
+            if (!force && _cache != null && _cacheScene == scene
+                && Time.realtimeSinceStartup - _cacheBuiltAt < StaticRescanInterval)
+                return;
+
+            var list = new List<StationRef>();
+            var seen = new Dictionary<int, int>();
+            foreach (var tn in StationTypes)
+            {
+                if (IsVolatile(tn))
+                    continue;                  // 每帧另扫, 见 Scan()
+                var type = FindType(tn);
+                if (type == null)
+                    continue;
+                try
+                {
+                    var objs = UnityEngine.Object.FindObjectsOfType(type);
+                    foreach (var o in objs)
+                    {
+                        var go = GetGameObject(o);
+                        if (go == null)
+                            continue;
+                        // 去重: 同一物体只归入优先级更高的那个类型
+                        int iid = go.GetInstanceID();
+                        if (seen.ContainsKey(iid))
+                            continue;
+                        seen[iid] = 1;
+                        list.Add(MakeRef(go, tn));
+                    }
+                }
+                catch (Exception) { }
+            }
+            _cache = list;
+            _cacheScene = scene;
+            _cacheBuiltAt = Time.realtimeSinceStartup;
+        }
+
+        /// <summary>作废静态缓存(换关卡/下一局时调)。下一次 ScanStations 会重建。</summary>
+        public static void InvalidateStationCache()
+        {
+            _cache = null;
+            _cacheScene = "";
+        }
+
+        private static bool IsVolatile(string typeName)
+        {
+            for (int i = 0; i < VolatileTypes.Length; i++)
+                if (VolatileTypes[i] == typeName)
+                    return true;
+            return false;
+        }
+
+        /// <summary>给一个台面物体建缓存记录 —— 只有身份是"算一次"的, 坐标不存(每帧现读)。</summary>
+        private static StationRef MakeRef(GameObject go, string typeName)
+        {
+            var r = new StationRef { go = go, typeName = typeName, name = go.name };
+            try { r.iid = go.GetInstanceID(); } catch (Exception) { }
+            try { r.tag = go.tag; } catch (Exception) { }
+            r.attach = AttachPointOf(go);
+            r.staticJson = DescribeStatic(go, typeName);
+            return r;
+        }
+
+        /// <summary>台面上内容物的挂点: Stack 优先(它可能被移动), 否则 AttachStation.m_attachPoint。
+        /// 物品是挂在它下面的**子 Transform**, 不是字段 —— 所以只能看子物体。
+        /// 这是"物品传递/接力(a 放台面 → b 接手)"唯一的观测手段。</summary>
+        private static Transform AttachPointOf(GameObject go)
+        {
+            Transform ap = null;
+            try
+            {
+                var at = FindType("AttachStation");
+                if (at != null)
+                {
+                    var comp = go.GetComponent(at);
+                    if (comp != null)
+                    {
+                        var f = at.GetField("m_attachPoint");
+                        if (f != null)
+                            ap = f.GetValue(comp) as Transform;
+                    }
+                }
+                var st = FindType("Stack");
+                if (st != null)
+                {
+                    var comp = go.GetComponent(st);
+                    if (comp != null)
+                    {
+                        var gm = st.GetMethod("GetAttachPoint");
+                        if (gm != null)
+                        {
+                            try
+                            {
+                                var tr = gm.Invoke(comp, new object[] { null }) as Transform;
+                                if (tr != null && (ap == null || tr.childCount > 0))
+                                    ap = tr;
+                            }
+                            catch (Exception) { }
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            return ap;
+        }
+
+        /// <summary>台面的**内容**部分 —— 每帧重算(用户提的"实时地图")。
+        ///
+        /// `n` / `on` / `ontags` 每帧都算(只是走一遍 Transform, 微秒级);
+        /// `onhas` 走**反射**(ItemKnowledge.ContentsNames → GetContents() 的
+        /// MethodInfo.Invoke), 按 OnhasInterval 节流并复用上一次的值。
+        ///
+        /// ⚠ ontags/onhas 必须和 on **同步、同长**(Python 侧按下标一一对应):
+        ///   ontags = 游戏自己的 Unity Tag(锅=CookingUtensil / 盘=Plate)
+        ///   onhas  = 这个东西容器里装了什么 —— 判"这个盘子是不是空的"。
+        ///   拿一个装了菜的盘子去锅边按交互会把菜倒进锅里(方向正好相反),
+        ///   所以取菜前必须能认出空盘。三个数组的长度必须一致。
+        /// </summary>
+        private static string DescribeDynamic(StationRef r, float now)
+        {
+            var sb = new StringBuilder();
+            if (r.go == null)
+                return "";
+
+            // 台上/容器里的食材(CookableIngredient)
+            //
+            // ⚠ 原来用 `GetComponentInChildren` —— **只返回第一个**。一个盘子装三样菜时
+            //   只报一样。改成收集**全部**, 用 "+" 拼起来(和 onhas 的拼法一致)。
+            try
+            {
+                var ingType = FindType("CookableIngredient");
+                if (ingType != null)
+                {
+                    var ings = r.go.GetComponentsInChildren(ingType);
+                    if (ings != null && ings.Length > 0)
+                    {
+                        var f = ingType.GetField("m_ingredientOrderNode");
+                        if (f != null)
+                        {
+                            var names = new StringBuilder();
+                            int got = 0;
+                            for (int k = 0; k < ings.Length && got < MaxOnShown; k++)
+                            {
+                                if (ings[k] == null)
+                                    continue;
+                                var node = f.GetValue(ings[k]);
+                                if (node == null)
+                                    continue;
+                                var np = node.GetType().GetProperty("name");
+                                if (np == null)
+                                    continue;
+                                var nm = (string)np.GetValue(node, null);
+                                if (string.IsNullOrEmpty(nm))
+                                    continue;
+                                if (got > 0)
+                                    names.Append("+");
+                                names.Append(SafeName(nm));
+                                got++;
+                            }
+                            if (got > 0)
+                                sb.Append(string.Format(",\"ing\":\"{0}\"", names.ToString()));
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            // 台面上放着什么 + 数量
+            try
+            {
+                var ap = r.attach;
+                if (ap == null)
+                    ap = r.attach = AttachPointOf(r.go);   // 缓存没了就补一次(台面被换过)
+                if (ap != null)
+                {
+                    int c = ap.childCount;
+                    sb.Append(string.Format(",\"n\":{0}", c));
+                    if (c > 0)
+                    {
+                        // onhas 节流: 它走反射, 是动态层里最贵的一项
+                        bool heavy = (OnhasInterval <= 0f) || (now - r.lastHasAt >= OnhasInterval);
+                        var tags = new StringBuilder();
+                        var hases = new StringBuilder();
+                        sb.Append(",\"on\":[");
+                        int shown = 0;
+                        for (int i = 0; i < c && shown < MaxOnShown; i++)
+                        {
+                            var ch = ap.GetChild(i);
+                            if (ch == null)
+                                continue;
+                            if (shown > 0)
+                            {
+                                sb.Append(",");
+                                tags.Append(",");
+                                hases.Append(",");
+                            }
+                            sb.Append("\"").Append(SafeName(ch.name)).Append("\"");
+                            string tg = "";
+                            try { tg = ch.tag; }
+                            catch (Exception) { }
+                            tags.Append("\"").Append(SafeName(tg)).Append("\"");
+                            if (heavy)
+                            {
+                                string has = "";
+                                try { has = ItemKnowledge.ContentsNames(ch.gameObject); }
+                                catch (Exception) { }
+                                r.lastHas = has;
+                            }
+                            hases.Append("\"").Append(SafeName(r.lastHas)).Append("\"");
+                            shown++;
+                        }
+                        sb.Append("],\"ontags\":[").Append(tags)
+                          .Append("],\"onhas\":[").Append(hases).Append("]");
+                        if (heavy)
+                            r.lastHasAt = now;
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            return sb.ToString();
+        }
+
+        /// <summary>台面的**身份**部分(tag / sub / spawn / plate) —— 只在建缓存时算一次。
+        /// 内容(`ing`/`n`/`on`/`ontags`/`onhas`)见 DescribeDynamic()。</summary>
+        private static string DescribeStatic(GameObject go, string typeName)
         {
             var sb = new StringBuilder();
 
@@ -681,14 +1076,27 @@ namespace Overcooked2AI.Game
             catch (Exception) { }
 
             // CookingStation.m_stationType (Hob/Oven/Fryer...)
-            if (typeName == "CookingStation")
+            //
+            // ⚠ 必须**连派生类一起**读。`m_stationType` 声明在基类 `CookingStation.cs:12`,
+            //   而 `HeatedCookingStation : CookingStation`(HeatedCookingStation.cs:3)。
+            //   原来只判 `typeName == "CookingStation"` ⇒ **HeatedCookingStation(烤箱/炸锅)
+            //   的 sub 永远是空** ⇒ Python 落到 `_STATION_SEM.get("", "hob")` ⇒ 全被当成普通灶台。
+            //   潜伏危害: 一旦遇到"灶台和烤箱并存"的关卡, 把需要 Oven 的菜放到 Hob 上会被
+            //   游戏拒绝(CookingStation.cs:39 `GetRequiredStationType() != m_stationType`)。
+            if (typeName == "CookingStation" || typeName == "HeatedCookingStation")
             {
                 try
                 {
                     var comp = go.GetComponent(typeName);
                     if (comp != null)
                     {
-                        var f = comp.GetType().GetField("m_stationType");
+                        // 用 FindFieldUp 类的回溯找法: 字段在基类上, 派生类型 GetField 也能拿到 public,
+                        // 但用 DeclaredOnly 之外的绑定再兜一层更稳。
+                        var f = comp.GetType().GetField("m_stationType",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (f == null && comp.GetType().BaseType != null)
+                            f = comp.GetType().BaseType.GetField("m_stationType",
+                                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                         if (f != null)
                         {
                             var v = f.GetValue(comp);
@@ -720,114 +1128,9 @@ namespace Overcooked2AI.Game
             }
             catch (Exception) { }
 
-            // CookableIngredient.m_ingredientOrderNode.name → 台上/容器里的食材
-            try
-            {
-                var ingType = FindType("CookableIngredient");
-                if (ingType != null)
-                {
-                    var ing = go.GetComponentInChildren(ingType);
-                    if (ing != null)
-                    {
-                        var f = ingType.GetField("m_ingredientOrderNode");
-                        if (f != null)
-                        {
-                            var node = f.GetValue(ing);
-                            if (node != null)
-                            {
-                                var np = node.GetType().GetProperty("name");
-                                if (np != null)
-                                {
-                                    var nm = (string)np.GetValue(node, null);
-                                    if (!string.IsNullOrEmpty(nm))
-                                        sb.Append(string.Format(",\"ing\":\"{0}\"", SafeName(nm)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception) { }
-
-            // 台面上放着什么 + 堆叠数量。
-            // 物品是挂在 attachPoint 下的子 Transform, 不是字段, 所以只能看子物体。
-            // 这是"物品传递/接力(a 放台面 → b 接手)"唯一的观测手段。
-            try
-            {
-                var at = FindType("AttachStation");
-                Transform ap = null;
-                if (at != null)
-                {
-                    var comp = go.GetComponent(at);
-                    if (comp != null)
-                    {
-                        var f = at.GetField("m_attachPoint");
-                        if (f != null)
-                            ap = f.GetValue(comp) as Transform;
-                    }
-                }
-                var st = FindType("Stack");
-                if (st != null)
-                {
-                    var comp = go.GetComponent(st);
-                    if (comp != null)
-                    {
-                        var gm = st.GetMethod("GetAttachPoint");
-                        if (gm != null)
-                        {
-                            try
-                            {
-                                var tr = gm.Invoke(comp, new object[] { null }) as Transform;
-                                if (tr != null && (ap == null || tr.childCount > 0))
-                                    ap = tr;
-                            }
-                            catch (Exception) { }
-                        }
-                    }
-                }
-                if (ap != null)
-                {
-                    int c = ap.childCount;
-                    sb.Append(string.Format(",\"n\":{0}", c));
-                    if (c > 0)
-                    {
-                        // ⚠ ontags/onhas 必须和 on **同步、同长**(Python 侧按下标一一对应):
-                        //   ontags = 游戏自己的 Unity Tag(锅=CookingUtensil / 盘=Plate)
-                        //   onhas  = 这个东西容器里装了什么 —— 判"这个盘子是不是空的"。
-                        //   拿一个装了菜的盘子去锅边按交互, 会把菜倒进锅里(方向正好相反),
-                        //   所以取菜前必须能认出空盘。这三个数组的长度与上限必须一致。
-                        var tags = new StringBuilder();
-                        var hases = new StringBuilder();
-                        sb.Append(",\"on\":[");
-                        int shown = 0;
-                        for (int i = 0; i < c && shown < 3; i++)
-                        {
-                            var ch = ap.GetChild(i);
-                            if (ch == null)
-                                continue;
-                            if (shown > 0)
-                            {
-                                sb.Append(",");
-                                tags.Append(",");
-                                hases.Append(",");
-                            }
-                            sb.Append("\"").Append(SafeName(ch.name)).Append("\"");
-                            string tg = "";
-                            try { tg = ch.tag; }
-                            catch (Exception) { }
-                            tags.Append("\"").Append(SafeName(tg)).Append("\"");
-                            string has = "";
-                            try { has = ItemKnowledge.ContentsNames(ch.gameObject); }
-                            catch (Exception) { }
-                            hases.Append("\"").Append(SafeName(has)).Append("\"");
-                            shown++;
-                        }
-                        sb.Append("],\"ontags\":[").Append(tags)
-                          .Append("],\"onhas\":[").Append(hases).Append("]");
-                    }
-                }
-            }
-            catch (Exception) { }
+            // ⚠ `ing` 和 `n/on/ontags/onhas` **已经搬到 DescribeDynamic()** ——
+            //   它们是动态内容(每帧在变), 留在"只算一次"的静态部分里就等于
+            //   又变回"1 秒前的世界"。这里只留身份: tag / sub / spawn / plate。
 
             // 盘子堆提供哪种容器(PlateStackBase.GetPlatingStep → 对比订单的 m_platingStep)
             if (typeName == "CleanPlateStack" || typeName == "DirtyPlateStack"

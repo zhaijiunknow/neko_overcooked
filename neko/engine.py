@@ -60,6 +60,9 @@ class Engine:
         self.know: Knowledge | None = None
         self.scene = ""
         self.assemble_spot: Station | None = None   # 组装台面(放容器的地方)
+        #: 组装台面的 id —— 半成品放在哪个台面上, 整局内不许换。
+        #: 见 pick_assemble_spot() 里那段注释(用户实测: 换台面导致同一份材料取了 7 遍)。
+        self._assemble_sid: str = ""
         self._stove_used = ""                        # 当前占用的灶台(用完释放)
         self._probed = False                         # 是否已实测过键位归属
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
@@ -416,6 +419,33 @@ class Engine:
         c = self.chef(st or {})
         return (c.get("pick") or "", c.get("use") or "")
 
+    def placement_target(self, st: dict) -> str:
+        """游戏自己认为这个厨师现在按下会**放到哪个物体** (`m_iHandlePlacement` 所在物体名)。
+
+        为什么必须看它(用户实测: "锅的定位不是很好"):
+          `InteractDirect` 发 `ReceivePlaceEvent` 时带的**就是**这个物体
+          (见 bridge/virtual_pad.py 的 tap → call_direct)。所以 **它指向谁, 东西就真的
+          会放到谁那儿**。而站位不对时它会指向旁边一个**无关的台面** ——
+          此时直调**照样返回 `ok=True`**, 因为 InteractDirect 只是把游戏算好的目标转交出去,
+          它不知道我们要的是锅。结果就是一个"假成功": 东西放上了旁边的柜台,
+          引擎却以为进锅了, 后面全是错的。
+
+        返回空串表示游戏此刻没有放置目标(站位太差)。
+        """
+        c = self.chef(st or {})
+        return (c.get("placeh") or "")
+
+    def _place_target_ok(self, stove: Station, pot: str, want_pot: bool) -> tuple:
+        """游戏说的放置目标, 是我们想放的那个吗? 返回 (是否OK, 游戏说的目标名)。"""
+        tgt = self.placement_target(self.state(force=True))
+        if not tgt:
+            return True, "(空)"        # 游戏没给目标 —— 判断不了, 交给交互本身去失败
+        t = self._norm(tgt)
+        cand = [self._norm(stove.name)]
+        if want_pot and pot:
+            cand.append(self._norm(pot))
+        return (t in cand), tgt
+
     def interact(self, kind: str = "pickup", verify_hold_change=True) -> bool:
         # force=True: 这一段的全部意义就是"按键之后世界变了没有", 绝不能用缓存旧帧
         st = self.state(force=True)
@@ -500,21 +530,46 @@ class Engine:
     # ---------------- 组装台面 ----------------
     def pick_assemble_spot(self, km: KitchenMap, x: float, z: float) -> Station | None:
         """挑摆盘位。**优先挑已经有盘子的台面** —— 那样材料放上去就直接进盘,
-        不必先跑去拿盘子。双人时通过黑板保证两人不用同一个。"""
+        不必先跑去拿盘子。双人时通过黑板保证两人不用同一个。
+
+        ⚠ **整局内粘住**(用户实测的 bug): 半成品就放在某个台面上, 换个台面等于从零重来。
+          旧行为是"优先挑空台面"(`not s.on`) —— 于是重新规划时, 上一轮放了材料的台面
+          因为 `on` 非空而**被排除**, 挑到一个空台面; 从空台面看"什么都没有", 就把
+          同一份材料再取一遍。实测一局里同一份海带取了 **7 遍**, 材料还散落在多个台面上
+          (用户原话: "菜谱三个食材 1、2 加过了缺少 3, 但是脚本还会拿 1 去补")。
+        """
         allc = [s for s in (km.of("counter") or km.of("board"))
                 if not s.spawn and s.kind != "CookingStation"]
         if not allc:
             return None
         with_plate = [s for s in allc if self._has_plate(s)]
+
+        # 先认上一次用的那个 —— 按 id 到**新鲜的 km** 里取, 保证 `.on` 不是陈旧快照
+        #
+        # ⚠ 但"台面上有盘子"是**更高优先级**, 不能无条件守旧:
+        #   盘子是"材料自动进盘"的前提(PlacementContainer), 没有它材料只能干放在台面上,
+        #   后面怎么拼都拼不出菜。而盘子会被送餐消耗掉 —— 上一单送走之后原来那个台面就空了。
+        #   所以: 旧台面还有盘子 → 认它; 全场一个带盘子的台面都没有 → 也只能认它;
+        #   否则(别处有盘子而它没有) → 让下面的逻辑去挑那个有盘子的。
+        if self._assemble_sid:
+            prev = km.stations.get(self._assemble_sid)
+            if prev is not None:
+                if self._has_plate(prev) or not with_plate:
+                    return prev
+            else:
+                self._assemble_sid = ""    # 台面没了(换关/被拆) → 重新挑
+
         if with_plate:
             cands = with_plate
-        else:
-            cands = [s for s in allc if not s.on] or allc
         if self.board is not None:
-            return self.board.pick_spot(cands, self.cid, (x, z))
-        serve = km.nearest("serve", x, z)
-        ax, az = (serve.x, serve.z) if serve else (x, z)
-        return min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
+            spot = self.board.pick_spot(cands, self.cid, (x, z))
+        else:
+            serve = km.nearest("serve", x, z)
+            ax, az = (serve.x, serve.z) if serve else (x, z)
+            spot = min(cands, key=lambda s: (s.x - ax) ** 2 + (s.z - az) ** 2)
+        if spot is not None:
+            self._assemble_sid = spot.id
+        return spot
 
     # ---------------- 键位归属（权威依据） ----------------
     #: 游戏的 Player 枚举 → 键盘半区（v1 §3.2: SplitPadHost=Left=WASD, SplitPadGuest=Right=方向键）
@@ -1692,6 +1747,17 @@ class Engine:
                 return False
             if not self.navigate_smart(km, stove.x, stove.z, tight=0.8):
                 return False
+            # ⚠ **按之前先问游戏"你会放到哪"**(用户实测: "锅的定位不是很好")。
+            #   站位不对时 m_iHandlePlacement 会指向旁边一个无关台面, 而直调照样回
+            #   ok=True —— 东西放上了柜台, 引擎却以为进锅了, 后面全错。
+            #   宁可这一步失败(execute 会重试, 每次重新导航 = 再给一次机会),
+            #   也不要放错地方还报成功。
+            ok_place, who = self._place_target_ok(stove, pot, want_pot)
+            if not ok_place:
+                self.log(f"[步骤] ⚠ 站位不对: 游戏说会放到 {who!r}, 而不是 "
+                         f"{stove.name!r}" + (f" / 锅 {pot!r}" if (want_pot and pot) else "")
+                         + " —— 不按, 免得放错地方还报成功")
+                return False
             if not self.interact("pickup", verify_hold_change=True):   # 手上的东西必须脱手
                 self.log("[步骤] ⚠ 东西没放上去(锅/灶台没接住)")
                 return False
@@ -1976,6 +2042,36 @@ class Engine:
         return False
 
     # ---------------- 执行一个订单 ----------------
+    def _top_up_plate(self) -> None:
+        """手空着 + 摆盘位缺盘子 → 现在就去补一个。**每个 op 边界都试一次**。
+
+        为什么不能只在 `execute()` 开头补一次(实测踩的坑, 上一局 9 次失败都是这个):
+          `_prepare_plate()` 里有 `if held: return True` —— **手上有东西就整个跳过**。
+          而 `execute()` 开头手上经常有东西(上一轮失败留下的材料, 日志里就是
+          "手上还有 SushiRice, 先放到组装台面")。那一次跳过之后**再没有任何重试**,
+          于是一整轮里每次 assemble 都在"没有盘子的台面"上干放, 材料永远拼不成菜,
+          日志里只看到反复的 `⚠ 摆盘位 counterNN 上没有盘子`。
+
+        放在 op 边界是因为那一刻手经常是空的(上一个材料刚放下去), 补盘正好做得了。
+        成本: 一次 state 读(共享缓存) + 一次 `_has_plate`; 大多数时候直接返回。
+        """
+        if self.assemble_spot is None:
+            return
+        st = self.state()
+        if not st or not st.get("inRound"):
+            return
+        _, _, held = self.pos(st)
+        if held:
+            return                                  # 手上有东西 → 现在补不了
+        km = self.map(st)
+        if km is None:
+            return
+        spot = km.stations.get(self.assemble_spot.id)   # 用新鲜的, 别用陈旧快照
+        if spot is None or self._has_plate(spot):
+            return
+        self.log(f"[步骤] 摆盘位 {spot.id} 还缺盘子 —— 趁手空补一个")
+        self._ensure_plate(km, *self.pos(st)[:2], spot)
+
     def _prepare_plate(self, flow: DishFlow) -> bool:
         """开局(手还空着)先把摆盘位那个盘子备好。
 
@@ -2032,12 +2128,63 @@ class Engine:
         # tool / mix 暂不处理
         return True
 
+    def _skip_already_on_spot(self, ops: list) -> list:
+        """组装台面上已经有某个材料了 → 把它那一组(fetch/chop/cook/mix/assemble)整组跳过。
+
+        `derive()` 是**纯静态**的: 每次都从订单定义从头推一遍, 完全不看台面上已经放了
+        什么。叠加"失败 → 重新规划 → 从头执行", 就会反复取同一份材料。
+        (用户实测: 三个食材, 1、2 已经加过、缺 3, 脚本却回头又拿 1 去补。)
+
+        判定故意**保守**: 归一化后**精确相等**才算命中, 认不出来就不跳。
+        漏跳只是回到旧行为(多取一次), 误跳却会让这单缺料做不出来 —— 那是更糟的失败。
+        (不用子串: `_norm` 的注释里说过 `SushiPrawn` 与 `SushiPrawnCooked` 会互相包含。)
+
+        分组依据: `derive()` 对每个材料按顺序产出
+        `fetch(raw) → [chop] → [cook/mix] → assemble(name)`, **以 assemble 收尾**。
+        """
+        spot = self.assemble_spot
+        if spot is None or not ops:
+            return ops
+
+        # 用**当下**的台面快照, 而不是可能陈旧的那一份(布局每秒才重扫一次)
+        st = self.state()
+        km = self.map(st) if st else None
+        if km is not None:
+            fresh = km.stations.get(spot.id)
+            if fresh is not None:
+                spot = fresh
+
+        have = set(self._norm(o) for o in (spot.on or []))
+        have |= self._plate_contents_on(spot)
+        if not have:
+            return ops
+
+        out, group = [], []
+        for op in ops:
+            group.append(op)
+            if op.action != "assemble":
+                continue
+            mat = self._norm(op.target)
+            if mat and mat in have:
+                self.log(f"[步骤] 台面 {spot.id} 上已有 {op.target} —— "
+                         f"跳过这 {len(group)} 步({group[0].action} {group[0].target} 起)")
+            else:
+                out.extend(group)
+            group = []
+        out.extend(group)          # 尾部不以 assemble 收尾的(例如 deliver)
+        return out
+
     def execute(self, flow: DishFlow, retries: int = 2) -> bool:
-        self.assemble_spot = None
+        # ⚠ 这里**不能**清空 assemble_spot —— 见 pick_assemble_spot() 里那段注释。
+        #   清空的后果: 重新规划时挑到一个空台面 → 从那个台面的视角"什么都没有"
+        #   → 同一份材料被反复取(实测一局取了 7 遍)。台面只在换关卡/对局结束时清(run())。
         self._prepare_plate(flow)
-        total = len(flow.ops)
-        for i, op in enumerate(flow.ops):
+        ops = self._skip_already_on_spot(flow.ops)
+        total = len(ops)
+        for i, op in enumerate(ops):
             done = False
+            # 摆盘位缺盘子就趁手空补上 —— 见 _top_up_plate() 的注释(一整轮 9 次失败都是它)
+            self._top_up_plate()
             _st0 = self.state()
             _c0 = self.pos(_st0) if _st0 else (None, None, "")
             _loc = f" @({op.at_x:.1f},{op.at_z:.1f})" if (op.at_x or op.at_z) else ""
@@ -2134,6 +2281,7 @@ class Engine:
                 if self.scene:
                     self.log("[引擎] 对局结束, 清空缓存")
                 self.know, self.scene, self.assemble_spot = None, "", None
+                self._assemble_sid = ""     # 换关卡/下一局 → 组装台面重新挑
                 self._belt_dirs_cache, self._belt_speeds_cache = None, {}
                 self._terrain, self._terrain_scene = None, ""
                 time.sleep(1)
