@@ -2,10 +2,17 @@
 setlocal
 
 set ROOT=%~dp0
-set CSC="C:\Program Files\dotnet\sdk\8.0.419\Roslyn\bincore\csc.dll"
+:: ⚠ 这三个路径是本机的实际位置, 换机器要改。
+::   · CSC  : 原来写的 sdk\8.0.419 本机没装(只有 9.0.307/9.0.311)。
+::            Roslyn 版本不影响产物 —— build.bat 用 -langversion:7.3 + -nostdlib+
+::            显式引 .NET 2.0 的 mscorlib, 所以编译器本身跑在 .NET 9 上没问题。
+::   · GAME : 原来写的 E:\SteamLibrary 这个盘不存在, 游戏实际在 D:\Steam。
+::   · BEP  : 原来指向仓库里的 tools\BepInEx_x86\ —— 那个目录已被删(只剩 zip)。
+::            直接用游戏里装好的 BepInEx\core, 更省事也更不会版本错配。
+set CSC="C:\Program Files\dotnet\sdk\9.0.311\Roslyn\bincore\csc.dll"
 set FW=C:\Windows\Microsoft.NET\Framework\v2.0.50727
-set GAME=E:\SteamLibrary\steamapps\common\Overcooked! 2\Overcooked2_Data\Managed
-set BEP=%ROOT%tools\BepInEx_x86\BepInEx\core
+set GAME=D:\Steam\steamapps\common\Overcooked! 2\Overcooked2_Data\Managed
+set BEP=D:\Steam\steamapps\common\Overcooked! 2\BepInEx\core
 set SRC=%ROOT%Overcooked2AI
 set OUT=%ROOT%build
 set DLL=%OUT%\Overcooked2AI.dll

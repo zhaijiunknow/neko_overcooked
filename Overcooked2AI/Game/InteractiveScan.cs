@@ -465,6 +465,116 @@ namespace Overcooked2AI.Game
         }
 
         // ---------------------------------------------------------------- 通用
+        /// <summary>灭火器诊断: 把"喷雾到底怎么触发"这条链上**只存在于 prefab 里**的东西读出来。
+        ///
+        /// 为什么必须运行时读(排查过程):
+        ///   `ServerSprayingUtensil.OnTrigger(string)`  (§91-101) 比对的是
+        ///   `SprayingUtensil.m_startSprayTrigger` / `m_stopSprayTrigger` —— 两个
+        ///   **public string 字段, 值写在 prefab 里**。
+        ///   · 反编译源码里搜含 spray 的字面量: **零命中**
+        ///     (`grep -rnoE '"[^"]*[Ss]pray[^"]*"' overcooked_decomp/*.cs` 空)
+        ///   · AssetBundle 是压缩的: 裸 grep 只能拿到资产名表, 读不到字段值
+        ///   ⇒ 只能运行时读。
+        ///
+        /// 顺带把**组件清单**打出来 —— 关键是确认它身上有没有 `ServerInteractable`/
+        /// `ClientInteractable`。`ServerSprayingUtensil.StartSynchronising` (§25) 里有
+        /// `GetComponent&lt;ClientInteractable&gt;().SetStickyInteractionCallback(...)`,
+        /// 说明**至少有 Client 那份**; 这决定喷雾能不能走现有的直调通路
+        /// (direct 发的 ReceiveInteractEvent 作用在 m_interactable 上)触发,
+        /// 还是必须走真按键。
+        /// </summary>
+        public static string SprayDiag()
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"utensils\":[");
+            int n = 0;
+            var seen = new Dictionary<int, int>();
+            // 三个类型都试: FireExtinguishSpray/WaterGunSpray 是 SprayingUtensil 的派生,
+            // 而 FindObjectsOfType 不保证含派生类型 —— 分开找再按 instanceID 去重。
+            foreach (var typeName in new string[] { "SprayingUtensil", "FireExtinguishSpray", "WaterGunSpray" })
+            {
+                foreach (var c in Comps(typeName))
+                {
+                    int iid = c.gameObject.GetInstanceID();
+                    if (seen.ContainsKey(iid))
+                        continue;
+                    seen[iid] = 1;
+                    if (n > 0)
+                        sb.Append(",");
+                    sb.Append(OneSpray(c, typeName));
+                    n++;
+                }
+            }
+            sb.Append("],\"count\":").Append(n).Append("}");
+            return sb.ToString();
+        }
+
+        private static string OneSpray(Component c, string typeName)
+        {
+            var t = c.GetType();
+            var p = c.transform.position;
+            var sb = new StringBuilder();
+            sb.Append("{\"type\":\"").Append(Safe(typeName)).Append("\"");
+            sb.Append(",\"name\":\"").Append(Safe(c.gameObject.name)).Append("\"");
+            sb.Append(",\"x\":").Append(F(p.x)).Append(",\"z\":").Append(F(p.z));
+
+            // ---- 这次要的核心答案: 两个触发字符串 ----
+            sb.Append(",\"fields\":{");
+            sb.Append("\"m_startSprayTrigger\":\"").Append(Safe(Str(t, c, "m_startSprayTrigger"))).Append("\"");
+            sb.Append(",\"m_stopSprayTrigger\":\"").Append(Safe(Str(t, c, "m_stopSprayTrigger"))).Append("\"");
+            sb.Append(",\"m_sprayDistance\":").Append(F(Num(t, c, "m_sprayDistance")));
+            sb.Append(",\"m_sprayAngleInDegrees\":").Append(F(Num(t, c, "m_sprayAngleInDegrees")));
+            sb.Append(",\"m_exinguishTime\":").Append(F(Num(t, c, "m_exinguishTime")));
+            sb.Append(",\"m_washSpeed\":").Append(F(Num(t, c, "m_washSpeed")));
+            sb.Append(",\"m_knockbackForce\":").Append(F(Num(t, c, "m_knockbackForce")));
+            sb.Append("}");
+
+            // ---- 组件清单(找 Interactable) ----
+            var comps = new StringBuilder();
+            int cn = 0;
+            try
+            {
+                var all = c.gameObject.GetComponents<Component>();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (all[i] == null)
+                        continue;
+                    if (cn > 0)
+                        comps.Append(",");
+                    comps.Append("\"").Append(Safe(all[i].GetType().Name)).Append("\"");
+                    cn++;
+                }
+            }
+            catch (Exception) { }
+            sb.Append(",\"components\":[").Append(comps).Append("]");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static string Str(Type t, object inst, string field)
+        {
+            try
+            {
+                var f = t.GetField(field,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                var v = f != null ? f.GetValue(inst) : null;
+                return v == null ? "" : v.ToString();
+            }
+            catch (Exception) { return ""; }
+        }
+
+        private static float Num(Type t, object inst, string field)
+        {
+            try
+            {
+                var f = t.GetField(field,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                var v = f != null ? f.GetValue(inst) : null;
+                return v == null ? 0f : Convert.ToSingle(v);
+            }
+            catch (Exception) { return 0f; }
+        }
+
         private static Component[] Comps(string typeName)
         {
             var t = SceneScanner.FindType(typeName);

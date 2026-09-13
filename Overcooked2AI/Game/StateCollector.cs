@@ -16,7 +16,16 @@ namespace Overcooked2AI.Game
         private readonly object _lock = new object();
         private string _snapshot = "";
         private float _lastLayoutScan = -10f;
-        private string _layoutCache = "{}";
+        /// <summary>台面数组 —— **每帧**刷新(静态身份走 SceneScanner 的缓存, 位置/内容现读)。</summary>
+        private string _stationsCache = "[]";
+        /// <summary>烹饪进度 —— 0.1 秒刷新(1× FindObjectsOfType + 每口锅几次反射)。</summary>
+        private string _cookCache = "[]";
+        private float _lastCookScan = -10f;
+        /// <summary>**全场景按 tag 找的食材** —— 0.1 秒刷新。
+        /// 补的是"不在台面上的食材看不见"这个盲区(掉地上的/移动平台上的)。
+        /// 依据: 游戏自己的 `GameUtils.GetAllIngredients()`(GameUtils.cs:504)。</summary>
+        private string _itemsCache = "[]";
+        private float _lastItemsScan = -10f;
 
         // ---- 主线程任务(桥发起, 主线程执行) ----
         private string _jobKind = "";
@@ -83,6 +92,8 @@ namespace Overcooked2AI.Game
                     json = LevelInfo.Snapshot(arg);
                 else if (kind == "dyn")
                     json = InteractiveScan.Snapshot();
+                else if (kind == "spray")
+                    json = InteractiveScan.SprayDiag();
                 else if (kind == "grid")
                     json = GridInfo.Snapshot();
                 else if (kind == "cells")
@@ -158,14 +169,55 @@ namespace Overcooked2AI.Game
             if (inRound)
             {
                 float now = Time.realtimeSinceStartup;
+
+                // **台面: 每帧**(用户提的"实时地图")。
+                //   贵的部分(20 个类型各一次 FindObjectsOfType)已经挪进 SceneScanner 的
+                //   静态缓存, 一关只做一次; 这里每帧的只是"走一遍缓存的引用, 读位置+内容"。
+                //   ⚠ 坐标**不缓存** —— 用户指出本游戏没有绝对静态的台面(食材会放上去、
+                //   锅会被端走), 所以位置每帧从 GameObject 现读。
+                try
+                {
+                    _stationsCache = SceneScanner.ScanStations();
+                }
+                catch (Exception) { }
+
+                // 烹饪进度: 0.1 秒(它自带 1× FindObjectsOfType + 每口锅几次反射)
+                if (now - _lastCookScan >= 0.1f)
+                {
+                    _lastCookScan = now;
+                    try
+                    {
+                        _cookCache = SceneScanner.ScanCooking();
+                    }
+                    catch (Exception) { }
+                }
+
+                // 全场景食材(按 tag): 0.1 秒 —— 补"不在台面上的食材"这个盲区
+                if (now - _lastItemsScan >= 0.1f)
+                {
+                    _lastItemsScan = now;
+                    try
+                    {
+                        _itemsCache = SceneScanner.ScanItems();
+                    }
+                    catch (Exception) { }
+                }
+
+                // 厨师位置: 0.1 秒(导航是闭环, 用旧坐标算方向必然来回震)
+                if (now - _lastChefScan >= 0.1f)
+                {
+                    _lastChefScan = now;
+                    try
+                    {
+                        _chefsCache = SceneScanner.ScanChefs();
+                    }
+                    catch (Exception) { }
+                }
+
+                // 配方池: 1 秒(要读游戏对象, 有开销)
                 if (now - _lastLayoutScan >= 1f)
                 {
                     _lastLayoutScan = now;
-                    try
-                    {
-                        _layoutCache = SceneScanner.Scan();
-                    }
-                    catch (Exception) { }
                     try
                     {
                         _recipeCache = ReadRecipePool();
@@ -182,19 +234,16 @@ namespace Overcooked2AI.Game
                         catch (Exception) { }
                     }
                 }
-                if (now - _lastChefScan >= 0.1f)
-                {
-                    _lastChefScan = now;
-                    try
-                    {
-                        _chefsCache = SceneScanner.ScanChefs();
-                    }
-                    catch (Exception) { }
-                }
-                // 世界 + 高频厨师拼成一个 layout
-                layout = "{\"stations\":" + ExtractArray(_layoutCache, "stations")
+
+                // ⚠ `ScanCooking()` 返回的是**裸的元素列表**(没有外层方括号)。
+                //   旧代码里那对方括号是 `ExtractArray(完整 Scan() 结果, "cooking")` 剥出来的,
+                //   现在直接调它就必须自己补 —— 否则 `"cooking":{...},{...}` 是**非法 JSON**,
+                //   整个 state 解析失败, 脚本第一步就崩。
+                //   (这个 bug 一跑 mapview 就暴露了: JSONDecodeError char 9667。)
+                layout = "{\"stations\":" + _stationsCache
                        + ",\"chefs\":" + _chefsCache
-                       + ",\"cooking\":" + ExtractArray(_layoutCache, "cooking") + "}";
+                       + ",\"items\":" + _itemsCache
+                       + ",\"cooking\":[" + _cookCache + "]}";
                 recipePool = _recipeCache;
             }
             else
@@ -203,8 +252,12 @@ namespace Overcooked2AI.Game
                 _recipeDetailRead = false;
                 _recipeDetailCache = "[]";
                 _recipeCache = "[]";
-                _layoutCache = "{}";
                 _chefsCache = "[]";
+                _stationsCache = "[]";
+                _cookCache = "[]";
+                _itemsCache = "[]";
+                // 台面静态缓存的引用会指向已销毁的对象 —— 换关必须作废重建
+                try { SceneScanner.InvalidateStationCache(); } catch (Exception) { }
             }
 
             string round = inRound ? "true" : "false";

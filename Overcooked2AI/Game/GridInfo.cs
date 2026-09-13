@@ -90,9 +90,17 @@ namespace Overcooked2AI.Game
                     float hx = Num(hs, "X"), hy = Num(hs, "Y"), hz = Num(hs, "Z");
                     sb.Append(",\"half\":[").Append(I(hx)).Append(",").Append(I(hy))
                       .Append(",").Append(I(hz)).Append("]");
-                    // 格宽已知时能算出整张网格覆盖的世界范围(供 Python 对齐采样)
-                    sb.Append(",\"cellSpan\":\"[\"")
-                      .Append("placeholder").Append("\"]");
+                    // ⚠ 这里曾经输出 `"cellSpan":"["placeholder"]"` —— **非法 JSON**
+                    //   (`placeholder` 是字面量, 值是字符串 `"["`, 解析器读到 `p` 就炸)。
+                    //   一调 `grid` 命令就报 `Expecting ',' delimiter: char 156`。
+                    //
+                    //   为什么当时填不出来: 要算"整张网格覆盖的世界范围"需要格宽(`size`),
+                    //   而 `size` 是在**下面另一个 try 块**里才读到的, 此刻还没有。
+                    //
+                    //   现在先输出合法的空数组 —— **别再造一个看起来像数据的东西**。
+                    //   要真做的话: 把 size 的读取提到前面, 然后 span = (2*half+1) * size
+                    //   (m_gridHalfSize 的注释说格子编号范围是 [-half, +half], 所以格数是 2*half+1)。
+                    sb.Append(",\"cellSpan\":[]");
                 }
             }
             catch (Exception) { }

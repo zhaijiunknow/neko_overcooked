@@ -105,6 +105,11 @@ class BridgeClient:
         """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
         return self._send({"cmd": "dyn"})
 
+    def get_spray(self) -> dict:
+        """灭火器诊断: 喷雾的**触发字符串**(写在 prefab 里, 反编译源码和 bundle 都读不到)
+        + 它的组件清单(找 Interactable)。见 InteractiveScan.SprayDiag()。"""
+        return self._send({"cmd": "spray"})
+
     def get_grid(self) -> dict:
         """**游戏自己的网格**: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。
         依据 GridManager.cs / QuadGridManager.cs —— 权威, 不是我们采样推断的。"""
