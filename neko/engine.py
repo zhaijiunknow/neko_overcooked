@@ -142,6 +142,17 @@ MAX_RESPAWNS = int(float(os.environ.get("NEKO_MAX_RESPAWNS") or 2))
 #:   (另一个厨师、一辆车、传送带上堆的货), 永久封路会把路越走越窄。
 BLOCKED_TTL = float(os.environ.get("NEKO_BLOCKED_TTL") or 25.0)
 
+#: **传球**: 走到离人类队友多近才丢(格)。`NEKO_PASS_RANGE` 可调。
+#:
+#: 用户原话(2026-09-15): "如果脚本控制的地方**没有菜板切菜**, 但是有食物箱,
+#: 那么脚本需要**拿到食物箱然后丢给我**(丢的按键和切菜是同一个, 手拿着生食材就能丢)"。
+#:
+#: 机制(反编译): `ServerAttachmentThrower.CalculateThrowVelocity` = `方向 × m_throwForce`
+#: —— **prefab 上的定值, 没有蓄力**, 所以"丢多远"我们控制不了, 只能**走近了再丢**。
+#: ⚠ `m_throwForce` 没上报(读不到那件东西能飞多远) ⇒ 这个数是**保守的估计值**,
+#:   实机看不准就调它。丢不到也只是掉在地上, 人类捡起来就行(不是灾难)。
+PASS_RANGE = float(os.environ.get("NEKO_PASS_RANGE") or 3.0)
+
 
 class _GroundItem:
     """把一件**掉在地上的料**包成**和 `Station` 同形状**的取货目标。
@@ -3028,6 +3039,63 @@ class Engine:
         self.log(f"[步骤] ✓ 搅拌完成, 手上是 {got!r}")
         return True
 
+    def op_pass(self, km, x, z, op: Op, st: dict) -> bool:
+        """**把手上的这份料丢给人类队友** —— 他那半边能做我这边做不了的那一环。
+
+        用户原话: "如果脚本控制的地方**没有菜板切菜**, 但是有食物箱,
+        那么脚本需要**拿到食物箱然后丢给我**(丢的按键和切菜是同一个, 手拿着生食材就能丢)"。
+
+        机制(反编译, 三处):
+          · `ClientPlayerControlsImpl_Default.Update_Throw`: **松开使用键**那一刻投,
+            按住期间是瞄准(`Update_Aim: m_aimingThrow = isUsePressed`)
+            ⇒ **"丢"和"用/切"是同一个键** ✓(用户说的就是这个)
+          · `ServerPlayerControlsImpl_Default.ReceiveThrowEvent(_target)`:
+            按**厨师朝向** `transform.forward` 算,**不读任何蓄力值**
+          · `ServerAttachmentThrower.CalculateThrowVelocity`: `方向 × m_throwForce`
+            —— **prefab 定值 ⇒ 没有蓄力, 每次丢一样远**; `AlertPotentialCatchers`
+            再沿投掷方向 **10 格**球扫一遍, 命中 `players` 层就通知接球。
+          ⇒ 动作: **走近到 `PASS_RANGE` 内 → 转身对准他 → 丢**(`direct("throw")` 直调服务端入口)。
+
+        ⚠ 走不到他身边是**常态**(两个厨房被墙隔开) —— 所以不要求"站到旁边",
+          只要求"离他 ≤ `PASS_RANGE`"; 到不了就**认输**(别把料丢进水里)。
+        """
+        mate = self._mate(st)
+        if mate is None:
+            self.log("[传球] 没有队友 —— 丢给谁? (单人局不该走这条路)")
+            return False
+        _, _, held = self.pos(st)
+        if not held:
+            self.log("[传球] 手上没东西, 没法丢")
+            return False
+        mx, mz = mate[0], mate[1]
+        cx, cz, _ = self.pos(st)
+        self.log(f"[传球] 把 {held!r} 丢给队友(他在 {mx:.1f},{mz:.1f}, 现距 "
+                 f"{((mx-(cx or 0))**2 + (mz-(cz or 0))**2) ** 0.5:.1f} 格)")
+        # 先按"走到他旁边"走; 走不到(隔墙)就**尽量靠近**, 靠到射程内也算数
+        if not self._approach(km, mx, mz, tight=PASS_RANGE):
+            self.navigate_smart(km, mx, mz, tight=PASS_RANGE, replans=1)
+        st2 = self.state(force=True)
+        x2, z2, held2 = self.pos(st2) if st2 else (None, None, "")
+        if x2 is None:
+            return False
+        d = ((mx - x2) ** 2 + (mz - z2) ** 2) ** 0.5
+        if d > PASS_RANGE + 1.0:        # 留 1 格余量(走不到正好那个点)
+            self.log(f"[传球] ✗ 离队友还有 {d:.1f} 格(要 ≤ {PASS_RANGE:.1f}) —— "
+                     f"太远丢不到, 这次不丢(免得丢进水里)")
+            return False
+        self.face(mx, mz)               # 投掷方向 = 厨师朝向, 必须正对
+        time.sleep(0.1)
+        try:
+            r = self.bridge.direct("throw", player=self._my_player_index(st2 or st))
+        except Exception as e:
+            self.log(f"[传球] ✗ 投掷直调失败: {e}")
+            return False
+        if not r.get("ok"):
+            self.log(f"[传球] ✗ 投掷被拒: {r.get('error')} —— 手上是不是没有可丢的东西?")
+            return False
+        self.log(f"[传球] ✓ 丢出去了({d:.1f} 格)")
+        return True
+
     def _station_items(self, sid: str) -> str:
         """读某个台面上现在放着的东西(**含容器里的内容** `onhas`)—— 给日志用。"""
         st = self.state()
@@ -4027,6 +4095,8 @@ class Engine:
             return self.op_work(km, x, z, op, st)
         if op.action == "serve_any":
             return self.op_serve_any(km, x, z, op, st)
+        if op.action == "pass":
+            return self.op_pass(km, x, z, op, st)
         # tool / mix 暂不处理
         return True
 
@@ -4236,6 +4306,11 @@ class Engine:
         if a == "deliver":
             sv = km.nearest("serve", x, z)              # 与 618 / 2911 同一惯用法
             return ((sv.x, sv.z), sv.id) if sv else (None, "没有送餐口")
+        # **传球**: 目标是**队友**(探测阶段写进 `at_x/at_z`)。
+        if a == "pass":
+            if op.at_x or op.at_z:
+                return (op.at_x, op.at_z), (op.at_name or "队友")
+            return None, "传球: 没解析到队友位置"
         # **杂活**: 目标在**探测阶段**就解析好了(`_chore_candidates` 写进 `at_x/at_z`),
         # 这里直接拿 —— 和 `fetch` 的"已知货源"同一条路。
         # ⚠ 探测和执行必须看同一个台面, 否则会"按 A 台算的分、走到 B 台去干"。
@@ -4300,6 +4375,12 @@ class Engine:
                 _oj = ops[_j]
                 if _oj.action in _need and self._norm(_oj.target) == _tn:
                     return False, f"还有前置步骤没做({_oj.action} {_oj.target})"
+        if a == "pass":
+            # **传球**: 手上得拿着要丢的那份料(丢的是"手上的东西"), 且得有队友接。
+            if not self._held_is(held, op.target):
+                return False, (f"手上是 {held!r} 不是 {op.target}" if held
+                               else f"手空 —— 要先把 {op.target} 拿在手上才能丢")
+            return True, ""
         if a == "mix":
             # **搅拌**: 手上必须拿着要搅的那个(搅拌台是"把料放进去自动搅")。
             # ⚠ 和 `chop` 不同: **不看搅拌台上有什么** —— 台上那个是**容器**,
@@ -4719,6 +4800,22 @@ class Engine:
                     chores = self._chore_candidates(km, st, flow)
                 except Exception as e:
                     self.log(f"[杂活] 探测出错: {e!r}")
+            # **传球**: 链条上"我这边做不了"的那一环 → 把料丢给人类队友(用户要求)。
+            # ⚠ 可达集**在这里算一次传进去** —— 不传的话 `_stand_cell_of` 会为每个候选
+            #   各跑一次 BFS(十几个候选 = 十几次泛洪, 而这个循环每 0.5 秒就转一圈)。
+            try:
+                _tm = self.terrain()
+                _reach = None
+                if _tm is not None and getattr(_tm, "ok", False):
+                    _cx0, _cz0, _ = self.pos(st)
+                    if _cx0 is not None:
+                        _reach = _tm.distances_from(
+                            _cx0, _cz0, at_y=self.chef_y(st),
+                            extra_edges=self._travel_edges(km, _tm))
+                chores += self._pass_candidates(km, st, flow, ops, pending,
+                                                tm=_tm, reach=_reach)
+            except Exception as e:
+                self.log(f"[传球] 探测出错: {e!r}")
             pool = ops + chores
             # **冷板凳上的菜谱步骤不进候选**(用户要求: 持续失败就去做其他事)。
             # 它们全在冷板凳上时也不硬试 —— 那样只会把时间烧在"重试 3 次 + 导航超时"上;
@@ -5042,6 +5139,54 @@ class Engine:
                 out.append(s)
         return out
 
+    def _pass_candidates(self, km, st, flow, ops, pending, tm=None, reach=None) -> list:
+        """**链条上"我这边做不了"的那一环 → 把料丢给人类队友**(用户 2026-09-15 要求)。
+
+        > "需要强化菜单链, 让脚本按菜单链走, 如果其中**有一环条件没达成就先行动在那一步**。
+        >  如果脚本控制的地方**没有菜板切菜**, 但是有食物箱,
+        >  那么脚本需要**拿到食物箱然后丢给我**。"
+
+        判据(**只做有把握的那一种**, 免得把料乱丢):
+          ① 这一环是加工类(`chop`/`mix`/`cook`/`assemble`);
+          ② **它的台面我够不着**(解析不出目标, 或目标旁没有可达的站位格)
+             —— 台面在的话多半就只在**人类那半边**(两个厨房是常态);
+          ③ 那份料**我拿得到**(箱子/台面现货/地上 —— 走 `_fetch_source_live` 同一套判据);
+          ④ 手上正好拿着它 → 这条候选直接可做; 没拿 → 交给评分先选 `fetch`(下一步自然轮到它)。
+        """
+        out = []
+        mate = self._mate(st)
+        if mate is None:
+            return out                      # 单人局没有"丢给谁"
+        if tm is None or not getattr(tm, "ok", False):
+            return out
+        cx, cz, held = self.pos(st)
+        if cx is None:
+            return out
+        seen = set()
+        for i in pending:
+            op = ops[i]
+            if op.action not in ("chop", "mix", "cook", "assemble"):
+                continue
+            tn = self._norm(op.target)
+            if not tn or tn in seen:
+                continue
+            seen.add(tn)
+            # ② 我够不着那一环的台面吗
+            tgt, _lbl = self._op_target_for_score(km, st, op, cx, cz, tm=tm, reach=reach)
+            if tgt is not None:
+                if self._stand_cell_of(tm, tgt[0], tgt[1], cx, cz,
+                                       ortho_only=True, reach=reach) is not None:
+                    continue                # 够得着 → 自己做, 不用丢
+            # ③ 这份料我拿得到吗
+            src = self._fetch_source_live(km, st, Op("fetch", op.target), cx, cz,
+                                          tm=tm, reach=reach)
+            if src is None and not self._held_is(held, op.target):
+                continue
+            out.append(Op("pass", op.target,
+                          note=f"我这边做不了 {op.action} —— 丢给队友",
+                          at_name=(mate[2] or "队友"), at_x=mate[0], at_z=mate[1]))
+        return out
+
     def _chore_admitted(self, chore, d, flow_ds, used: dict) -> tuple:
         """这件杂活**现在能不能进候选池** —— 返回 `(能不能, 原因)`。**纯函数, 可离线核对。**
 
@@ -5061,6 +5206,11 @@ class Engine:
           `flow_ds` —— 菜谱候选里**可做**那些的步数列表; 空列表 = 菜谱一个可做的都没有
         """
         a = getattr(chore, "action", "")
+        if a == "pass":
+            # **传球不受杂活闸门管** —— 它不是"顺路顺手做的杂活", 而是
+            #   "链条上有一环我这边做不了"时的**唯一出路**(用户要求"先行动在那一步")。
+            #   它由 `_pass_candidates` 在生成时就卡过条件了(够不着 + 料拿得到)。
+            return True, ""
         # ⚠ **总开关排在最前面** —— 包括 `serve_any`。调试期要靠 `NEKO_CHORES=0`
         #   把整条杂活链路一次性拔掉做二分定位; 留一个"关不掉的动作"会让它没用。
         if CHORE_MODE in ("0", "off", "no", "false", "none"):
