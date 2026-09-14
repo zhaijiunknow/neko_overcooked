@@ -484,8 +484,12 @@ class TerrainMap:
                 or (ch == CH_TRAVELATOR and allow_travelator))
 
     def _mark(self, i: int, j: int, at_y: float = None, reach: set = None,
-              dynamic: set = None) -> str:
+              dynamic: set = None, conv: dict = None) -> str:
         """这一格在图上画什么 —— **泛洪结果优先**。
+
+        `conv`: `{格: 箭头字符}` —— **传送带的方向**(见 `conveyor_arrows` 那边的说明)。
+          两套传送带推的东西不一样, 但都该看得出**往哪边推** ——
+          否则图上一个 `T` / `C` 只说了"这是传送带", 没说方向, 等于白标。
 
         为什么以泛洪为准(用户要求: "泛洪也应该用来做地形图和叠加图"):
           静态投影(`blocked_by_height`)只答"有没有邻居能迈进来", 答不了
@@ -495,6 +499,15 @@ class TerrainMap:
         """
         if dynamic is not None and (i, j) in dynamic:
             return CH_DYNAMIC              # 监视期间变过 → 它不是"常驻"
+        # **传送带方向优先于字符**(`T`/`C` 只说"这是传送带", 没说往哪边推 = 白标);
+        # 但**不优先于"到不了"** —— 可达图里那格过不去就该显示 `-`,
+        # 否则"能不能过去"被方向箭头盖掉了。
+        if conv:
+            _a = conv.get((i, j))
+            if _a:
+                if reach is None or (i, j) in reach:
+                    return _a
+                return CH_UNREACHED
         ch = self.at(i, j)
         if ch not in (CH_FREE, CH_PLATFORM, CH_TRAVELATOR):
             return ch                      # 危险/占用/空洞: 原样画, 别拿 V 盖掉
@@ -890,7 +903,7 @@ class TerrainMap:
         return summary + "; 危险区: " + "; ".join(parts)
 
     def ascii(self, cx: float = None, cz: float = None, at_y: float = None,
-              reach: set = None, dynamic: set = None) -> str:
+              reach: set = None, dynamic: set = None, conv: dict = None) -> str:
         """把网格画成文本, 方便在终端里肉眼确认(大图片段看得很直观)。
 
         `at_y` = **厨师当前的高度**。传了它, "字符上能走、但对这只厨师站不下"
@@ -910,6 +923,6 @@ class TerrainMap:
                 if mark == (i, j):
                     line.append(CH_MARK)
                     continue
-                line.append(self._mark(i, j, at_y, reach, dynamic))
+                line.append(self._mark(i, j, at_y, reach, dynamic, conv))
             rows.append("".join(line))
         return "\n".join(rows)

@@ -621,3 +621,104 @@ def teleport_edges(km, tm) -> dict:
             if b != own and b not in lst2:
                 lst2.append(b)
     return out
+
+
+#: 传送带方向的两套箭头 —— **两类传送带推的东西不一样, 图上必须能分开**:
+#:   · `ConveyorStation`(**台面**传送带, 推**物品**) → 引擎会用它算拦截点 ⇒ 细箭头
+#:   · `Travelator`(**地面**传送带, 推**厨师**) → 引擎当普通可走格, 不管 ⇒ ASCII 箭头
+#:
+#: ⚠ **为什么不是更漂亮的 `⇒`/`▶◀`**: 那些 **GBK 编不出来** ——
+#:   实测 `⇒⇐⇑⇓ ▶◀ ►◄ ▻◅ »« ↔↕` 全部 `UnicodeEncodeError`,
+#:   GBK 里**唯一一套完整的四方向**就是细箭头 `→←↑↓`。
+#:   (这条坑在本项目备忘里: 工具输出里的符号必须能过 GBK, 否则管道一抓就炸。)
+#:   所以地面那套退而求其次用 ASCII —— 方向对、一格一字符、必定编得过。
+#:
+#: 坐标约定和图上一致 —— 图是 `j` 大的画在上面, 而 `j` 随世界 `z` 增大,
+#: 所以 `+z` 是图上的"上"。
+#:
+#: ⚠ `!` 在**叠加图**里是"撞上就死"(`MV_DEADLY`)。地形图/可达图不用它,
+#:   而这两张图才画传送带方向 —— 所以只在叠加图上会重号(那边不传 `conv`)。
+BELT_ARROW = {(1, 0): "→", (-1, 0): "←", (0, 1): "↑", (0, -1): "↓"}
+FLOOR_ARROW = {(1, 0): ">", (-1, 0): "<", (0, 1): "?", (0, -1): "!"}
+
+
+def conveyor_arrows(tm, dyn) -> dict:
+    """**传送带往哪边推** —— `{格: 箭头}`, 喂给 `TerrainMap.ascii(conv=...)`。
+
+    为什么非要把方向画出来: 图上原来只有 `T`(推**厨师**的 `Travelator`) 和
+    `C`(推**物品**的 `ConveyorStation`), 只说了"这是传送带"。
+    而**方向才是关键** —— 知道它往哪推才知道东西会跑到哪、人站上去会被带到哪。
+    一个不知道方向的 `T`, 对寻路和摆盘基本等于白标。
+
+    **两套箭头不一样**(见 `BELT_ARROW` / `FLOOR_ARROW` 的注释): 台面那套(`→←↑↓`)
+    **引擎会处理**, 地面那套(`> < ^ v`)**引擎不管** —— 图上分得开, 才知道
+    "这块地板会把厨师带走, 而寻路并不知道"。
+
+    数据来自插件 `dyn.conveyors` 的 `stepx/stepz`(**每格位移方向**),
+    **不用动 C#**(`BridgeServer.cs:133` 那个 `dyn` 命令本来就带"传送带方向")。
+    """
+    out = {}
+    if tm is None or not getattr(tm, "ok", False):
+        return out
+    for c in (dyn or {}).get("conveyors") or []:
+        sx = float(c.get("stepx") or 0)
+        sz = float(c.get("stepz") or 0)
+        if abs(sx) < 0.05 and abs(sz) < 0.05:
+            continue                      # 停着的传送带没有方向
+        # 取**主导轴** —— OC2 的传送带都是轴向的, 但读数偶尔带噪声,
+        # 硬要求恰好的 (0,±1)/(±1,0) 会漏掉。
+        k = (1 if sx > 0 else -1, 0) if abs(sx) >= abs(sz) \
+            else (0, 1 if sz > 0 else -1)
+        table = FLOOR_ARROW if c.get("type") == "Travelator" else BELT_ARROW
+        a = table.get(k)
+        if not a:
+            continue
+        cell = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
+        if tm.inside(*cell):
+            out[cell] = a
+    return out
+
+
+def conveyor_edges(tm, dyn) -> dict:
+    """**地面传送带把你往哪送** —— `{格: [落点格]}`, 喂给泛洪/A* 的 `extra_edges`。
+
+    和传送门边同一套机制(都是"到了这一格, 就也能到那一格"), 但**语义不一样**:
+      · 传送门是**瞬移** —— 不判高度, 落点是不是地板都无所谓
+      · 传送带是**被推着走** —— 落点还是地面。所以**落点必须可走**才算一条边:
+        尽头是水/空洞时**不给边**(那不是"能去", 那是"会死", 是另一码事)。
+
+    依据(反编译, 三处串起来才是完整链条):
+      · `Travelator.cs:134` `GetSurfaceVelocity() = m_speed * 方向`(默认 `m_speed=1`)
+      · `SurfaceMovable.cs:42` `Update()` **无条件每帧**算,
+        和厨师有没有输入**无关**
+      · `RigidbodyMotion.cs:43` `Movement(v,dt)` → **`MovePosition(pos + v*dt)`**
+        —— 是**直接挪位置**, 不是设速度
+    ⇒ 站在带子上**输入为 0 也照推**; 默认 1 u/s 而厨师 4 u/s, 所以**逆流仍走得动**。
+
+    ⚠ 于是这条边**大多数时候和普通邻接重复**(`T` 可走 + 相邻同高, 泛洪本来就通)。
+      它真正不重复的只有两种:
+        · **带速被关卡调大**(≥4 u/s) ⇒ 上游上不去
+        · **带子尽头有落差** ⇒ 带子送你下去, 而 `step_ok` 会拦
+    """
+    out = {}
+    if tm is None or not getattr(tm, "ok", False):
+        return out
+    for c in (dyn or {}).get("conveyors") or []:
+        if c.get("type") != "Travelator":
+            continue                      # 台面传送带推的是物品, 不推人
+        sx = float(c.get("stepx") or 0)
+        sz = float(c.get("stepz") or 0)
+        if abs(sx) < 0.05 and abs(sz) < 0.05:
+            continue                      # 停着的带子不推人
+        k = (1 if sx > 0 else -1, 0) if abs(sx) >= abs(sz) \
+            else (0, 1 if sz > 0 else -1)
+        src = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
+        if not tm.inside(*src):
+            continue
+        dst = (src[0] + k[0], src[1] + k[1])
+        if not tm.inside(*dst) or not tm.walkable(*dst):
+            continue                      # 尽头不能站 → 不给边(那是"会死", 不是"能去")
+        lst = out.setdefault(src, [])
+        if dst not in lst:
+            lst.append(dst)
+    return out

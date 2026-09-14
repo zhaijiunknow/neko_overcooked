@@ -20,7 +20,15 @@ import time
 
 from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed
 from map_model import (KitchenMap, Station, is_plate, is_pot, is_extinguisher,
-                       teleport_edges)
+                       teleport_edges, conveyor_edges)
+#: 地面传送带的字符。**从 terrain 导进来而不是抄一份** ——
+#: "判定和显示只能有一条规则", 抄一份迟早会漂(这一轮已经栽过好几次)。
+from terrain import CH_TRAVELATOR
+
+#: 选站位时给**传送带格**加的距离惩罚 —— 只是排到所有非传送带格之后,
+#: 不是排除(旁边只有带子时还是得站上去)。取个远大于地图尺寸的数:
+#: 格子距离是平方, 一张图最多几百格, 1e6 足够"跨类别"而不影响同类内部的远近排序。
+BELT_STAND_PENALTY = 1e6
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
 
@@ -831,7 +839,7 @@ class Engine:
         km = self.map(st) if st else None
         i, j = tm.cell_of(tx, tz)
         reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
-                                  extra_edges=teleport_edges(km, tm))
+                                  extra_edges=self._travel_edges(km, tm))
         best, best_d = None, None
         for dj in range(-max_di, max_di + 1):
             for di in range(-max_di, max_di + 1):
@@ -846,6 +854,13 @@ class Engine:
                     continue          # 站得到但过不去, 等于没用
                 wx, wz = tm.world_of(*c)
                 d = (wx - cx) ** 2 + (wz - cz) ** 2
+                # ☠ **别选传送带格当站位**: 站在带子上**输入为 0 也会被推走**
+                #   (`RigidbodyMotion.Movement` = `MovePosition(pos + v·dt)`,
+                #    和厨师有没有按方向键无关 —— 见 `conveyor_edges` 的注释)。
+                #   站在那儿交互 = 人一直在漂, 交互判定时有时无, 表现成"卡住/来回抖"。
+                #   用**足够大的惩罚**而不是直接排除: 旁边只有带子时还是得站上去。
+                if tm.at(*c) == CH_TRAVELATOR:
+                    d += BELT_STAND_PENALTY
                 if best_d is None or d < best_d:
                     best_d, best = d, (wx, wz)
         return best
@@ -868,7 +883,7 @@ class Engine:
         km = self.map(st) if st else None
         i, j = tm.cell_of(tx, tz)
         reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
-                                  extra_edges=teleport_edges(km, tm))
+                                  extra_edges=self._travel_edges(km, tm))
         avoid = avoid or set()
         out, blocked = [], []
         for dj in range(-max_di, max_di + 1):
@@ -879,7 +894,13 @@ class Engine:
                 if not tm.walkable(*c) or c not in reach:
                     continue
                 wx, wz = tm.world_of(*c)
-                row = (((wx - cx) ** 2 + (wz - cz) ** 2), wx, wz)
+                # ☠ 传送带格排在**所有非传送带格之后**(同 `_stand_cell`):
+                #   站上去输入为 0 也会被推走, 交互会时有时无。惩罚足够大 ⇒
+                #   只有当旁边**全是**带子时才会退而求其次选它。
+                d0 = (wx - cx) ** 2 + (wz - cz) ** 2
+                if tm.at(*c) == CH_TRAVELATOR:
+                    d0 += BELT_STAND_PENALTY
+                row = (d0, wx, wz)
                 (blocked if c in avoid else out).append(row)
         out.sort()
         blocked.sort()
@@ -1530,6 +1551,37 @@ class Engine:
         self.log("[遥感] 按了交互但还在会话里")
         return False
 
+    def _travel_edges(self, km, tm):
+        """本帧的**额外边** = 传送门 + **地面传送带**。按地形对象缓存。
+
+        为什么合在一起: 泛洪和 A* 都只认**一个** `extra_edges` 参数 ——
+        分成两处传的话迟早有一处漏传, 那就又回到 §5.1 那个
+        "工具静默地什么都没做"(实测: 漏传传送门边让可达少算 15 格)。
+
+        缓存键用**对象身份**而不是版本号: `Engine.terrain()` 没变时返回的是
+        **同一个 `TerrainMap` 对象**, 变了才换新的 —— 身份就是最准的"变了没有"。
+        """
+        c = getattr(self, "_travel_cache", None)
+        if c is not None and c[0] is tm:
+            return c[1]
+        ed = {}
+        try:
+            for k, vs in (teleport_edges(km, tm) or {}).items():
+                ed.setdefault(k, []).extend(vs)
+        except Exception as e:
+            self.log(f"[边] 传送门边构造失败: {e}")
+        try:
+            dyn = self.bridge.get_dyn() or {}
+            for k, vs in conveyor_edges(tm, dyn).items():
+                lst = ed.setdefault(k, [])
+                for t in vs:
+                    if t not in lst:
+                        lst.append(t)
+        except Exception as e:
+            self.log(f"[边] 传送带边构造失败: {e}")
+        self._travel_cache = (tm, ed)
+        return ed
+
     def _pilot_probe(self, term) -> bool:
         """**"现在动的是平台还是厨师?"** —— 进/退会话的判据都靠它。
 
@@ -1882,8 +1934,8 @@ class Engine:
 
             # 会动的东西(路人/车)当前占住的格子 —— 每次都重算, 因为它们在动
             blk = self._dynamic_blocks(km, tm)
-            # 传送门作为**额外的边**(不是地形): 到这一格就也能到对端。
-            tedges = teleport_edges(km, tm)
+            # **额外边**(传送门 + 地面传送带): 到这一格就也能到那一格。
+            tedges = self._travel_edges(km, tm)
 
             def _plan(blocked):
                 """三条路依次试。blocked 传空 = 不避让会动的东西。"""

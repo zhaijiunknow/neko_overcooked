@@ -26,7 +26,8 @@ from neko.bridge.client import BridgeClient, BridgeError   # noqa: E402
 from neko.terrain import (TerrainMap, HEIGHT_TOLERANCE,     # noqa: E402
                           CH_MARK)
 from neko.map_model import (KitchenMap, is_extinguisher,    # noqa: E402
-                            is_pot, is_plate, teleport_edges)
+                            is_pot, is_plate, teleport_edges,
+                            conveyor_arrows)
 
 #: 叠加图里"会动的东西"和厨师手上那件东西的符号。
 MV_DEADLY = "!"      # 撞上就死(RespawnCollider: 车/水)
@@ -440,7 +441,8 @@ def watch_loop(b, st0: dict, dyn0: dict, interval: float = 2.0,
         # **只打这一张** —— 原始地形图/叠加图在主图里已经有了, 这一节只回答
         # "哪儿到得了", 别把日志淹掉。
         print("  可达图(到不了的画成 '-'):")
-        for line in tm.ascii(at_y=cy, reach=_r).split("\n"):
+        for line in tm.ascii(at_y=cy, reach=_r,
+                             conv=conveyor_arrows(tm, dyn)).split("\n"):
             print("    " + line)
         _flush_md()          # ← 每片都落盘: 被 timeout 杀掉也不丢(见 _MD 的注释)
         prev_reach = _r
@@ -572,6 +574,12 @@ LEGEND = """
        V  空洞(没地面, 会掉下去) / **站不下**(太低或太高)
        x  物理阻挡(不占格子但有碰撞体)
        C  台面传送带(走不上去, 而且放上去的东西会被传走)
+       →↓←↑ **台面**传送带(`C`, 推**物品**)的方向 —— **引擎会用它算拦截点**
+       > < ? ! **地面**传送带(`T`, 推**厨师**)的方向 —— ⚠**引擎当普通可走格, 不管**
+            两套分开是因为推的东西不一样, 处理也不一样。只标"这是传送带"没用:
+            知道**往哪推**才知道东西会跑到哪、人站上去会被带到哪。
+            图是俯视: `→`/`>` = 世界 +x, `↑`/`^` = 世界 +z
+            (⚠ 不用 `⇒`: GBK 编不出来, 管道一抓就炸。GBK 里完整的四方向只有 `→←↑↓`)
        ~  **动态格**: 监视期间"变过"的格子(限时平台/升降台/轮换的地板)。
           一张静态图没法表达"这格有时在有时不在", 所以标出来 ——
           **不标的话它们看上去就是常驻**, 而那会骗人。
@@ -588,6 +596,9 @@ REACH_LEGEND = """
              ⚠ 它**和空洞不是一回事** —— 空洞是 `V`。两者原来共用一个字符,
              于是可达集一变(实测 42 ↔ 78)整张图就换个样子, 看着像地图坏了。
        `.` = 可走且到得了;  其余字符(V/#/x/H/F/…)和地形图同义。
+       `→↓←↑`(台面传送带) / `> < ? !`(地面传送带) = 传送带方向。
+       ⚠ 这里**"到不了"优先于方向** —— 传送带那格如果从厨师过不去,
+       画的是 `-` 不是箭头(否则"能不能过去"被方向盖掉了)。
        落差按**相邻格之间**算: 有台阶就爬得上去、落差太大就过不去;
        平台沉下去 = 邻格和它差一大截 = 进不去 = 洞。
 """
@@ -1101,6 +1112,9 @@ def main() -> int:
     except Exception:
         _dyn = {}
     _plats = _dyn.get("platforms") or []
+    # **传送带方向** —— 图上把 `T`/`C` 换成箭头(见 `map_model.conveyor_arrows`)。
+    # 和 `_dyn` 一起在地形图之前算好: 图要用, 后面那节机关清单也要用。
+    _conv = conveyor_arrows(tm, _dyn)
 
     # **泛洪一次, 两张图共用** —— 图上要表达的是"**我到得了哪**"(连通性),
     # 而那是泛洪才能答的: 水面/沟对面的地每格都"迈得进来", 可厨师过不去。
@@ -1187,11 +1201,11 @@ def main() -> int:
     # **原始网格**: 不判可达, 只画地形本身(加上"站不下"的静态投影)。
     # 为什么要单独一张(用户定): 带可达的那张, 可达集一大一小图面就整个变样
     # (实测 42 ↔ 78), 于是"地形到底长什么样"反而看不出来了。
-    print(tm.ascii(at_y=chef_y))
+    print(tm.ascii(at_y=chef_y, conv=_conv))
     print(LEGEND)
 
     print("\n---- 可达图 (地形 + 泛洪: 到不了的画成 '-') ----")
-    print(tm.ascii(cx, cz, at_y=chef_y, reach=_reach))
+    print(tm.ascii(cx, cz, at_y=chef_y, reach=_reach, conv=_conv))
     print(REACH_LEGEND)
 
     print("\n---- 叠加图 (地形 + 台面语义 + 厨师) ----")
