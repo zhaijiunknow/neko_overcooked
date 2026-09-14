@@ -159,6 +159,18 @@ namespace Overcooked2AI.Game
                         method = "ReceiveThrowEvent";
                         target = Held(controls);
                         break;
+                    case "spray":       // 开喷雾(灭火器)
+                    case "unspray":     // 停喷雾
+                        // ⚠ **必须大小写不敏感**。这里原来写的是 `action == "spray"` ——
+                        //   而分派那一行是 `switch (action.ToLowerInvariant())`:
+                        //   ⇒ 输入 `SPRAY` / `Spray` 时**分支能进, 但这个比较是 false**,
+                        //     于是"开喷雾"静默变成"**停喷雾**", 而且照样返回 `ok:true`。
+                        //   实测踩过: 引擎一直发的是大写 `SPRAY`(为了绕开早就改名的诊断
+                        //   命令), 于是 `Engine.extinguish()` **从来没真的喷过** ——
+                        //   两次调用都是"停喷", 看起来却全成功。
+                        return SprayAction(controls,
+                            string.Equals(action, "spray",
+                                          StringComparison.OrdinalIgnoreCase));
                     default:
                         return Err("未知动作: " + action);
                 }
@@ -179,6 +191,78 @@ namespace Overcooked2AI.Game
                     player, Safe(action), method, Safe(target != null ? target.name : "(null)"),
                     Safe(holding ? "yes" : "no"), Safe(pick != null ? pick.name : ""),
                     Safe(place != null ? place.name : ""), extra);
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException != null ? ex.InnerException.Message : "";
+                return Err(ex.GetType().Name + ": " + ex.Message + (inner.Length > 0 ? " / " + inner : ""));
+            }
+        }
+
+        /// <summary>**开关灭火器的喷雾** —— 绕开输入层, 直接调游戏自己的触发入口。
+        ///
+        /// 为什么走这条(完整排查经过):
+        ///   · 喷雾由 `ServerSprayingUtensil.OnTrigger(string)` 驱动
+        ///     (`ServerSprayingUtensil.cs:91-101`), 它比对的是
+        ///     `SprayingUtensil.m_startSprayTrigger` / `m_stopSprayTrigger` ——
+        ///     两个**只存在于 prefab 里**的字符串(反编译源码搜 spray 字面量零命中,
+        ///     AssetBundle 又是压缩的, 静态读不到)。运行时实测拿到:
+        ///     **"StartSpray" / "StopSpray"**。
+        ///   · `OnTrigger` 是 **public**(实现 `ITriggerReceiver`), 所以能直接调。
+        ///   · `direct("use")` 那条路打的是 `m_interactable`, **不是喷雾** ——
+        ///     不能指望它(虽然灭火器自己是个 `UsableItem : Interactable`,
+        ///     但中间还隔着 prefab 里的 `m_onInteractImpulseTrigger`, 没验证过)。
+        ///
+        /// 服务端效果(`ServerFireExtinguishSpray.cs:37-57`): 每帧遍历
+        ///   `ServerFlammable.GetAllOnFire()`, 凡 `IsInSpray` 的 `FightFire(0.5s, dt)`
+        ///   ⇒ `fireStrength -= 2*dt` ⇒ **持续喷 0.5 秒灭掉一个满强度的火**。
+        /// 命中判据(`ServerSprayingUtensil.cs:117-139`): 以**厨师**为原点、
+        ///   用厨师的 forward, **15° 半锥 + 4 射程 + 0.6 物品半径** ⇒ **必须正对**。
+        /// 两个副作用: 喷的时候 `MovementScale=0`(原地定住, 可转向);
+        ///   拿着灭火器的人 `SetCanCatchFire(false)`(不会着火)。
+        /// </summary>
+        private static string SprayAction(PlayerControls controls, bool on)
+        {
+            try
+            {
+                GameObject held = Held(controls);
+                if (held == null)
+                    return Err("手上没东西 —— 要先拿起灭火器");
+
+                // 触发字符串从组件上读, **不硬编码** —— 水枪(WaterGunSpray)可能不一样
+                string trigger = null;
+                foreach (var tn in new string[] {
+                    "SprayingUtensil", "FireExtinguishSpray", "WaterGunSpray" })
+                {
+                    var t = SceneScanner.FindType(tn);
+                    if (t == null)
+                        continue;
+                    var data = held.GetComponent(t);
+                    if (data == null)
+                        continue;
+                    var fn = on ? "m_startSprayTrigger" : "m_stopSprayTrigger";
+                    var f = t.GetField(fn, BindingFlags.Instance
+                                          | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (f != null)
+                        trigger = f.GetValue(data) as string;
+                    break;
+                }
+
+                var st = SceneScanner.FindType("ServerSprayingUtensil");
+                var server = st != null ? held.GetComponent(st) : null;
+                if (server == null)
+                    return Err("手上的东西不是喷雾器(没有 ServerSprayingUtensil): " + held.name);
+                if (string.IsNullOrEmpty(trigger))
+                    trigger = on ? "StartSpray" : "StopSpray";   // 兜底(实测值)
+
+                var m = st.GetMethod("OnTrigger", new Type[] { typeof(string) });
+                if (m == null)
+                    return Err("ServerSprayingUtensil.OnTrigger 找不到");
+                m.Invoke(server, new object[] { trigger });
+
+                return string.Format(
+                    "{{\"ok\":true,\"action\":\"{0}\",\"target\":\"{1}\",\"trigger\":\"{2}\"}}",
+                    on ? "spray" : "unspray", Safe(held.name), Safe(trigger));
             }
             catch (Exception ex)
             {

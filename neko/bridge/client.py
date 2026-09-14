@@ -97,18 +97,35 @@ class BridgeClient:
         """
         return self._send({"cmd": "path", "chef": chef, "tx": tx, "tz": tz})
 
-    def get_map(self, force: bool = False) -> dict:
-        """整张关卡网格 + 危险区 + 空洞 + 平台。见 neko/terrain.py 的 TerrainMap。"""
-        return self._send({"cmd": "map", "arg": "force" if force else ""})
+    def get_map(self, force: bool = False, max_age: float = None) -> dict:
+        """整张关卡网格 + 危险区 + 空洞 + 平台。见 neko/terrain.py 的 TerrainMap。
+
+        `max_age` = **最多接受多旧的数据**(秒)。C# 侧默认缓存 5 秒 —— 对人看地图
+        够用, 但**寻路前**太旧: 限时平台升降这类变化, 5 秒足够厨师走出 20 格,
+        拿着旧图规划就是往海里走。传小的值(如 1.0)会强制它更新鲜。
+        """
+        arg = "force" if force else ""
+        if max_age is not None and not force:
+            arg = ("%s maxage=%s" % (arg, float(max_age))).strip()
+        return self._send({"cmd": "map", "arg": arg})
 
     def get_dyn(self) -> dict:
         """关卡里的机关/陷阱: 按钮 / 传送带方向 / 触发机器 / 平台 / 正在烧的东西 / 关卡变形。"""
         return self._send({"cmd": "dyn"})
 
+    def get_movers(self) -> dict:
+        """**会动的东西**: 路人 / 车辆 / 移动危险物。
+
+        地形图是整局一次的静态快照, 看不见它们 —— 而车会开、路人会走,
+        所以"地图标的安全格"可能是过期的。每条带 `moved` 字段(和上一帧比位置变没变),
+        那才是"它是不是在动"的通用判据。见 MoverScan 的注释。
+        """
+        return self._send({"cmd": "movers"})
+
     def get_spray(self) -> dict:
         """灭火器诊断: 喷雾的**触发字符串**(写在 prefab 里, 反编译源码和 bundle 都读不到)
         + 它的组件清单(找 Interactable)。见 InteractiveScan.SprayDiag()。"""
-        return self._send({"cmd": "spray"})
+        return self._send({"cmd": "sprayinfo"})
 
     def get_grid(self) -> dict:
         """**游戏自己的网格**: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。

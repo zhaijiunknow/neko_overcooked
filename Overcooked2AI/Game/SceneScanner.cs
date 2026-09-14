@@ -206,11 +206,18 @@ namespace Overcooked2AI.Game
 
             if (n > 0)
                 stations.Append(",");
+            // `active` = 这个物体**现在在不在场**(GameObject.activeInHierarchy)。
+            // 为什么要有(用户实测指出): 限时构件(例: s_wizard_school_3_4 的传送门,
+            // 和限时楼梯轮换)会**整块启用/停用**, 而台面清单原来不管这个 ——
+            // 于是一扇当前根本不存在的门, 在地图上照样被画成一个常驻的 `O`。
+            // **那是显示层在替限时构件打包票**, 和人读到"地图说安全"就去走同一个毛病。
+            bool active = true;
+            try { active = r.go.activeInHierarchy; } catch (Exception) { }
             stations.Append(string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "{{\"id\":\"{0}_{1}\",\"iid\":{2},\"kind\":\"{3}\",\"name\":\"{4}\",\"x\":{5:F2},\"y\":{6:F2},\"z\":{7:F2}{8}{9}}}",
+                "{{\"id\":\"{0}_{1}\",\"iid\":{2},\"kind\":\"{3}\",\"name\":\"{4}\",\"x\":{5:F2},\"y\":{6:F2},\"z\":{7:F2},\"active\":{10}{8}{9}}}",
                 r.typeName, n, r.iid, r.typeName, SafeName(r.name), x, y, z,
-                r.staticJson, DescribeDynamic(r, now)));
+                r.staticJson, DescribeDynamic(r, now), active ? "true" : "false"));
             n++;
         }
 
@@ -891,6 +898,34 @@ namespace Overcooked2AI.Game
             return r;
         }
 
+        /// <summary>按名字反射读一个字段, 读不到返回 null(不抛)。
+        ///
+        /// ⚠ 这里**不能用 `Func&lt;&gt;` / lambda** —— 本插件是用 `-nostdlib+` 显式引
+        ///   .NET **2.0** 的 mscorlib 编译的(`build.bat`), 而 `Func&lt;T,TResult&gt;` 是
+        ///   3.5 才进 mscorlib 的 ⇒ `error CS0246: 未能找到类型 Func&lt;,&gt;`(实测踩过)。
+        ///   所以这类小工具一律写成方法。</summary>
+        private static object ObjField(Type t, object comp, string name)
+        {
+            try
+            {
+                var f = t.GetField(name, BindingFlags.Instance
+                                       | BindingFlags.Public | BindingFlags.NonPublic);
+                return f == null ? null : f.GetValue(comp);
+            }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>同 ObjField, 但转成 float; 读不到返回 0。</summary>
+        private static float NumField(Type t, object comp, string name)
+        {
+            try
+            {
+                object o = ObjField(t, comp, name);
+                return o == null ? 0f : Convert.ToSingle(o);
+            }
+            catch (Exception) { return 0f; }
+        }
+
         /// <summary>台面上内容物的挂点: Stack 优先(它可能被移动), 否则 AttachStation.m_attachPoint。
         /// 物品是挂在它下面的**子 Transform**, 不是字段 —— 所以只能看子物体。
         /// 这是"物品传递/接力(a 放台面 → b 接手)"唯一的观测手段。</summary>
@@ -1074,6 +1109,97 @@ namespace Overcooked2AI.Game
                     sb.Append(string.Format(",\"tag\":\"{0}\"", SafeName(tag)));
             }
             catch (Exception) { }
+
+            // ---- 传送门: **配对** ----
+            //
+            // 传送门是**两两配对**的, 而配对信息就是 `Teleportal` 上的一个**直接引用**:
+            //   `Teleportal.cs:13-14`  `[SerializeField] public GameObject m_exitPortal;`
+            // 我们原来只读名字+坐标 ⇒ 三扇门在管线里是**三个互不相干的点**, 谁也不通向谁,
+            // 规划层就没法把"门"当成一条边用(只能当装饰)。
+            //
+            // 顺带把**落点**读出来: `m_teleportPoint`(Teleportal.cs:5-7) 才是真正把人
+            // 放下的位置, 和门的视觉位置**不是一处** —— 实测 s_wizard_school_3_4 上
+            // 占用表说门在 z=8.4 而物体在 z=7.28, 差约一格。拿视觉位置当落点会
+            // "站在门外够不着"。
+            //
+            // 还有 `m_cooldownTime` / `m_receiveDelay`: 连着用会不会被冷却卡住,
+            // 是规划时要考虑的时序。`m_teleportArc` 决定出来之后的朝向。
+            // ---- 遥感/遥控驾驶台: **现在是不是正在驾驶** ----
+            //
+            // 机制(反编译, 见 `Terminal.cs` / `ServerTerminal.cs` / `ServerPilotMovement.cs`):
+            //   走到控制台按交互 → 开始一个 session:
+            //     · 厨师自己的 `PlayerControls.enabled = false`, 刚体转 kinematic(人定住)
+            //     · 控制权交给被驾驶的物体(`AssignPlayer(ControlScheme)`)
+            //   ⇒ **此后发的移动键驱动的是那块平台, 不是厨师**。
+            //   会话在按下 拾取/交互/冲刺 任意一个键时结束。
+            //
+            // 为什么必须报出来: 引擎不知道这件事就会**把平台当厨师开** ——
+            //   `navigate()` 发移动键 → 平台乱跑; 卡住检测判"厨师卡住" → 侧移脱困 → 更乱。
+            //   而"退出"用的正是交互键, 所以 `interact()` 在会话中等于**踩刹车**。
+            //
+            // 信号是现成的公开属性: `ClientSessionInteractable.HasSession => m_session != null`。
+            if (typeName == "Terminal")
+            {
+                try
+                {
+                    var ct = SceneScanner.FindType("ClientTerminal");
+                    var comp = ct != null ? go.GetComponent(ct) : null;
+                    if (comp != null)
+                    {
+                        var prop = ct.GetProperty("HasSession");
+                        bool has = prop != null && (bool)prop.GetValue(comp, null);
+                        sb.Append(",\"session\":").Append(has ? "true" : "false");
+                    }
+                    // 顺便报出**它驾驶的是哪个物体** —— 便于把"台子"和"平台"对上。
+                    var term = go.GetComponent(typeName);
+                    if (term != null)
+                    {
+                        object po = ObjField(term.GetType(), term, "m_pilotableObject");
+                        var pc = po as Component;
+                        if (pc != null && pc.gameObject != null)
+                            sb.Append(",\"pilots\":\"").Append(SafeName(pc.gameObject.name))
+                              .Append("\"");
+                    }
+                }
+                catch (Exception) { }
+            }
+
+            if (typeName == "Teleportal")
+            {
+                try
+                {
+                    var comp = go.GetComponent(typeName);
+                    if (comp != null)
+                    {
+                        var t = comp.GetType();
+
+                        var exit = ObjField(t, comp, "m_exitPortal") as GameObject;
+                        if (exit != null)
+                        {
+                            Vector3 ep = exit.transform.position;
+                            sb.Append(string.Format(
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                ",\"exitPortal\":\"{0}\",\"exitX\":{1:F2},\"exitZ\":{2:F2}",
+                                SafeName(exit.name), ep.x, ep.z));
+                        }
+                        var pt = ObjField(t, comp, "m_teleportPoint") as Transform;
+                        if (pt != null)
+                        {
+                            Vector3 lp = pt.position;
+                            sb.Append(string.Format(
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                ",\"landX\":{0:F2},\"landZ\":{1:F2}", lp.x, lp.z));
+                        }
+                        sb.Append(string.Format(
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            ",\"arc\":{0:F1},\"cooldown\":{1:F2},\"recvDelay\":{2:F2}",
+                            NumField(t, comp, "m_teleportArc"),
+                            NumField(t, comp, "m_cooldownTime"),
+                            NumField(t, comp, "m_receiveDelay")));
+                    }
+                }
+                catch (Exception) { }
+            }
 
             // CookingStation.m_stationType (Hob/Oven/Fryer...)
             //

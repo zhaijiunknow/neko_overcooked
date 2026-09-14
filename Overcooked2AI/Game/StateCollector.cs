@@ -26,6 +26,10 @@ namespace Overcooked2AI.Game
         /// 依据: 游戏自己的 `GameUtils.GetAllIngredients()`(GameUtils.cs:504)。</summary>
         private string _itemsCache = "[]";
         private float _lastItemsScan = -10f;
+        /// <summary>**会动的东西**: 路人 / 车辆 / 移动危险物 —— 0.1 秒刷新。
+        /// 地形的静态快照看不见它们(moved 字段才是判据), 见 MoverScan 的注释。</summary>
+        private string _moversCache = "[]";
+        private float _lastMoverScan = -10f;
 
         // ---- 主线程任务(桥发起, 主线程执行) ----
         private string _jobKind = "";
@@ -94,6 +98,8 @@ namespace Overcooked2AI.Game
                     json = InteractiveScan.Snapshot();
                 else if (kind == "spray")
                     json = InteractiveScan.SprayDiag();
+                else if (kind == "movers")
+                    json = MoverScan.Snapshot();
                 else if (kind == "grid")
                     json = GridInfo.Snapshot();
                 else if (kind == "cells")
@@ -192,6 +198,17 @@ namespace Overcooked2AI.Game
                     catch (Exception) { }
                 }
 
+                // 会动的东西(路人/车辆/移动危险物): 0.1 秒 —— 地形快照看不见它们
+                if (now - _lastMoverScan >= 0.1f)
+                {
+                    _lastMoverScan = now;
+                    try
+                    {
+                        _moversCache = MoverScan.Snapshot();
+                    }
+                    catch (Exception) { }
+                }
+
                 // 全场景食材(按 tag): 0.1 秒 —— 补"不在台面上的食材"这个盲区
                 if (now - _lastItemsScan >= 0.1f)
                 {
@@ -243,6 +260,7 @@ namespace Overcooked2AI.Game
                 layout = "{\"stations\":" + _stationsCache
                        + ",\"chefs\":" + _chefsCache
                        + ",\"items\":" + _itemsCache
+                       + ",\"movers\":" + _moversCache
                        + ",\"cooking\":[" + _cookCache + "]}";
                 recipePool = _recipeCache;
             }
@@ -256,6 +274,7 @@ namespace Overcooked2AI.Game
                 _stationsCache = "[]";
                 _cookCache = "[]";
                 _itemsCache = "[]";
+                _moversCache = "[]";
                 // 台面静态缓存的引用会指向已销毁的对象 —— 换关必须作废重建
                 try { SceneScanner.InvalidateStationCache(); } catch (Exception) { }
             }

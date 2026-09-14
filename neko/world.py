@@ -37,6 +37,11 @@ class World:
         self._km_t = 0.0
         self._tm = None
         self._tm_scene = ""
+        self._tm_ver = ""       # 上面那份地形的版本号(C# 算的), 见 terrain()
+        self._tm_at = 0.0       # 上面那份是什么时候取的
+        #: 地形保质期(秒)。**这是"跳海"的保险丝** —— 理由见 terrain() 的注释:
+        #: 限时平台升降只改高度不改字符, 整局不刷新就会拿着旧图走进海里。
+        self.terrain_ttl = 1.5
         self._resv: dict[tuple, tuple] = {}     # cell -> (cid, 过期时刻)
         self.state_fetches = 0
         self.state_cache_hits = 0
@@ -86,16 +91,23 @@ class World:
 
     # ---------------- 地形(整关可走图) ----------------
     def terrain(self, force: bool = False):
-        """共享的 TerrainMap: 同一关卡只拉一次、只解一次。"""
+        """共享的 TerrainMap: 同一关卡只拉一次、只解一次 —— **但有保质期**。
+
+        ⚠ 保质期和版本号的理由同 `Engine.terrain()` 那段长注释: 限时平台升降、
+          荷叶沉浮这类变化**只改高度不改字符**, 整局不刷新就会拿着"平台还升着"
+          的旧图去寻路 → 走进海里。双人模式走的就是这一条路径, 所以这里也必须改。
+        """
         from terrain import TerrainMap
         st = self.state()
         scene = (st or {}).get("scene") or ""
+        now = time.time()
         with self._lock:
             if (not force and self._tm is not None
-                    and self._tm_scene == scene and self._tm.ok):
+                    and self._tm_scene == scene and self._tm.ok
+                    and (now - self._tm_at) < self.terrain_ttl):
                 return self._tm
         try:
-            data = self.br.get_map(force=force)
+            data = self.br.get_map(force=force, max_age=self.terrain_ttl)
         except Exception as e:
             self.log(f"[地形] 取图失败: {e}")
             with self._lock:
@@ -113,11 +125,21 @@ class World:
                 return self._tm
         with self._lock:
             old = self._tm
+            if old is not None and old.ok and self._tm_scene == scene:
+                if tm.ver:
+                    same = (tm.ver == self._tm_ver)       # 权威判据
+                else:
+                    same = (tm.counts == old.counts)      # 老 dll: 退化成比计数
+                self._tm_at = now
+                if not force and same:
+                    return old                                # 没变 → 沿用旧对象
             if old is None or not old.ok or tm.counts != old.counts:
-                self.log(f"[地形] {tm.w}x{tm.h} 格 步长({tm.cellx:.2f},{tm.cellz:.2f}) "
-                         + tm.describe_dangers())
+                self.log(f"[地形] 更新 ver={tm.ver or 'n/a'}  {tm.w}x{tm.h} 格 "
+                         f"步长({tm.cellx:.2f},{tm.cellz:.2f}) " + tm.describe_dangers())
             self._tm = tm
             self._tm_scene = scene
+            self._tm_ver = tm.ver
+            self._tm_at = now
             self.tm_rebuilds += 1
         return tm
 

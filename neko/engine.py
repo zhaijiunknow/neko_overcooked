@@ -19,7 +19,8 @@ import os
 import time
 
 from bridge.keyboard_input import KeyboardPlayer, PLAYER1, PLAYER2, ensure_focus, game_focused, panic_pressed
-from map_model import KitchenMap, Station, is_plate, is_pot
+from map_model import (KitchenMap, Station, is_plate, is_pot, is_extinguisher,
+                       teleport_edges)
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
 
@@ -65,8 +66,18 @@ class Engine:
         self._assemble_sid: str = ""
         self._stove_used = ""                        # 当前占用的灶台(用完释放)
         self._probed = False                         # 是否已实测过键位归属
+        self._last_fire_check = 0.0                  # 上次查火的时间(节流见 run())
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
         self._terrain_scene = ""
+        self._terrain_at = 0.0                       # 上面那份是什么时候取的(见 terrain 的 TTL)
+        self._terrain_ver = ""                       # 上面那份的版本号(变没变的便宜判据)
+        #: 地形最多能用多久(秒) —— 超过就重取一次。
+        #: **这是"跳海"的保险丝**。原先地形按场景缓存、**整局不刷新**,
+        #: 而限时平台升降/荷叶沉浮/潮水都会改地形, 且**只改高度不改字符** ——
+        #: 于是引擎会拿着"平台还升着"的旧图规划, 直接走进海里
+        #: (实测 s_wonderland_1_2: 66 格高度在 0.00 ↔ -3.00 之间循环, 字符一格不变)。
+        #: 取 1.5 秒: 比 C# 默认的 5 秒缓存短, 所以会真的触发重取; 又不至于每帧都建图。
+        self.terrain_ttl = 1.5
         self._last_fail_step = ""                    # 最后失败在哪一步(供主循环判断重复失败)
         #: 台面传送带的"每格往哪传"表 + 速度, 按场景缓存(来自插件 dyn)
         self._belt_dirs_cache = None
@@ -109,6 +120,21 @@ class Engine:
             if int(c.get("id", -1)) == self.cid:
                 return float(c.get("x", 0)), float(c.get("z", 0)), c.get("held", "")
         return None, None, ""
+
+    def chef_y(self, st: dict) -> float:
+        """**厨师当前的高度** —— 多平台关卡判"这格站不站得下"要用它。
+
+        为什么必须是"这只厨师的 y"而不是某个全局地面高度(实测 s_wizard_school_3_4):
+          C# 侧原来是拿第一只厨师的当前 y 当全局参考去建整张图, 结果
+            ① 随厨师移动而不稳定(同一关两次读出 -1.84 / 0.00);
+            ② 只覆盖一层平台, 另一层全判成空洞 —— 厨师站在自己平台上却被判成
+               "站在空洞上", 可达格数 = 1, 一步都走不了。
+          "站不站得下"是相对量, 所以由引擎把**它自己这只**的 y 传下去。
+        """
+        try:
+            return float(self.chef(st or {}).get("y") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def chef(self, st: dict) -> dict:
         """当前厨师这一帧的完整信息(位置/手持/归属玩家/是否正在重生)。"""
@@ -296,6 +322,12 @@ class Engine:
                 # 方向换算依据 PlayerControlsHelper.GetControlAxis：MoveX 对应世界 x，
                 # MoveY 被取负后才对应世界 z，所以世界 +z 要发 MoveY = -dz。
                 if analog:
+                    # ☠ **遥感地雷**: 如果此刻在**遥控驾驶会话**里, 这里发的方向键
+                    #   驱动的是**被驾驶的平台, 不是厨师** —— 症状是"厨师纹丝不动,
+                    #   平台却开到别处去了", 而这里的分支只会判成"厨师卡住→侧移脱困",
+                    #   于是把平台越开越远。
+                    #   判据: `self.session_station(st) is not None`(见那边的注释);
+                    #   调导航前要么先退出会话, 要么改用 `pilot_to()` 直接开平台。
                     inv = 1.0 / dist if dist > 1e-4 else 0.0
                     driver.move(dx * inv, -dz * inv)
                     time.sleep(0.03)
@@ -453,6 +485,11 @@ class Engine:
             return False
         _, _, held_before = self.pos(st)
         if kind == "pickup":
+            # ☠ **遥感地雷**: 拾取/交互/冲刺 **三个键都是"退出遥控驾驶"的键**
+            #   (`ServerSessionInteractable` 的 `SessionBase.Update`: 按下任一个就
+            #    `OnSessionEnded`)。所以在遥感会话里调 `interact()` 等于**踩刹车** ——
+            #   而它照样返回 True, 看起来像"交互成功"。
+            #   要主动退出请用 `pilot_end()`(它就是干这个的, 名字也说得清)。
             self.kb.pickup()
         elif kind == "chop":
             self.kb.chop()
@@ -785,8 +822,16 @@ class Engine:
         """
         if tm is None or not tm.ok:
             return None
+        # ⚠ **`st` / `km` 必须自己取**: 这里原来直接引用了 `st` 和 `km`, 而它们
+        #   **既不是参数也不是局部变量** —— 那是必然的 `NameError`, 调用点没有一个
+        #   try 兜着, 于是整个"走到台面旁边"的路径全瘫(实测: `_approach` 一进去就炸)。
+        #   症状像 §5.2 记的那种"改调用处时误伤": `at_y=` / `extra_edges=` 是后加的,
+        #   参数没跟着穿进来。自己取一帧最省事(`state()` 吃 TTL 缓存, 几乎不要钱)。
+        st = self.state()
+        km = self.map(st) if st else None
         i, j = tm.cell_of(tx, tz)
-        reach = tm.reachable_from(cx, cz)
+        reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
+                                  extra_edges=teleport_edges(km, tm))
         best, best_d = None, None
         for dj in range(-max_di, max_di + 1):
             for di in range(-max_di, max_di + 1):
@@ -818,8 +863,12 @@ class Engine:
         """
         if tm is None or not tm.ok:
             return []
+        # ⚠ 同 `_stand_cell`: `st`/`km` 原先引用了不存在的名字, 必然 `NameError`。
+        st = self.state()
+        km = self.map(st) if st else None
         i, j = tm.cell_of(tx, tz)
-        reach = tm.reachable_from(cx, cz)
+        reach = tm.reachable_from(cx, cz, at_y=self.chef_y(st),
+                                  extra_edges=teleport_edges(km, tm))
         avoid = avoid or set()
         out, blocked = [], []
         for dj in range(-max_di, max_di + 1):
@@ -1361,24 +1410,373 @@ class Engine:
         from pathing import to_grid
         return set(to_grid(s.x, s.z) for s in km.stations.values())
 
+    # ------------------------------------------------------------ 传送门边
+
+    # ------------------------------------------------------------ 遥感驾驶
+    #
+    # 机制(反编译): 走到 `Terminal` 控制台按交互 → 开始一个 session:
+    #   厨师自己的 `PlayerControls.enabled = false` + 刚体转 kinematic(**人定住**),
+    #   控制权交给被驾驶的物体(`ServerPilotMovement.AssignPlayer`)。
+    #   ⇒ **此后发的移动键驱动的是那块平台, 不是厨师**。
+    #   会话在按下 拾取/交互/冲刺 任意一个键时结束。
+    # 依据: `Terminal.cs` / `ServerTerminal.cs` / `ServerPilotMovement.cs` /
+    #       `ClientSessionInteractable.cs`(`HasSession` 就是那个可读信号)。
+    def session_station(self, st: dict) -> dict:
+        """**我(本地这只厨师)现在在遥感驾驶吗?** 是则返回那个控制台工位, 否则 None。
+
+        为什么非知道不可: 不知道就会**把平台当厨师开** ——
+          `navigate()` 发的移动键全落到平台上; 卡住检测判"厨师卡住"→ 侧移脱困 → 更乱。
+          而且**退出用的正是交互键**, 所以会话中调 `interact()` 等于踩刹车。
+        """
+        for s in ((st or {}).get("layout") or {}).get("stations") or []:
+            if s.get("session"):
+                return s
+        return None
+
+    def pilot_pose(self) -> dict | None:
+        """被驾驶物体的**当前位置**(来自插件 dyn 的 platforms 表)。"""
+        try:
+            dyn = self.bridge.get_dyn()
+        except Exception as e:
+            self.log(f"[遥感] 读机关表失败: {e}")
+            return None
+        plats = dyn.get("platforms") or []
+        if not plats:
+            return None
+        # 优先按控制台说的名字找, 找不到就用第一个
+        want = (self.session_station(self.state()) or {}).get("pilots") or ""
+        for p in plats:
+            if want and (p.get("name") or "") == want:
+                return p
+        return plats[0]
+
+    def pilot_to(self, tm, cell: tuple, budget: float = 20.0,
+                 arrive: float = 0.35) -> bool:
+        """把**被驾驶的平台**开到格子 `cell`。**调用前必须已经在会话里**(见 `session_station`)。
+
+        闭环: 每轮读平台**当前位置** → 算方向 → 发移动键 → 再读。
+        为什么要闭环而不是"按住 N 秒": 平台是**逐格移动且只往空闲格走**
+        (`ServerPilotMovement.Update_Movement` 里先做 0.3 的 BoxCast,
+        目标格被占就退化成只走 x 或只走 z) —— 所以它会被墙挡、会沿边走,
+        按时间开环必然停错地方。
+        """
+        from pathing import dir_for_step
+        from bridge.keyboard_input import ensure_focus, get_driver
+        tx, tz = tm.world_of(*cell)
+        t0 = time.time()
+        last = None
+        while time.time() - t0 < budget:
+            if not ensure_focus(wait_s=1.0):
+                self.kb.release_all()
+                continue
+            p = self.pilot_pose()
+            if p is None:
+                self.log("[遥感] 读不到平台位置(会话结束了吗?)")
+                return False
+            px, pz = float(p.get("x") or 0), float(p.get("z") or 0)
+            dx, dz = tx - px, tz - pz
+            dist = (dx * dx + dz * dz) ** 0.5
+            if dist <= arrive:
+                self.kb.release_all()
+                self.log(f"[遥感] 平台已到位 格({cell[0]},{cell[1]}) 世界({px:.1f},{pz:.1f})")
+                return True
+            driver = get_driver()
+            analog = driver is not None and hasattr(driver, "move")
+            if analog:
+                inv = 1.0 / dist if dist > 1e-4 else 0.0
+                driver.move(dx * inv, -dz * inv)
+                time.sleep(0.05)
+            else:
+                d = dir_for_step(dx, dz, deadzone=0.05)
+                if not d:
+                    self.kb.release_all()
+                    continue
+                key = self._key({"left": "A", "right": "D",
+                                 "up": "W", "down": "S"}[d])
+                from bridge.keyboard_input import key_down, key_up
+                key_down(key)
+                time.sleep(min(0.25, max(0.06, max(abs(dx), abs(dz)) / self.speed)))
+                key_up(key)
+                time.sleep(0.05)
+            # 没动 = 被挡住/顶住, 交给上层决定(别在这儿死等)
+            if last is not None and abs(px - last[0]) < 0.05 and abs(pz - last[1]) < 0.05:
+                self._pilot_stuck = getattr(self, "_pilot_stuck", 0) + 1
+                if self._pilot_stuck >= 12:
+                    self.kb.release_all()
+                    self.log(f"[遥感] 平台卡在 ({px:.1f},{pz:.1f}), 距目标还 {dist:.1f}")
+                    self._pilot_stuck = 0
+                    return False
+            else:
+                self._pilot_stuck = 0
+            last = (px, pz)
+        self.kb.release_all()
+        self.log(f"[遥感] 超时({budget}s)还没把平台开到 格({cell[0]},{cell[1]})")
+        return False
+
+    def pilot_end(self) -> bool:
+        """退出遥感会话(按交互键 —— 拾取/交互/冲刺任一即可)。
+
+        ⚠ 这也是为什么会话中**不能随手调 `interact()`**: 那正是退出键。
+        """
+        self.kb.release_all()
+        time.sleep(0.1)
+        self.kb.pickup()
+        time.sleep(0.35)
+        st = self.state(force=True)
+        s = self.session_station(st) if st else None
+        if s is None:
+            self.log("[遥感] 已退出驾驶")
+            return True
+        self.log("[遥感] 按了交互但还在会话里")
+        return False
+
+    def _pilot_probe(self, term) -> bool:
+        """**"现在动的是平台还是厨师?"** —— 进/退会话的判据都靠它。
+
+        ⚠ **不能靠 `Station.session` 判**: 它是 C# 建**场景缓存**时算一次的
+          静态值(`SceneScanner.DescribeStatic`, 最多 5 秒兜底重扫),
+          按完交互键**立刻读反映不了**。所以直接发一小段方向键看**谁动了**:
+
+             厨师动了            → 没进会话(控制权还在厨师手上)
+             厨师没动、平台动了  → **进了会话**(控制权已经交给平台)
+             两边都没动          → 判不了(多半被挡住), 当没进
+        """
+        from bridge.keyboard_input import key_down, key_up
+
+        def snap():
+            st = self.state(force=True)
+            cx, cz, _ = self.pos(st) if st else (None, None, "")
+            p = self.pilot_pose() or {}
+            return cx, cz, float(p.get("x") or 0), float(p.get("z") or 0)
+
+        cx0, cz0, px0, pz0 = snap()
+        if cx0 is None:
+            return False
+        # 朝**远离控制台**的方向推 —— 那个方向基本不会被台子挡住
+        d = dir_for_step(cx0 - term.x, cz0 - term.z, deadzone=0.05) or "down"
+        key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
+        key_down(key)
+        time.sleep(0.35)
+        key_up(key)
+        time.sleep(0.20)
+        cx1, cz1, px1, pz1 = snap()
+        if cx1 is None:
+            return False
+        chef_moved = abs(cx1 - cx0) > 0.15 or abs(cz1 - cz0) > 0.15
+        plat_moved = abs(px1 - px0) > 0.05 or abs(pz1 - pz0) > 0.05
+        if not chef_moved and plat_moved:
+            self.log("[遥感] ✓ 已在会话里(厨师没动、平台动了 %.2f 格)"
+                     % (((px1 - px0) ** 2 + (pz1 - pz0) ** 2) ** 0.5))
+            return True
+        if chef_moved:
+            self.log("[遥感] ✗ 厨师还在动 —— 没进会话")
+            return False
+        self.log("[遥感] ? 厨师和平台都没动 —— 判不了")
+        return False
+
+    def pilot_enter(self, km, st, tm) -> bool:
+        """走到最近的 `Terminal` 控制台按交互, 并**验证真的进了会话**。
+
+        进入方式: 走到控制台旁边 → 按拾取键(`interact` 会等 `held` 变化, 这里没东西可拿,
+        所以直接 `kb.pickup()`)。进门之后厨师的 `PlayerControls` 被停用,
+        移动键改驱动平台 —— `navigate` 里那段 ☠ 注释说的就是这个。
+        """
+        terms = km.of("terminal") if km is not None else []
+        if not terms:
+            self.log("[遥感] 这一关没有 Terminal 控制台")
+            return False
+        x, z, _ = self.pos(st) if st else (None, None, "")
+        if x is None:
+            return False
+        t = min(terms, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
+        self.log("[遥感] 去控制台 %s (%.1f,%.1f), 它驾驶的是 %r"
+                 % (t.id, t.x, t.z, getattr(t, "pilots", "")))
+        if not self.navigate_smart(km, t.x, t.z, tight=0.8):
+            self.log("[遥感] 走不到控制台")
+            return False
+        self.kb.release_all()
+        time.sleep(0.15)
+        self.kb.pickup()
+        time.sleep(0.45)
+        return self._pilot_probe(t)
+
+    def pilot_bridge(self, km, st, tm, goal_xz, tries: int = 3) -> bool:
+        """目标**走不到** → 用**可开动的平台**搭桥过去。
+
+        串联四步(§4.2 的"串联"): `bridge_cells` 算桥位 → 走到控制台进会话 →
+        把平台开到桥位 → 退出 → **重取地形、重算可达** → 通了就导航过去。
+
+        ⚠ 两条硬约束:
+          · `pilot_to` 假设**已经在会话里** —— 所以先 `pilot_enter`
+          · 会话中**严禁调 `interact()`**(那正是退出键, 见 `pilot_end` 的注释)
+        """
+        x, z, _ = self.pos(st) if st else (None, None, "")
+        if x is None or tm is None or not tm.ok:
+            return False
+        cands = tm.bridge_cells((x, z), goal_xz)
+        if not cands:
+            # `bridge_cells` 是**按单格**算的: "只把这一格变可走, 目标就通了"。
+            # 多个格子才通的情况它返回空 —— 那种交给上层换别的办法。
+            self.log("[搭桥] `bridge_cells` 说单格当桥救不了 (目标 %.1f,%.1f)"
+                     % goal_xz)
+            return False
+        self.log("[搭桥] 桥位候选 %d 个(按离厨师近排序), 试前 %d 个: %s"
+                 % (len(cands), tries, cands[:tries]))
+        # ☠ **重入闸**: `pilot_enter` 里"走到控制台"用的是 `navigate_smart`,
+        #   而控制台够不着时那条路又会进 `pilot_bridge` —— 不加这道闸就无限套娃
+        #   (`navigate_smart → pilot_bridge → pilot_enter → navigate_smart → …`)。
+        self._in_bridge = True
+        entered = False
+        try:
+            for c in cands[:tries]:
+                if not entered:
+                    if not self.pilot_enter(km, st, tm):
+                        return False
+                    entered = True
+                # 单次别等太久: 三个候选 × 20s 会把整局的节奏耗光
+                if not self.pilot_to(tm, c, budget=8.0):
+                    self.log("[搭桥] 平台开不到 %s, 换下一个候选" % (c,))
+                    continue
+                self.pilot_end()
+                entered = False
+                # 退出后**必须重取地形**: 判据是**可达性**而不是字符 ——
+                # 平台不占格子(`MovingPlatform5` 实测报 `平台0`), 它停下了
+                # `walkable` 也不会变, 变的只有"从厨师出发能不能到"。
+                tm2 = self.terrain(force=True)
+                st2 = self.state(force=True)
+                if tm2 is None or not tm2.ok or not st2:
+                    continue
+                x2, z2, _ = self.pos(st2)
+                if x2 is None:
+                    continue
+                g = tm2.cell_of(goal_xz[0], goal_xz[1])
+                reach = tm2.reachable_from(
+                    x2, z2, at_y=self.chef_y(st2),
+                    extra_edges=teleport_edges(km, tm2))
+                if g in reach:
+                    self.log("[搭桥] ✓ 平台停在 %s 之后目标格 %s 进可达集了" % (c, g))
+                    # ⚠ **不在这里调 `navigate_smart`** —— 那会递归
+                    #   (`navigate_smart → pilot_bridge → navigate_smart`)。
+                    #   返 True 让调用方重取地形、重新规划就行。
+                    return True
+                self.log("[搭桥] 平台停在 %s, 目标格 %s 还是到不了" % (c, g))
+        finally:
+            if entered:
+                self.pilot_end()
+            self._in_bridge = False
+        self.log("[搭桥] 试完 %d 个候选都没通" % min(len(cands), tries))
+        return False
+
+    def navigate_teleport(self, tx: float, tz: float, exits,
+                          budget: float = 6.0) -> bool:
+        """朝**传送门自己那一格**挤进去, 直到人被送到对端。
+
+        为什么不能用 `navigate()`:
+          · 门那一格在地形上是**障碍**(`teleport_edges` 的注释写着"边必须经过门自己那格"),
+            所以"走到目标附近"这个判据**永远不成立** —— 人顶在门上被判 `stuck>=8`,
+            侧移脱困反复几次, 把 `step_timeout` 白耗光
+          · 更糟的是 `navigate()` 只判"没动"(`abs(x-last)<0.05`), **不判位置跳变** ——
+            被传到对岸之后它还在朝原方向走, 可能掉头走回出口那扇门**被再传回来**
+
+        所以**成功判据换掉了**: 不是"走到 (tx,tz)", 而是
+        **厨师所在格落进 `exits` 的 Chebyshev 1 邻域**(`exits` = 该格在
+        `teleport_edges` 里的出边目标, 也就是"出口旁边那几格")。
+        """
+        ex = [tuple(c) for c in (exits or ())]
+        if not ex:
+            return False
+        from bridge.keyboard_input import key_down, key_up, ensure_focus, get_driver
+        tm = self.terrain()
+        driver = get_driver()
+        analog = driver is not None and hasattr(driver, "move") \
+            and hasattr(driver, "release_all")
+        t0 = time.time()
+        try:
+            while time.time() - t0 < budget:
+                if not ensure_focus(wait_s=1.0):
+                    self.kb.release_all()
+                    continue
+                st = self.state(force=True)
+                if not st or not st.get("inRound"):
+                    self.log("[传送] 对局结束, 中止")
+                    return False
+                x, z, _ = self.pos(st)
+                if x is None:
+                    return False
+                if self.is_respawning(st):
+                    self.log("[传送] 厨师正在重生, 松手等")
+                    if not self.wait_respawn():
+                        return False
+                    t0 = time.time()
+                    continue
+                if tm is not None and tm.ok:
+                    cc = tm.cell_of(x, z)
+                    if any(abs(cc[0] - e[0]) <= 1 and abs(cc[1] - e[1]) <= 1
+                           for e in ex):
+                        self.kb.release_all()
+                        self.log("[传送] ✓ 已到对端 格%s (世界 %.1f,%.1f)" % (cc, x, z))
+                        return True
+                dx, dz = tx - x, tz - z
+                dist = (dx * dx + dz * dz) ** 0.5
+                if dist < 1e-4:
+                    dx, dz = 0.0, 1.0          # 正好压在门上, 随便推一下
+                if analog:
+                    inv = 1.0 / max(dist, 1e-4)
+                    driver.move(dx * inv, -dz * inv)
+                    time.sleep(0.03)
+                else:
+                    d = dir_for_step(dx, dz, deadzone=0.02)
+                    if not d:
+                        # 两轴都在死区 = 已经贴到门上了, 直接顶最后一下
+                        d = ("right" if dx > 0 else "left") if abs(dx) >= abs(dz) \
+                            else ("up" if dz >= 0 else "down")
+                    key = self._key({"left": "A", "right": "D",
+                                     "up": "W", "down": "S"}[d])
+                    key_down(key)
+                    time.sleep(0.10)
+                    key_up(key)
+                    time.sleep(0.04)
+            self.kb.release_all()
+            self.log("[传送] 挤了 %.0fs 还没过去 (门格世界 %.1f,%.1f)" % (budget, tx, tz))
+            return False
+        finally:
+            if analog:
+                try:
+                    driver.release_all()
+                except Exception:
+                    pass
+            self.kb.release_all()
+
     # ------------------------------------------------------------ 关卡地形
     def terrain(self, force: bool = False):
-        """拿整张关卡网格(含危险区)。同一关卡内缓存, 关卡一变就重取。
+        """拿整张关卡网格(含危险区)。**有保质期, 不是整局只用一份。**
 
         这张图是**寻路的唯一真相来源**: 它同时知道"哪里被占住"和"哪里会淹死/掉下去",
-        而游戏原生 FindPath 只知道前者。开局/换关/强制时刷新。
+        而游戏原生 FindPath 只知道前者。
         双人时走共享世界 —— 同一关**只拉一次、只解一次**, 两个人看同一份。
+
+        ⚠ **为什么必须带保质期**(用户实测指出的"跳海"):
+          这里原来是"按场景缓存, 关卡不变就不重取", 而地形**真的会变** ——
+          限时平台升降、荷叶沉浮、潮水、火。要命的是这类变化**常常只改高度不改字符**
+          (`s_wonderland_1_2` 实测: 66 格高度在 `0.00 ↔ -3.00` 循环, 字符一格不变),
+          所以拿着开局那张图, 引擎会以为"平台还升着" → **直接走进海里**。
+          现在: 超过 `terrain_ttl` 就重取, 再用 C# 给的**版本号**判断到底变没变 ——
+          没变就沿用**旧对象**(不打扰别处的引用, 也不刷日志), 变了才换。
         """
         if self.world is not None:
             return self.world.terrain(force=force)
         from terrain import TerrainMap
         st = self.state()
         scene = (st or {}).get("scene") or ""
+        now = time.time()
         if (not force and self._terrain is not None
-                and self._terrain_scene == scene and self._terrain.ok):
+                and self._terrain_scene == scene and self._terrain.ok
+                and (now - self._terrain_at) < self.terrain_ttl):
             return self._terrain
         try:
-            data = self.bridge.get_map(force=force)
+            # 只要"最多这么旧"的数据: 不强制重建(C# 每格一次射线, 很重),
+            # 但也不能拿 C# 默认那 5 秒的老图 —— 5 秒够厨师走出 20 格。
+            data = self.bridge.get_map(force=force, max_age=self.terrain_ttl)
         except Exception as e:
             self.log(f"[地形] 取图失败: {e}")
             return self._terrain
@@ -1389,24 +1787,55 @@ class Engine:
         if not tm.ok:
             self.log("[地形] 网格数据不完整, 退回旧寻路")
             return self._terrain
-        if tm.error is None and (self._terrain is None or not self._terrain.ok
-                                 or tm.counts != self._terrain.counts):
-            self.log(f"[地形] {tm.w}x{tm.h} 格 步长({tm.cellx:.2f},{tm.cellz:.2f}) " + tm.describe_dangers())
+        if self._terrain is not None and self._terrain.ok and self._terrain_scene == scene:
+            if tm.ver:
+                same = (tm.ver == self._terrain_ver)      # 权威判据
+            else:
+                # 老 dll 没有版本号 → 退化成"比计数"(和改之前一样), 免得刷日志
+                same = (tm.counts == self._terrain.counts)
+            self._terrain_at = now
+            if not force and same:
+                return self._terrain
         self._terrain = tm
         self._terrain_scene = scene
+        self._terrain_ver = tm.ver
+        self._terrain_at = now
+        # **只有真的变了才记日志** —— 否则每 1.5 秒刷一行, 日志会被淹掉
+        self.log(f"[地形] 更新 ver={tm.ver or 'n/a'}  {tm.w}x{tm.h} 格 "
+                 f"步长({tm.cellx:.2f},{tm.cellz:.2f}) " + tm.describe_dangers())
         return tm
 
-    def _native_path_safe(self, tm, pts: list) -> list:
-        """把游戏原生路径里"会淹死人的点"剔掉。
+    def _dynamic_blocks(self, km, tm) -> set:
+        """**会动的东西当前占住的格子** —— 路人 / 车辆 / 移动危险物。
 
-        原生寻路不知道水面, 所以它给的路径可能直接横穿池塘。这里逐点检查:
-        一旦某个点落在危险格上, 就把这条路径整条作废(返回空), 让调用方改用
-        地形 A* —— 半条原生路径比没有路径更危险。
+        为什么要单独算(用户指出: "对于路人和车辆完全没有建模"):
+          地形是**整局一次的静态快照**, 而车会开、路人会走。快照把它们冻在
+          第一次扫到的位置 —— 于是"地图说安全的地方"可能是车当前的位置。
+          **这比不知道更危险: 它让人放心地走进去。**
+          所以每次规划都拿 movers 的**当前位置**重新禁一遍。
+        """
+        if km is None or tm is None or not getattr(tm, "ok", False):
+            return set()
+        try:
+            return km.blocked_by_movers(tm)
+        except Exception as e:
+            self.log(f"[导航] 动态禁行格算失败: {e}")
+            return set()
+
+    def _native_path_safe(self, tm, pts: list, blocked: set = None) -> list:
+        """把游戏原生路径里"会淹死人的点"和"被会动的东西占住的点"剔掉。
+
+        原生寻路不知道水面, 所以它给的路径可能直接横穿池塘; 也不知道车开到哪了。
+        这里逐点检查: 一旦某个点落在危险格或动态禁行格上, 就把这条路径整条作废
+        (返回空), 让调用方改用地形 A* —— 半条原生路径比没有路径更危险。
         """
         if not pts or tm is None or not tm.ok:
             return pts
+        blk = blocked or ()
         for (px, pz) in pts:
             if tm.is_danger_world(px, pz):
+                return []
+            if blk and tm.cell_of(px, pz) in blk:
                 return []
         return pts
 
@@ -1421,6 +1850,16 @@ class Engine:
              因为它的可走判定 `GetGridOccupant()==null` 根本看不见水面。
           3) 拿台子列表当障碍的 Python A* —— 最后兜底(会漏掉边界与橱柜)。
         每段走完位置会变, 所以失败就重新规划。
+
+        ⚠ **遥感相关的两件事, 这张导航图都不知道**:
+          · **可开动的平台不占格子**(实测 `MovingPlatform5` 关报 `平台0`),
+            所以它停在哪、能不能当桥, 在地形图上**完全看不见** ——
+            "某几格到不了"有可能是"平台没开过去", 不是地形问题。
+            要判这个用 `TerrainMap.bridge_cells(起点, 目标)`(它会告诉你停在哪几格有用)。
+          · **会话开着时移动键驱动的是平台而不是厨师** ——
+            本函数一路都在发移动键, 所以进这里之前必须先确认不在会话里
+            (`self.session_station(st) is None`), 否则厨师原地不动、
+            平台却被开跑(见 navigate 里那段 ☠ 注释)。
         """
         from pathing import plan_path
         tm = self.terrain()
@@ -1441,17 +1880,45 @@ class Engine:
             if (tx - x) ** 2 + (tz - z) ** 2 <= (tight or self.arrive) ** 2:
                 return True
 
-            pts = []
-            if tm is not None and tm.ok:
-                pts = tm.find_path(x, z, tx, tz)
-                if not pts:
-                    self.log(f"[导航] 地形 A* 无解 → ({tx:.1f},{tz:.1f}), 试原生寻路")
+            # 会动的东西(路人/车)当前占住的格子 —— 每次都重算, 因为它们在动
+            blk = self._dynamic_blocks(km, tm)
+            # 传送门作为**额外的边**(不是地形): 到这一格就也能到对端。
+            tedges = teleport_edges(km, tm)
+
+            def _plan(blocked):
+                """三条路依次试。blocked 传空 = 不避让会动的东西。"""
+                if tm is not None and tm.ok:
+                    p = tm.find_path(x, z, tx, tz, blocked=blocked,
+                                     at_y=self.chef_y(st), extra_edges=tedges)
+                    if p:
+                        return p
+                p = self._native_path_safe(tm, self._game_path(tx, tz), blocked=blocked)
+                if p:
+                    return p
+                return plan_path(x, z, tx, tz, self._obstacles(km) | (blocked or set()))
+
+            pts = _plan(blk)
+            if not pts and blk:
+                # ⚠ **绕不开就只能不绕**。路人/车把唯一的路堵死时, 硬撑着"必须避让"
+                #   会让整个厨师原地卡住 —— 那比"冒着撞上去的风险走"更糟(整局报废)。
+                #   所以这里退回不避让, 但**大声记下来**: 这条日志就是"这局有东西挡路"的证据。
+                self.log(f"[导航] ⚠ 动态禁行({len(blk)} 格)导致无路可走 —— "
+                         f"退回不避让会动的东西(路人/车), 冒着撞上去的风险")
+                pts = _plan(set())
             if not pts:
-                pts = self._native_path_safe(tm, self._game_path(tx, tz))
+                self.log(f"[导航] 地形 A* 无解 → ({tx:.1f},{tz:.1f}), 试原生寻路")
             if not pts:
-                pts = plan_path(x, z, tx, tz, self._obstacles(km))
-            if not pts:
-                # 三条路都规划不出来 → 退回直线冲一次
+                # 三条路都规划不出来 —— **先试"用可开动的平台搭桥"**(只在第一轮试,
+                # 否则外层 replans 会把整局的节奏耗光)。
+                # 为什么放这儿: 目标到不了常常不是"没有路", 而是**某几格缺一块地板**,
+                # 而移动平台本质就是**一块可挪的地板**(`bridge_cells` 就是算这个的)。
+                if attempt == 0 and not getattr(self, "_in_bridge", False) \
+                        and tm is not None and tm.ok \
+                        and self.session_station(st) is None:
+                    if self.pilot_bridge(km, st, tm, (tx, tz)):
+                        tm = self.terrain(force=True)   # 桥搭好了, 重取图重规划
+                        continue
+                # 都不行 → 退回直线冲一次
                 return self.navigate(tx, tz, tight=tight)
 
             # 逐格走。关键: **某个路径点走不到不该让整条路径失败** ——
@@ -1462,6 +1929,16 @@ class Engine:
                     continue                      # 起点附近的点不用专门走
                 if tm is not None and tm.ok and tm.is_danger_world(px, pz):
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 是危险格, 跳过")
+                    continue
+                # **传送门那格要"挤进去"而不是"走到"** —— 它是障碍格,
+                # `navigate` 的"到目标附近"永远不成立(见 `navigate_teleport`)。
+                _cell = tm.cell_of(px, pz) if (tm is not None and tm.ok) else None
+                _exits = tedges.get(_cell) if _cell is not None else None
+                if _exits and not tm.walkable(*_cell):
+                    if not self.navigate_teleport(px, pz, _exits):
+                        self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 是传送门, 没能挤过去")
+                        continue
+                    x, z = px, pz
                     continue
                 if not self.navigate(px, pz, arrive=0.9, step_timeout=6.0):
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
@@ -1579,6 +2056,129 @@ class Engine:
             if self.board is not None and self._stove_used:
                 self.board.release_stove(self._stove_used, self.cid)
                 self._stove_used = ""
+
+    # ---------------- 灭火 ----------------
+    #
+    # 为什么整块是新的(用户实测提出): **引擎原来对火一无所知** ——
+    # `get_dyn()` 只用来读传送带方向, `op_cook` 里"着了火就失败"是**放弃**而不是**处理**。
+    # 而 s_balloon_5_2 那种关卡开局就 5 处着火, 还有燃烧器持续点火, 不灭就没法做菜。
+    #
+    # 机制(全部来自反编译, 见 InteractDirect.SprayAction 的注释):
+    #   · 触发: `ServerSprayingUtensil.OnTrigger("StartSpray"/"StopSpray")`
+    #   · 命中: 以**厨师**为原点、用厨师 forward, **15° 半锥 + 4 射程 + 0.6 半径**
+    #           ⇒ **必须正对**, 斜一点就浇不到
+    #   · 效果: `FightFire(0.5s, dt)` ⇒ 持续喷 **0.5 秒**灭掉一个满强度的火
+    #   · 副作用: 喷的时候 `MovementScale=0` —— 原地定住, 但**可以转向**
+    #            拿着灭火器的人不会着火
+    def fires(self) -> list:
+        """场上**正在烧**的地方(世界坐标)。数据来自插件 dyn 命令。"""
+        try:
+            dyn = self.bridge.get_dyn()
+        except Exception as e:
+            self.log(f"[灭火] 读火失败: {e}")
+            return []
+        out = []
+        for f in (dyn or {}).get("fires") or []:
+            try:
+                out.append((float(f.get("x") or 0), float(f.get("z") or 0)))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _my_player_index(self, st: dict) -> int:
+        """这个厨师归属的玩家号(0=One), 给 `direct` 用。"""
+        from bridge.virtual_pad import PLAYER_INDEX
+        key = str(self.chef(st or {}).get("player") or "").strip().lower()
+        return PLAYER_INDEX.get(key.replace("player.", ""), self.cid)
+
+    def _find_extinguisher(self, km: KitchenMap):
+        """场上的灭火器在哪 —— (持有者cid, 坐标) 或 (None, None)。"""
+        for c in km.chefs:
+            if is_extinguisher(c.held or ""):
+                return c.id, (c.x, c.z)
+        for s in km.stations.values():
+            for i, o in enumerate(s.on or []):
+                if is_extinguisher(o, s.tag_of(i)):
+                    return None, (s.x, s.z)
+        return None, None
+
+    def extinguish(self, km: KitchenMap, st: dict, budget: float = 25.0) -> int:
+        """有火就灭。返回**灭掉了几处**(0 = 没火或灭不掉)。
+
+        流程: 拿灭火器 → 走到火**正前方** → 面向 → 喷 ~0.9s → 确认灭了。
+        为什么要"正前方": 那 15° 半锥很窄, 站在斜角上按了也浇不到,
+        而日志只会显示"没反应"。
+        """
+        import time as _t
+        fires = self.fires()
+        if not fires:
+            return 0
+
+        # ---- 1) 先弄到灭火器(拿着它自己也不会着火) ----
+        _, _, held = self.pos(st)
+        if not is_extinguisher(held or ""):
+            owner, pos = self._find_extinguisher(km)
+            if pos is None:
+                self.log(f"[灭火] ⚠ 场上有 {len(fires)} 处着火, 但**找不到灭火器**")
+                return 0
+            if owner is not None and owner != self.cid:
+                self.log(f"[灭火] ⚠ 灭火器在队友(P{owner + 1})手上, 拿不到")
+                return 0
+            if not self.navigate_smart(km, pos[0], pos[1], tight=0.8):
+                self.log("[灭火] 走不到灭火器那儿")
+                return 0
+            if not self.interact("pickup", verify_hold_change=True):
+                self.log("[灭火] 拿不起灭火器")
+                return 0
+            self.log("[灭火] ✓ 拿到灭火器(拿着它自己不会着火)")
+
+        # ---- 2) 逐个灭 ----
+        player = self._my_player_index(st)
+        done = 0
+        t0 = _t.time()
+        while _t.time() - t0 < budget:
+            fires = self.fires()
+            if not fires:
+                break
+            cx, cz, _ = self.pos(self.state() or {})
+            if cx is None:
+                break
+            # 从**最近**那处开始灭(走得少, 也最快止住扩散)
+            fx, fz = min(fires, key=lambda f: (f[0] - cx) ** 2 + (f[1] - cz) ** 2)
+            # 站在火的**正前方 1~2 格**(射程 4, 但锥角窄 —— 近了容错更大)
+            if not self.navigate_smart(km, fx, fz, tight=1.4):
+                self.log(f"[灭火] ✗ 走不到火 ({fx:.1f},{fz:.1f}) 旁边")
+                break
+            self.face(fx, fz)                      # 那 15° 锥要求必须正对
+            self.log(f"[灭火] 对 ({fx:.1f},{fz:.1f}) 喷 0.9s (需 0.5s 灭一个满强度的火)")
+            try:
+                # 发**小写** `spray`。曾经这里发的是全大写 `SPRAY` —— 那是为了绕开
+                # 当年诊断命令也叫 `spray` 的子串撞车(诊断现已改名 `sprayinfo`, 不需要了)。
+                # ⚠ 更糟的是: C# 那边分派用 `ToLowerInvariant()` 而比较用大小写敏感的
+                #   `== "spray"`, 所以**大写 SPRAY 实际执行的是"停喷"** ——
+                #   于是这个"绕过"把灭火变成了"两次停喷"(已修, 见 InteractDirect)。
+                r = self.bridge.direct("spray", player=player)
+            except Exception as e:
+                self.log(f"[灭火] ✗ 开喷失败: {e}")
+                break
+            if not r.get("ok"):
+                self.log(f"[灭火] ✗ 开喷被拒: {r.get('error')} —— 手上是不是没有灭火器?")
+                break
+            _t.sleep(0.9)
+            try:
+                self.bridge.direct("unspray", player=player)
+            except Exception:
+                pass
+            left = len(self.fires())
+            if left < len(fires):
+                done += 1
+                self.log(f"[灭火] ✓ 灭了一处(还剩 {left})")
+            else:
+                self.log("[灭火] ⚠ 喷了但火没灭 —— 多半是没正对(15° 锥很窄)")
+                break
+
+        # ---- 3) 手上有灭火器的话保持拿着(它能防火), 不主动放下 ----
+        return done
 
     # ---------------- 锅 ----------------
     def _pick_stove(self, km: KitchenMap, x: float, z: float, want_pot: bool):
@@ -2294,6 +2894,19 @@ class Engine:
             if not self.ensure_knowledge(st):
                 time.sleep(2)
                 continue
+
+            # **有火先灭火** —— 优先级高于做菜。理由(反编译 ServerFlammable.cs:214-224):
+            #   着火时台面上的 `Interactable` / `PickupItemSpawner` / `Workstation`
+            #   三个组件被 `enabled = false` ⇒ **那个台子既不能拿放也不能切**;
+            #   而且火会按 m_fireSpreadRadius=1.5 扩散到相邻可燃物。
+            #   等它烧开, 整关的台面会一片片失效 —— 那比晚做一道菜严重得多。
+            # 节流 2 秒: 每次都要问桥要 dyn, 不必每帧。
+            now = time.time()
+            if now - self._last_fire_check >= 2.0:
+                self._last_fire_check = now
+                n = self.extinguish(km, st)
+                if n:
+                    continue          # 灭了火 → 这一轮重新规划(世界变了)
 
             planned = self.plan(st)
             if planned is None:

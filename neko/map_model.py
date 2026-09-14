@@ -124,6 +124,26 @@ def is_tool(name: str = "", tag: str = "") -> bool:
     return is_pot(name, tag) or is_extinguisher(name, tag)
 
 
+def _aslist(v, key: str = "") -> list:
+    """layout 里的字段**可能有两种形状**: 裸数组 `[...]`, 或被包成 `{"key":[...],...}`。
+
+    为什么要有这个防御: `ScanItems()` 返裸数组, 而 `MoverScan.Snapshot()` 我一开始
+    写成了 `{"movers":[...],"count":N}` —— 塞进 layout 就成了对象,
+    Python 那边 `for m in layout["movers"]` 迭代出来的是**键(字符串)**,
+    直接 `AttributeError: 'str' object has no attribute 'get'`。
+    C# 已改成裸数组统一形状, 这里再兜一层: 老 dll 也不会把它弄崩。
+    """
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        if key and isinstance(v.get(key), list):
+            return v[key]
+        for k in ("movers", "items"):
+            if isinstance(v.get(k), list):
+                return v[k]
+    return []
+
+
 def _norm_name(s: str) -> str:
     """只留字母数字, 用于比物品名(和 `engine.Engine._norm` 同一套约定)。
 
@@ -156,6 +176,38 @@ class Station:
     # 以及它自己容器里装了什么(盘子上的菜)。onhas 非空 = 这个盘子/锅不是空的。
     ontags: list = field(default_factory=list)
     onhas: list = field(default_factory=list)
+    # ---- 传送门专属(kind == "teleport"; 其余台面这些字段全为空) ----
+    #: **配对: 这扇门通向哪** —— 来自 `Teleportal.m_exitPortal`(一个直接引用)。
+    #: 没有它就等于"三扇门是三个互不相干的点", 规划层没法把门当一条边用。
+    exit_portal: str = ""
+    exit_x: float = 0.0
+    exit_z: float = 0.0
+    #: 真正的**落点**(`m_teleportPoint`)。和门的视觉位置**不是一处** ——
+    #: 实测 s_wizard_school_3_4: 占用表说门在 z=8.4 而物体在 z=7.28, 差约一格。
+    #: 拿视觉位置当落点会"站在门外够不着"。
+    land_x: float = 0.0
+    land_z: float = 0.0
+    cooldown: float = 0.0      # 冷却秒数(连着用会不会被卡住)
+    arc: float = 0.0           # 出来之后的朝向弧(度)
+    recv_delay: float = 0.0    # 接收延迟
+    #: 这个台面**现在在不在场**(`GameObject.activeInHierarchy`)。
+    #: 限时构件(如 s_wizard_school_3_4 的传送门, 与限时楼梯轮换)会整块启用/停用 ——
+    #: 不判它的话, 一扇当前根本不存在的门在地图上照样被画成常驻的 `O`,
+    #: **等于显示层在替限时构件打包票**。老 dll 没这字段 → 默认 True。
+    active: bool = True
+    # ---- 遥感控制台(kind == "Terminal")专属 ----
+    #: **现在是不是正在驾驶它**(`ClientSessionInteractable.HasSession`)。
+    #: 机制: 交互控制台 → 控制权交给被驾驶的物体, **厨师的 PlayerControls 被停用**
+    #: ⇒ 此后发的移动键驱动的是平台而不是厨师(见 `Engine.session_station`)。
+    session: bool = False
+    #: 它驾驶的是哪个物体(`Terminal.m_pilotableObject` 的名字) —— 用来跟 dyn 里的
+    #: platforms 表对上, 从而知道"平台现在在哪一格"。
+    pilots: str = ""
+
+    @property
+    def paired(self) -> bool:
+        """这扇门**读到配对**了没有。老 dll / 没读到 → False。"""
+        return bool(self.exit_portal)
 
     def tag_of(self, i: int) -> str:
         return self.ontags[i] if i < len(self.ontags) else ""
@@ -205,6 +257,33 @@ class Item:
     tag: str                   # Pre-Ingredient(生料) / Ingredient(处理过的)
     x: float
     z: float
+
+
+@dataclass
+class Mover:
+    """**会动的东西**: 路人 / 车辆 / 移动危险物。
+
+    为什么单独建模(用户指出: "对于路人和车辆完全没有建模"):
+      地形图是**整局一次的静态快照**, 而这两类会动:
+        · 车辆 = 带 `RespawnCollider`(`RespawnType.Car`), **接触即死**
+        · 路人 = 挡住路, 但它会走
+      静态快照把它们冻在第一次扫到的位置 —— 于是"地图说安全的地方"可能是车的位置。
+      **这比空白更糟: 它让人放心地走进去。**
+
+    `moved` 是"和上一帧比位置变没变" —— 不依赖类名(反编译里根本没有 NPC/Vehicle 类)。
+    """
+    name: str
+    kind: str                  # RespawnCollider / ByName
+    death_by: str = ""         # RespawnType: Hit/Drowning/FallDeath/Car
+    x: float = 0.0
+    z: float = 0.0
+    r: float = 0.6             # 水平半径(到碰撞体边), 用来算它占了哪几格
+    moved: bool = False        # 这一帧它动了没有
+
+    @property
+    def deadly(self) -> bool:
+        """碰到就死。`Car` 明确是死法; RespawnCollider 上挂着的都算(它们都是"重生触发器")。"""
+        return self.kind == "RespawnCollider"
 
 
 @dataclass
@@ -258,6 +337,36 @@ class KitchenMap:
     cooking: list = field(default_factory=list)
     #: 全场景按 tag 找的食材(游戏 GetAllIngredients 的视角) —— 用来查"我们漏了什么"
     items: list = field(default_factory=list)
+    #: 会动的东西(路人/车辆/移动危险物) —— 地形快照看不见的那一层
+    movers: list = field(default_factory=list)
+
+    def blocked_by_movers(self, tm) -> set:
+        """**当前被会动的东西占住/威胁的格子**。给 A* 当动态禁行格。
+
+        为什么要算这个: 地形是静态快照, 车开到哪它不知道。把 movers 的**当前位置**
+        换算成格子并在寻路时禁掉, 才是"车开到哪, 危险区就在哪"。
+
+        半径 `m.r` 用**切比雪夫**展开(取 max(|dx|,|dz|) 那圈), 因为格子是方的。
+
+        ⚠ **别多禁**: 一开始我写成 `int(r/cell)+1`(保守多禁一圈), 结果离线测试里
+          一辆车 + 一个路人就把一条走廊**完全堵死**, A* 无解 —— 反而走不动了。
+          现在按**精确 footprint** 展开(向上取整到整格), 由调用方负责"真无解时怎么办"
+          (见 `Engine.navigate_smart` 的兜底)。
+        """
+        out = set()
+        if tm is None or not getattr(tm, "ok", False):
+            return out
+        cell = max(tm.cellx, tm.cellz, 1e-6)
+        for m in self.movers:
+            try:
+                ci, cj = tm.cell_of(m.x, m.z)
+            except Exception:
+                continue
+            n = max(1, int(m.r / cell + 0.999))     # 向上取整到整格, 不加余量
+            for di in range(-n, n + 1):
+                for dj in range(-n, n + 1):
+                    out.add((ci + di, cj + dj))
+        return out
 
     def unseen_items(self) -> list:
         """**我们地图看不见的食材**: 在 `items` 里, 但既不在任何台面的 `on`/`onhas` 里,
@@ -355,13 +464,31 @@ class KitchenMap:
                 on=list(s.get("on") or []), n=int(s.get("n", 0) or 0),
                 plate=s.get("plate", ""),
                 ontags=list(s.get("ontags") or []),
-                onhas=list(s.get("onhas") or []))
+                onhas=list(s.get("onhas") or []),
+                exit_portal=s.get("exitPortal", "") or "",
+                exit_x=float(s.get("exitX", 0) or 0),
+                exit_z=float(s.get("exitZ", 0) or 0),
+                land_x=float(s.get("landX", 0) or 0),
+                land_z=float(s.get("landZ", 0) or 0),
+                cooldown=float(s.get("cooldown", 0) or 0),
+                arc=float(s.get("arc", 0) or 0),
+                recv_delay=float(s.get("recvDelay", 0) or 0),
+                active=bool(s.get("active", True)),
+                session=bool(s.get("session", False)),
+                pilots=s.get("pilots", "") or "")
         for i, c in enumerate(layout.get("chefs") or []):
             km.chefs.append(Chef(
                 id=int(c.get("id", i)), name=c.get("name", f"P{i}"),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
                 held=c.get("held", ""), player=c.get("player", "")))
-        for it in layout.get("items") or []:
+        for m in _aslist(layout.get("movers"), "movers"):
+            km.movers.append(Mover(
+                name=m.get("name", ""), kind=m.get("kind", ""),
+                death_by=m.get("deathBy", ""),
+                x=float(m.get("x", 0) or 0), z=float(m.get("z", 0) or 0),
+                r=float(m.get("r", 0.6) or 0.6),
+                moved=bool(m.get("moved"))))
+        for it in _aslist(layout.get("items"), "items"):
             km.items.append(Item(
                 name=it.get("name", ""), tag=it.get("tag", ""),
                 x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0)))
@@ -437,3 +564,60 @@ class KitchenMap:
             cnt[sem] += 1
         cook = f" 烹饪中{len(self.cooking)}" if self.cooking else ""
         return f"台子 {dict(cnt)} 厨师 {len(self.chefs)}{cook}"
+
+
+def teleport_edges(km, tm) -> dict:
+    """传送门的**额外边** —— `{可站格: [到的格, ...]}`，喂给泛洪和 A*。
+
+    为什么传送门必须是"边"而不是地形: 它是**在这一点被送到别处**, 不是走过去 ——
+    地形/高度/邻接都表达不了它。所以泛洪到这一格时, 额外把对端也加进可达集;
+    A* 也在这一步多出几条候选。
+
+    ⚠ 端点用**门旁边的可走格**, 不是门自己那格 —— 门是占用物(障碍),
+      厨师得站在它旁边才进得去(和"台面旁边才够得着"同一个道理)。
+    ⚠ 出口用 `exitX/exitZ`(也就是 `m_exitPortal` 那个物体的坐标), 不是靠名字猜 ——
+      名字带实例编号("Teleportal (1)"), 会随关卡加载变。
+    """
+    if km is None or tm is None or not getattr(tm, "ok", False):
+        return {}
+    ports = [st for st in km.stations.values()
+             if (st.kind or "").lower() == "teleportal"]
+    if not ports:
+        return {}
+    by_name = dict((st.name, st) for st in ports)
+
+    def around(c):
+        """这一格 + 四邻 —— 门的"旁边"就是这一圈里能站的那些。"""
+        i, j = c
+        return [(i, j), (i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)]
+
+    def standable(cells):
+        return [c for c in cells
+                if tm.inside(*c) and tm.walkable(c[0], c[1])]
+
+    out = {}
+    for st in ports:
+        if not st.exit_portal:
+            continue
+        # ⚠ **边必须"经过门自己那一格"**, 不能从门旁直接连到出口旁 ——
+        #   传送的触发方式是**走进门里**。少这一步的话, `navigate` 会拿着
+        #   "门旁 → 出口旁"这条边直接朝对岸走 —— 而那是走不过去的(中间是空的),
+        #   表现就是"朝墙一直走然后卡住"。
+        #   拆成两跳之后, 路径里会带上门那一格, 走进去就触发了。
+        own = tm.cell_of(st.x, st.z)
+        src = standable(around(own))
+        ex = by_name.get(st.exit_portal)
+        ec = (tm.cell_of(ex.x, ex.z) if ex
+              else tm.cell_of(st.exit_x, st.exit_z))
+        dst = standable(around(ec))
+        if not src or not dst:
+            continue
+        for a in src:                       # 门旁 → 门里
+            lst = out.setdefault(a, [])
+            if own != a and own not in lst:
+                lst.append(own)
+        lst2 = out.setdefault(own, [])      # 门里 → 出口旁
+        for b in dst:
+            if b != own and b not in lst2:
+                lst2.append(b)
+    return out

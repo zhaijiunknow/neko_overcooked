@@ -135,8 +135,17 @@ namespace Overcooked2AI.Game
                 return _collector.RequestJob("dyn", 8000);
             // 灭火器诊断: 喷雾的两个触发字符串(只在 prefab 里, 静态读不到) + 组件清单。
             // 见 InteractiveScan.SprayDiag() 的注释。
-            if (line.Contains("\"spray\""))
+            //
+            // ⚠ 命令名是 `sprayinfo` **不是** `spray` —— 这里全是**子串匹配**,
+            //   而直调动作用的是 `{"cmd":"direct","action":"spray"}`, 里面就含 `"spray"`,
+            //   叫 `spray` 的话会把直调那条抢先拦下来(实测: spray 返回诊断 JSON、
+            //   而 unspray 正常 —— 因为 "unspray" 里没有带引号的 "spray" 子串)。
+            if (line.Contains("\"sprayinfo\""))
                 return _collector.RequestJob("spray", 6000);
+            // 会动的东西: 路人 / 车辆 / 移动危险物 —— 地形快照看不见的那一层。
+            // 见 MoverScan 的注释。
+            if (line.Contains("\"movers\""))
+                return _collector.RequestJob("movers", 6000);
             // 游戏自己的网格: 格子↔世界坐标换算参数(m_origin/m_size/transform) + 占位表。
             // 依据 GridManager.cs:9,64-92 与 QuadGridManager.cs:28-38 —— 这是"解析地图"的权威依据,
             // 不是我们自己采样推断的那套。

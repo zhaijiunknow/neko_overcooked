@@ -31,4 +31,6 @@ overcooked_decomp*.zip
 # 本机工具产物 / 调试快照 —— 不进仓库
 .codegraph/
 tools/_last_map.txt
+tools/_w*.txt
+tools/_watch*.txt
 shot*.png
