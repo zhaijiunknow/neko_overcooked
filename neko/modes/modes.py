@@ -23,8 +23,17 @@
 from __future__ import annotations
 
 import random
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+
+# 评分层的可调常量都在 scoring.py（调参只改那一处）。
+# 两种导入方式都要能活：`neko/` 在 sys.path 上时是顶层 `scoring`（engine 就是这么导的），
+# 以包方式导入（`neko.modes`）时走相对导入。
+try:                                        # pragma: no cover - 取决于调用方式
+    from scoring import SABOTAGE_MEMORY
+except ImportError:                         # pragma: no cover
+    from ..scoring import SABOTAGE_MEMORY
 
 
 class Mode(str, Enum):
@@ -128,6 +137,10 @@ class ModeState:
     reminders_obeyed: int = 0
     reminders_ignored: int = 0
 
+    #: 捣蛋鬼的"重复记忆"：最近做过哪几个动作（`(action, target)`）。
+    #: 评分变换用它给"做过的再做一遍"加分 —— 这就是规格说的"做一些重复的、没有意义的"。
+    recent: deque = field(default_factory=lambda: deque(maxlen=SABOTAGE_MEMORY))
+
     # ---------------------------------------------------------------- 模式
     def set_mode(self, m) -> None:
         """热切换（v1 D6）：外部开关/良心发现都走这里，**下一个决策点生效**。"""
@@ -188,6 +201,34 @@ class ModeState:
         self.strikes = 0
 
     # ---------------------------------------------------------------- 决策
+    def transform(self, scores: list, sigs: list | None = None) -> list:
+        """**把"状态"表达成对评分向量的变换**（交接包 §4.2）。
+
+        规格原话："状态不再是额外撒一层随机捣乱，而是在评分向量上做变换"：
+
+        | 状态 | 变换 | 效果 |
+        |---|---|---|
+        | `coop` 好帮手 | 原样 | 取最高分 = **高效取最优** |
+        | `clumsy` 笨手笨脚 | 加高斯噪声 | **随机评分波动**，常常不是最优，但不主动害人 |
+        | `sabotage` 捣蛋鬼 | 取负 + 重复奖励 | **低效**，自然演成"反复做同一件没意义的事" |
+
+        这样捣蛋鬼**不需要单独写一堆捣乱动作** —— 低效本身就是从偏好低分/重复里长出来的。
+
+        真正的实现是 `scoring.transform`（纯函数、脱离游戏可核对）；这里只负责把
+        "我是谁"（`self.mode` / `self.rng` / `self.recent`）喂进去。
+
+        ⚠ `-inf`（到不了）在所有模式下都是硬闸门，连噪声都不翻 —— 见 `scoring.transform`。
+        """
+        try:
+            from scoring import transform as _t
+        except ImportError:                     # pragma: no cover
+            from ..scoring import transform as _t
+        return _t(scores, self.mode.value, self.rng, sigs=sigs, recent=self.recent)
+
+    def remember(self, sig: str) -> None:
+        """记下刚做过的一个动作（`(action, target)`）—— 供捣蛋鬼的重复偏好用。"""
+        self.recent.append(sig)
+
     def roll(self, urgency: float = 0.0, allowed=None) -> Mischief | None:
         """**每个空闲决策点调一次**：这一步要不要使坏？返回形态或 None。
 

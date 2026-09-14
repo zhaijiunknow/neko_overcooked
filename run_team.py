@@ -58,8 +58,13 @@ def worker(cid: int, bindings: dict, board: OrderBoard, dry: bool, roster,
         if pad is None:
             log("⚠ 虚拟手柄装不上, 退回键盘注入(需要游戏在前台)")
 
+    # teammate_is_human=False: 两只都是脚本。
+    # ⚠ **不能让位** —— 两个引擎各自 `board.claim_order` 领的是**不同的订单**,
+    #   评价分是拿两张不同的 DishFlow 在比, 步骤价那一项根本没有共同基准;
+    #   而且队友正在煮他那道菜时, 从我这看就是"他站在我的灶台边",
+    #   于是我会一直让位给他 —— 让到天荒地老。见 scoring.choose 的注释。
     eng = Engine(bridge, cid=cid, bindings=bindings, board=board, log=log,
-                 mode_state=st, world=world)
+                 mode_state=st, world=world, teammate_is_human=False)
     try:
         eng.run(dry=dry)
     except KeyboardInterrupt:

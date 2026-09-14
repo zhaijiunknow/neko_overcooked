@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import heapq
+from collections import deque
 
 # 能站的格子
 CH_FREE = "."
@@ -733,6 +734,52 @@ class TerrainMap:
         return [self.world_of(i, j) for i, j in cells[1:]]
 
     # ---------------------------------------------------------------- 连通性
+    def distances_from(self, x: float, z: float,
+                       allow_platform: bool = True,
+                       allow_travelator: bool = True,
+                       at_y: float = None, extra_edges: dict = None) -> dict:
+        """从某个世界坐标出发, 到每个**真能走到**的格子的**步数**(BFS)。`{cell: 步数}`。
+
+        和 `reachable_from` 是**同一套边规则**(后者现在就是 `set(这个函数)`) ——
+        规则只能有一份, 抄一份迟早会漂(见 `CH_TRAVELATOR` 那段注释)。
+
+        为什么需要距离: 评分要把"这一步离我多远"算成一个数(`scoring.W_DIST`)。
+        单纯判"可不可达"选不出"先做近的那件"。
+
+        起点恒在表里(步数 0), **即使起点本身不可走** —— 人被平台推到边上是常见情况。
+        """
+        if not self.ok:
+            return {}
+        start = self.cell_of(x, z)
+        if not self.inside(*start):
+            return {}
+        ex = extra_edges or {}
+        dist = {start: 0}
+        queue = deque([start])
+        while queue:
+            i, j = queue.popleft()
+            d = dist[(i, j)]
+            # **额外边(传送门那种)**: 到了这一格就也能到它的对端 ——
+            # 传送门不是"走过去", 是"在这一点被送到别处", 所以只能是额外的边,
+            # 不能靠高度/邻接表达。
+            for t in ex.get((i, j), ()):
+                if t not in dist:
+                    dist[t] = d + 1
+                    queue.append(t)
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = (i + di, j + dj)
+                if nb in dist:
+                    continue
+                if not self.walkable(nb[0], nb[1], allow_platform, allow_travelator):
+                    continue
+                # **高度按"边"判**: 从当前格迈到它这一步的落差 ≤ 厨师的步长。
+                # 有台阶时每级都 ≤0.65 → 洪泛爬得上去; 沉下去的平台 → 迈不进去。
+                if not self.step_ok(i, j, nb[0], nb[1]):
+                    continue
+                dist[nb] = d + 1
+                queue.append(nb)
+        return dist
+
     def reachable_from(self, x: float, z: float,
                        allow_platform: bool = True,
                        allow_travelator: bool = True,
@@ -746,39 +793,10 @@ class TerrainMap:
           反过来说: 如果某片区域**是**连通的, 那它就是真能走过去的, 不该当成 bug。
 
         寻路只关心"起点所在连通块"; 这个函数把它算出来。
+        **边规则只有 `distances_from` 一份**, 这里只是丢掉步数。
         """
-        if not self.ok:
-            return set()
-        start = self.cell_of(x, z)
-        if not self.inside(*start):
-            return set()
-        ex = extra_edges or {}
-        seen = set()
-        stack = [start]
-        # 起点即使不可走也允许出发(人被平台推到边上是常见情况)
-        seen.add(start)
-        while stack:
-            i, j = stack.pop()
-            # **额外边(传送门那种)**: 到了这一格就也能到它的对端 ——
-            # 传送门不是"走过去", 是"在这一点被送到别处", 所以只能是额外的边,
-            # 不能靠高度/邻接表达。
-            for t in ex.get((i, j), ()):
-                if t not in seen:
-                    seen.add(t)
-                    stack.append(t)
-            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nb = (i + di, j + dj)
-                if nb in seen:
-                    continue
-                if not self.walkable(nb[0], nb[1], allow_platform, allow_travelator):
-                    continue
-                # **高度按"边"判**: 从当前格迈到它这一步的落差 ≤ 厨师的步长。
-                # 有台阶时每级都 ≤0.65 → 洪泛爬得上去; 沉下去的平台 → 迈不进去。
-                if not self.step_ok(i, j, nb[0], nb[1]):
-                    continue
-                seen.add(nb)
-                stack.append(nb)
-        return seen
+        return set(self.distances_from(x, z, allow_platform, allow_travelator,
+                                       at_y, extra_edges))
 
     def ascii_reach(self, x: float, z: float, at_y: float = None,
                     dynamic: set = None) -> str:

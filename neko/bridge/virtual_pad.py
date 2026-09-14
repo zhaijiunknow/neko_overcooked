@@ -34,8 +34,11 @@ import time
 #:   所以"往世界 +z 走"必须发 y = -1。
 #:   这条踩过: 一开始发 y=+1, 结果"目标是 z=6.0 而厨师从 4.8 跑到 2.2" ——
 #:   方向整体反了, 表现为"卡在边界只会左右移动", 日志里只看得出'卡住/超时'。
-#:   (XAxisAllignment/YAxisAllignment 还是每关可覆盖的 [SerializeField], 所以引擎侧
-#:    另有一次运行时标定 calibrate_axes(), 兜住关卡级的反转。)
+#:   (XAxisAllignment/YAxisAllignment 是每关可覆盖的 [SerializeField] ——
+#:    **现在由插件直接报出来**了: `SceneScanner.ReadControl` 读 `PlayerControls.Movement`
+#:    的这两个字段, 落在 `state.layout.chefs[].alignx/aligny`。
+#:    ⚠ 2026-09-14 更正: 这里原先写"引擎侧另有 calibrate_axes() 兜底" ——
+#:      **那个函数不存在**(`pathing.calibrate` 从来没有调用方)。别再照着它写代码。)
 DIR_ROLES = {"up": (0.0, -1.0), "down": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
 #: 动作键名 → 桥上的按键位名
 BTN_ROLES = {"pickup": "pickup", "chop": "use", "dash": "dash"}

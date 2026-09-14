@@ -58,6 +58,15 @@ class OrderBoard:
                 return True
             return False
 
+    def stove_owner(self, stove_id: str):
+        """**只读**: 这个灶台归谁(没人占 → None)。
+
+        给评分层用 —— 它要替队友也算一遍"这个灶台能不能用", 那种调用**不能顺手占位**
+        (否则拿我的 cid 把一个队友本来能用的灶台抢走)。
+        """
+        with self._lock:
+            return self._stoves.get(stove_id)
+
     def release_stove(self, stove_id: str, cid: int) -> None:
         with self._lock:
             if self._stoves.get(stove_id) == cid:

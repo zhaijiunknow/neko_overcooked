@@ -34,6 +34,23 @@ namespace Overcooked2AI.Game
 
         private static readonly string[] ConveyorTypes = { "Travelator", "ConveyorStation" };
 
+        /// <summary>风区: 场景里会把厨师/物品吹走的一块体积。
+        ///
+        /// 依据(反编译, 三处串起来才是完整链条):
+        ///   · WindVolume.cs:18-21  GetVelocity() = enabled ? m_windSpeed * transform.right : 0
+        ///       ⇒ 方向和大小都能精确读出来, **且禁用时为 0**(所以必须每次现读, 不能整局缓存)。
+        ///   · WindAccumulator.cs:32-39  玩家身上的接收器把各个源的 GetVelocity() **矢量求和**。
+        ///   · ClientPlayerControlsImpl_Default.cs:902-906  ApplyWindForce()
+        ///       → RigidbodyMotion.Movement(v, dt) = MovePosition(pos + v*dt)
+        ///       ⇒ **每 1/60 秒额外平移 风速/60**, 与厨师自己的速度相加,
+        ///          **玩家不按键也照样被吹**(和传送带同一条位移通道)。
+        ///
+        /// 为什么要上报它(实机事故 2026-09-14, s_balloon_2_3):
+        ///   脚本不知道有风 ⇒ 风把厨师推到边缘 ⇒ 掉进空洞 ⇒ 烧掉整局。
+        ///   `docs/关卡逆向/08-移动危险物与打滑推挤.md:462` 早就把这条列成待做补丁(B4)。
+        /// </summary>
+        private static readonly string[] WindTypes = { "WindVolume" };
+
         /// <summary>机关机器: 这些东西是"触发器动作", 它们存在就说明这一格附近有会变的玩意。</summary>
         private static readonly string[] TriggerTypes =
         {
@@ -86,6 +103,23 @@ namespace Overcooked2AI.Game
                 }
             }
             o.Append(",\"conveyors\":[").Append(conv).Append("]");
+
+            // ---- 风区 ----
+            var wind = new StringBuilder();
+            int nw = 0;
+            foreach (var typeName in WindTypes)
+            {
+                foreach (var c in Comps(typeName))
+                {
+                    string extra = WindExtra(c);
+                    if (extra == null)
+                        continue;               // 拿不到体积(没有 BoxCollider) —— 跳过这一条, 别拖垮整个 dyn
+                    if (nw > 0) wind.Append(",");
+                    wind.Append(PointJson(c, typeName, extra));
+                    nw++;
+                }
+            }
+            o.Append(",\"winds\":[").Append(wind).Append("]");
 
             // ---- 触发机器 ----
             var trig = new StringBuilder();
@@ -169,6 +203,7 @@ namespace Overcooked2AI.Game
 
             o.Append(",\"counts\":{\"buttons\":").Append(nb)
              .Append(",\"conveyors\":").Append(nc)
+             .Append(",\"winds\":").Append(nw)
              .Append(",\"triggers\":").Append(nt)
              .Append(",\"platforms\":").Append(np)
              .Append(",\"fires\":").Append(nf)
@@ -614,6 +649,139 @@ namespace Overcooked2AI.Game
             {
                 return true;
             }
+        }
+
+        /// <summary>风区的附加字段。拿不到体积时返回 null(调用方跳过这一条)。
+        ///
+        /// ⚠ 全程反射: `WindVolume` 是游戏自己的类型, 本工程**没有编译期引用**
+        ///   (`build.bat` 只链了 Assembly-CSharp, 但直接用类型名编译不过 ——
+        ///    仓库里所有跨程序集取类型都走 `SceneScanner.FindType`)。
+        /// ⚠ `GetMethod` 必须带 `Type.EmptyTypes`: 裸名字遇到重载会抛
+        ///   `AmbiguousMatchException`(SceneScanner.cs:1339-1356 为此踩过坑)。
+        /// ⚠ `.NET 2.0`(`-nostdlib+` 链 v2.0.50727): **不能写 lambda / Func<>**,
+        ///   一律普通方法 —— SceneScanner.cs:901-906 记过 `CS0246 Func<,>` 那个错。
+        /// </summary>
+        private static string WindExtra(Component c)
+        {
+            var sb = new StringBuilder();
+            sb.Append("\"on\":").Append(BoolJson(Enabled(c)));
+
+            // ---- 风速与方向: GetVelocity() 是 public, 反射调一下就行 ----
+            float vx = 0f, vz = 0f, speed = 0f;
+            try
+            {
+                var m = c.GetType().GetMethod("GetVelocity", Type.EmptyTypes);
+                if (m != null)
+                {
+                    var v = (Vector3)m.Invoke(c, null);
+                    vx = v.x;
+                    vz = v.z;
+                    speed = new Vector2(v.x, v.z).magnitude;
+                }
+            }
+            catch (Exception) { }
+            sb.Append(",\"vx\":").Append(F(vx));
+            sb.Append(",\"vz\":").Append(F(vz));
+            sb.Append(",\"speed\":").Append(F(speed));
+
+            // ---- 体积: 一个转过的矩形。给中心(PointJson 已报) + 半长 + Y 角, Python 侧还原四角 ----
+            // ⚠ **BoxCollider 不一定在自己身上**: `WindVolume` 是 [RequireComponent(typeof(BoxCollider))],
+            //   但同级的 `WindCosmeticDecisions` 用的是 `RequireComponentRecursive<BoxCollider>()`
+            //   ⇒ 老实往子物体里找一层, 找不到就放弃这一条(宁可少报一个风区, 也不要整个 dyn 报错)。
+            BoxCollider box = null;
+            try
+            {
+                box = c.gameObject.GetComponent<BoxCollider>();
+                if (box == null)
+                    box = c.gameObject.GetComponentInChildren<BoxCollider>();
+            }
+            catch (Exception) { }
+            if (box == null)
+                return null;
+
+            sb.Append(",\"ex\":").Append(F(box.size.x * 0.5f * Mathf.Abs(box.transform.lossyScale.x)));
+            sb.Append(",\"ez\":").Append(F(box.size.z * 0.5f * Mathf.Abs(box.transform.lossyScale.z)));
+            sb.Append(",\"rot\":").Append(F(box.transform.eulerAngles.y));
+            // 体积中心可能和 GameObject 原点不同(BoxCollider 有 center 偏移)
+            Vector3 wc = box.transform.TransformPoint(box.center);
+            sb.Append(",\"cx\":").Append(F(wc.x));
+            sb.Append(",\"cz\":").Append(F(wc.z));
+
+            // **这个风区此刻真的作用在哪个厨师身上** —— 厨师序号数组, 与 `ScanChefs` 的 `id` 同源。
+            sb.Append(",\"chefs\":").Append(WindChefs(c));
+            return sb.ToString();
+        }
+
+        /// <summary>这个风区**此刻真的作用在哪个厨师身上** —— 返回厨师序号数组(与 `ScanChefs` 的 `id` 同源)。
+        ///
+        /// 依据(反编译): `WindVolume.ObjectAdded` (WindVolume.cs:23-29) 只做一件事 ——
+        /// 把**自己这个组件实例**注册进目标身上那台 `WindAccumulator` 的 `m_sources`
+        /// (`WindAccumulator.AddWindSource`, :44-51), 而且**要先过 `m_windFilter` 层掩码**
+        /// (WindVolume.cs:8-9, `[SerializeField] LayerMask = -1`; 关卡可以把它配成"不吹厨师")。
+        /// ⇒ 所以"格子落在体积里"**推不出**"人真被吹": 层掩码、碰撞体的真实形状/旋转、
+        ///   触发器开关、体积挂在哪个子物体上 —— 没有一样是能从这个体积自己的几何反推的。
+        ///   反过来问"谁的 `m_sources` 里有我"则是**游戏自己的答案**。
+        ///
+        /// ⚠ 枚举顺序要**和 `SceneScanner.ScanChefs` 一致**(都是 `FindObjectsOfType(PlayerControls)`
+        ///   的顺序, 且 GameObject 为空的跳过), 否则这里报的序号和 `state.layout.chefs[].id` 对不上。
+        /// ⚠ `m_sources` 是 `List&lt;IWindSource&gt;`、private ⇒ 反射取出来按 `IEnumerable` 走,
+        ///   用 `ReferenceEquals` 比**组件实例本身**(注册进去的就是 `this`)。
+        /// </summary>
+        private static string WindChefs(Component vol)
+        {
+            var sb = new StringBuilder();
+            int n = 0;
+            try
+            {
+                var pcType = SceneScanner.FindType("PlayerControls");
+                if (pcType == null)
+                    return "[]";
+                var objs = UnityEngine.Object.FindObjectsOfType(pcType);
+                if (objs == null)
+                    return "[]";
+                var prop = pcType.GetProperty("WindReceiver");
+                int idx = -1;
+                for (int i = 0; i < objs.Length; i++)
+                {
+                    var pc = objs[i] as Component;
+                    if (pc == null)
+                        continue;                       // 与 ScanChefs 同步: 拿不到 GameObject 的不计数
+                    idx++;
+                    bool hit = false;
+                    try
+                    {
+                        var acc = (prop == null) ? null : prop.GetValue(pc, null);
+                        if (acc != null)
+                        {
+                            var f = acc.GetType().GetField("m_sources",
+                                BindingFlags.Instance | BindingFlags.NonPublic);
+                            var list = (f == null) ? null : f.GetValue(acc)
+                                       as System.Collections.IEnumerable;
+                            if (list != null)
+                            {
+                                foreach (var s in list)
+                                {
+                                    if (ReferenceEquals(s, vol))
+                                    {
+                                        hit = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception) { }
+                    if (hit)
+                    {
+                        if (n > 0)
+                            sb.Append(",");
+                        sb.Append(idx);
+                        n++;
+                    }
+                }
+            }
+            catch (Exception) { }
+            return "[" + sb + "]";
         }
 
         private static string PointJson(Component c, string typeName, string extra)

@@ -27,11 +27,14 @@ from neko.terrain import (TerrainMap, HEIGHT_TOLERANCE,     # noqa: E402
                           CH_MARK)
 from neko.map_model import (KitchenMap, is_extinguisher,    # noqa: E402
                             is_pot, is_plate, teleport_edges,
-                            conveyor_arrows)
+                            conveyor_arrows, wind_cells)
 
 #: 叠加图里"会动的东西"和厨师手上那件东西的符号。
 MV_DEADLY = "!"      # 撞上就死(RespawnCollider: 车/水)
 PLATFORM_MARK = "&"  # **可开动的平台**(遥感驾驶的那种) —— 它不占格子, 地形图上完全看不见
+#: **风区** —— 它和传送带一样每帧 `MovePosition` 推人(不按键也照推), 但**地形图上
+#: 完全没有痕迹**。用它的人: 选站位要躲开(`WIND_STAND_PENALTY`)、导航要迎风补偿。
+WIND_MARK = "~"
 TERM_LIVE = "*"      # 控制台, 而且**会话进行中**(此刻移动键驱动的是平台, 不是厨师)
 MV_BLOCK = "%"       # 只是挡路(路人)
 CH_HELD = "H"        # 厨师手上拿着东西(内容图)
@@ -607,6 +610,8 @@ OVERLAY_LEGEND = """
 叠加图: 地形字符之上再画**台面语义 + 厨师 + 会动的东西**(优先级: 厨师 > 台面 > 地形)
        数字 1/2 = 厨师 (P1/P2);  会动的: ! = 撞上就死   % = 只是挡路
        & = **可开动的平台**(遥感驾驶的那种; 它不占格子, 地形图上本来完全看不见)
+       ~ = **风区**(每帧把人推走, 和传送带同一条位移通道; 地形图上本来完全看不见)
+           ⚠ 只在 `dyn` 报得出 `winds` 时才画 —— 旧 DLL 没有这一类, 图上一个 `~` 都不会有
        N = 控制台(驾驶台)
        字母 = 台面语义(见 SEM_LETTER), 常用几个:
        S 送餐口  P 干净盘子堆  D 脏盘子堆  R 盘子回收  B 切菜板  K 灶台/锅
@@ -744,7 +749,8 @@ def _flush_md() -> None:
 
 
 def overlay_ascii(tm, stations, chefs=(), mark=None, movers=None,
-                  at_y=None, platforms=None, reach=None, dynamic=None) -> str:
+                  at_y=None, platforms=None, reach=None, dynamic=None,
+                  wind=None) -> str:
     """把**台面层 + 会动的东西**叠到地形网格上 —— 一张图看清"哪一格是什么"。
 
     为什么需要: 地形图里所有台面都是 `#`(都走不上去), 分不出灶台/切菜板/盘子堆。
@@ -807,6 +813,13 @@ def overlay_ascii(tm, stations, chefs=(), mark=None, movers=None,
         except (TypeError, ValueError):
             continue
         over[tm.cell_of(x, z)] = PLATFORM_MARK
+    # **风区**(插件 dyn 的 winds 表, 由调用方用 `wind_cells()` 投成格) —— 画成 `~`。
+    # 为什么必须画出来: 风区**和传送带一样会把人推走**(同一条 `MovePosition` 位移通道),
+    # 而它**看不见也摸不着** —— 实机事故(s_balloon_2_3)就是"脚本不知道有风,
+    # 被一路推到边缘掉下去"。图上看得见, 才谈得上判断"这一步是不是走进了风里"。
+    # 判据只有 `map_model.wind_cells` 一处 —— 图上看什么, 引擎就按什么躲(开发约定规则1)。
+    for _cell in (wind or {}):
+        over[_cell] = WIND_MARK
     for c in chefs or []:
         try:
             cell = tm.cell_of(float(c.get("x") or 0), float(c.get("z") or 0))
@@ -1225,9 +1238,16 @@ def main() -> int:
 
     print("\n---- 叠加图 (地形 + 台面语义 + 厨师) ----")
     movers = (st.get("layout") or {}).get("movers") or []
+    # 风区: 用**引擎同一个** `wind_cells` 投成格 —— 图上看什么, 引擎就按什么躲。
+    # 拿不到 dyn / 旧 DLL 没有 winds ⇒ 空表, 图上不画(不报错)。
+    _wind = {}
+    try:
+        _wind = wind_cells(tm, _dyn)
+    except Exception:
+        _wind = {}
     print(overlay_ascii(tm, stations, chefs, tm.cell_of(cx, cz) if at else None,
                         movers=movers, at_y=chef_y, platforms=_plats,
-                        reach=_reach))
+                        reach=_reach, wind=_wind))
     print(OVERLAY_LEGEND)
     # ---- 遥感(遥控驾驶)标记 ----
     # 为什么必须显式打出来: **会话一开, 移动键驱动的是平台而不是厨师** ——
@@ -1246,6 +1266,22 @@ def main() -> int:
         print("  可开动平台 %s @ (%.1f,%.1f)   ← 图上画成 '%s'"
               % (p.get("name") or "?", float(p.get("x") or 0),
                  float(p.get("z") or 0), PLATFORM_MARK))
+    # ---- 风区: **每一条**都列出来(不只是画个 `~`) ----
+    # 为什么要把"作用在哪个厨师身上"打出来(`chefs`, 插件读 `WindAccumulator.m_sources`
+    # 得到的"游戏自己的答案"): 图上那个 `~` 是**几何近似**(格心落在体积的矩形里),
+    # 而 `WindVolume.m_windFilter` 层掩码可以把一个体积配成"不吹厨师" —— 那时图上有 `~`,
+    # 人走进去却一点事没有。两者对不上时该怀疑的是几何近似, 不是引擎。
+    for _w in (_dyn.get("winds") or []):
+        _ch = _w.get("chefs")
+        print("  风区 %s @ (%.1f,%.1f)  风速 %.2f u/s  开=%s  吹的厨师=%s%s"
+              % (_w.get("name") or "?",
+                 float(_w.get("cx") if _w.get("cx") is not None else (_w.get("x") or 0)),
+                 float(_w.get("cz") if _w.get("cz") is not None else (_w.get("z") or 0)),
+                 float(_w.get("speed") or 0),
+                 "是" if _w.get("on") else "否",
+                 _ch if _ch is not None else "?(旧 DLL 没这个字段)",
+                 "   ← 此刻没吹到任何人(没人站进去, 或层掩码对它关了)"
+                 if (_w.get("on") and _ch == []) else ""))
     # 隐去了什么必须说清楚 —— 不然就是"静默地少画了东西", 和原来那个
     # "静默地多画了东西"一样会误导。
     hid = [s for s in stations if not s.get("active", True)]
@@ -1285,6 +1321,25 @@ def main() -> int:
             print("      寻路不会去, 也不该算作'边界被解析成可走'。")
             if len(reach) < 10:
                 print("⚠ 到得了的格子非常少! 厨师可能被卡在角落里, 需要人工确认")
+        # **每个厨师各一行"他能到几格"** —— 上面那张图只画了 #0。
+        # ⚠ 为什么需要: 脚本驱的往往是 **Player.Two 那只(#1)**, 而图上画的是 #0 ——
+        #   两个人被分在两个厨房/两块平台时, "图上看着通"和"脚本走得到"是两回事。
+        #   (实机 2026-09-14 `s_summer_1_4`: 引擎 8 个候选全不可达, 而当时代码里
+        #    没有这个数, 只能靠猜是"口袋"还是"台面问题"。)
+        for c in chefs:
+            try:
+                qx = float(c.get("x") or 0)
+                qz = float(c.get("z") or 0)
+                qy = float(c.get("y")) if c.get("y") is not None else None
+            except (TypeError, ValueError):
+                continue
+            hr = tm.reachable_from(qx, qz, at_y=qy)
+            cell = tm.cell_of(qx, qz)
+            print("  厨师#%s @(%.1f,%.1f,%.1f) 格%s 地形 %r  可达 **%d** 格%s" % (
+                c.get("id"), qx, qz, qy if qy is not None else 0.0, cell,
+                tm.at(cell[0], cell[1]) if tm.inside(*cell) else "?",
+                len(hr),
+                "   ← ⚠ 几乎哪儿都去不了" if len(hr) < 10 else ""))
 
     # 顺手给出"哪里有危险"的格子坐标清单
     danger = [(i, j) for j in range(tm.h) for i in range(tm.w) if tm.is_danger(i, j)]

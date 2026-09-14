@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -769,4 +770,76 @@ def conveyor_edges(tm, dyn) -> dict:
         lst = out.setdefault(src, [])
         if dst not in lst:
             lst.append(dst)
+    return out
+
+
+def wind_cells(tm, dyn) -> dict:
+    """风区覆盖了哪些格、每格被往哪个方向推: `{(i,j): (vx, vz)}`(世界单位/秒)。
+
+    **为什么和传送带不是一套**(别顺手合并):
+      · 传送带是**逐格搬运** ⇒ 值得加一条连通边(`conveyor_edges`)
+      · 风是**体积内的持续漂移** ⇒ 只影响"站在这里会被推", **不产生新的连通性**
+        (风速通常远小于厨师速度 4 u/s, 顶着风也走得动; 真推不动的情况
+         `|W| ≥ 4` 是"到不了", 由导航的可行性闸门判, 不该伪装成一条边)
+
+    依据(反编译, 三处串起来):
+      · `WindVolume.cs:18-21`  `GetVelocity() = enabled ? m_windSpeed * transform.right : 0`
+      · `WindAccumulator.cs:32-39`  玩家身上的接收器把各源**矢量求和**
+      · `ClientPlayerControlsImpl_Default.cs:902-906` `ApplyWindForce()`
+        → `RigidbodyMotion.Movement(v, dt)` = `MovePosition(pos + v*dt)`
+        ⇒ **不按键也照样被吹**(实机事故: 风把厨师推到边缘 → 掉空洞 → 烧掉整局)
+
+    ⚠ **每次现算, 不要按 `TerrainMap` 身份缓存**(`_travel_edges` 那样):
+      `enabled` / `m_windSpeed` 会被机关改 —— `WindVolume.Update` 起风时播 `WindGust`、
+      `WindCosmeticDecisions.Update` 跟着点亮粒子, 都是"会变"的证据。
+      数据源走调用方的 `Engine._dyn()`, 它本来就带 1 秒 TTL, 刷新频率天然受限。
+    """
+    out = {}
+    if tm is None or not getattr(tm, "ok", False):
+        return out
+    for c in (dyn or {}).get("winds") or []:
+        if not c.get("on"):
+            continue                        # 停着的风区不推人
+        try:
+            vx = float(c.get("vx") or 0.0)
+            vz = float(c.get("vz") or 0.0)
+            cx = float(c.get("cx") if c.get("cx") is not None else (c.get("x") or 0.0))
+            cz = float(c.get("cz") if c.get("cz") is not None else (c.get("z") or 0.0))
+            ex = abs(float(c.get("ex") or 0.0))
+            ez = abs(float(c.get("ez") or 0.0))
+            rot = float(c.get("rot") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if abs(vx) < 1e-3 and abs(vz) < 1e-3:
+            continue                        # 风速为 0 = 此刻没风
+        if ex <= 0.0 or ez <= 0.0:
+            continue                        # 没有体积(插件没拿到 BoxCollider)
+
+        # 世界 → 体积局部: Unity 绕 Y 转 θ 的逆变换
+        th = math.radians(rot)
+        ca, sa = math.cos(th), math.sin(th)
+        # 有向矩形的世界 AABB 半长(用来只遍历相关格, 不扫全图)
+        ax = ex * abs(ca) + ez * abs(sa)
+        az = ex * abs(sa) + ez * abs(ca)
+
+        i0, j0 = tm.cell_of(cx - ax, cz - az)
+        i1, j1 = tm.cell_of(cx + ax, cz + az)
+        for i in range(min(i0, i1) - 1, max(i0, i1) + 2):
+            for j in range(min(j0, j1) - 1, max(j0, j1) + 2):
+                if not tm.inside(i, j):
+                    continue
+                px, pz = tm.world_of(i, j)          # 格心
+                wx, wz = px - cx, pz - cz
+                lx = wx * ca - wz * sa              # Unity: R^T · (p-c)
+                lz = wx * sa + wz * ca
+                if abs(lx) <= ex and abs(lz) <= ez:
+                    # ☠ **多股风要「求和」, 不是「覆盖」** —— `WindAccumulator.Update()`
+                    #   是 `m_totalForce += m_sources[i].GetVelocity()`(WindAccumulator.cs:44-51),
+                    #   两股风**方向相反时甚至互相抵消**。写成覆盖的话, 重叠风区上报的风速
+                    #   **偏小还可能反向**(风箱喷雾 + 场景风区重叠就是这种局面)。
+                    # ⚠ 这里只是"规划用的近似"(格心落在体积里); **补偿**那一侧不用它 ——
+                    #   游戏自己报的合力才是权威, 见 `Engine._wind_of`。
+                    prev = out.get((i, j))
+                    out[(i, j)] = (vx, vz) if prev is None \
+                        else (prev[0] + vx, prev[1] + vz)
     return out

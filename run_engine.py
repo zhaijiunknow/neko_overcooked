@@ -141,9 +141,12 @@ def main() -> int:
         print("[输入] ⚠ 键盘注入(需要游戏在最前台; 会真的按键 —— "
               "玩家也在用键盘时会互相抢。默认是 --input virtual)", flush=True)
 
+    # teammate_is_human=True: 这个入口只驱动**一只**厨师, 另一只归玩家 ——
+    # 让位判定(规格: "对方是人类时, 帮助他评距离和可达性")只在这种局面下开。
     eng = Engine(bridge, cid=args.cid,
                  mode_state=None if clean else roster.get(args.cid),
-                 world=World(bridge, log=print))
+                 world=World(bridge, log=print),
+                 teammate_is_human=True)
     try:
         eng.run(dry=args.dry)
     except KeyboardInterrupt:

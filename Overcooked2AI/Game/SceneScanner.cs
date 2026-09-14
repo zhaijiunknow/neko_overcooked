@@ -341,14 +341,126 @@ namespace Overcooked2AI.Game
                 }
                 catch (Exception) { }
 
+                // **正被击退/冲量推着吗** —— `ClientPlayerControlsImpl_Default.m_impactTimer > 0`
+                // 就是"此刻有外部冲量在覆盖速度"(ClientPlayerControlsImpl_Default.cs:426-431):
+                // 冲量期间它按 S 曲线把 `m_impactVelocity` 插值进运动, **按键只起一部分作用**,
+                // 所以脚本这时最该做的是**松手等它衰减**(0.2 秒), 而不是硬顶。
+                // 三类触发(§2.4.2): 撞火 / 被投掷物砸中 / 两名厨师冲刺对撞 —— 都不可预判。
+                // ⚠ `ClientPlayerControlsImpl_Default` **不是** `PlayerControls` 的子类
+                //   (`: ClientSynchroniserBase`), 是同一个 GameObject 上的**另一个组件**,
+                //   所以得单独取一次; `m_impactTimer` 是私有字段, 走反射读。
+                bool impacted = false;
+                try
+                {
+                    var icType = FindType("ClientPlayerControlsImpl_Default");
+                    if (icType != null)
+                    {
+                        var ic = chefGo.GetComponent(icType);
+                        if (ic != null)
+                        {
+                            var fi = icType.GetField("m_impactTimer",
+                                BindingFlags.Instance | BindingFlags.NonPublic);
+                            if (fi != null)
+                            {
+                                var v = fi.GetValue(ic);
+                                impacted = v is float && (float)v > 0f;
+                            }
+                        }
+                    }
+                }
+                catch (Exception) { }
+
+                // ---- 风: **直接问游戏**"此刻这个厨师身上的合力是多少" ----
+                //
+                // 依据(反编译, 一条链):
+                //   PlayerControls.WindReceiver                    (PlayerControls.cs:408, 576)
+                //     → WindAccumulator.GetVelocity() = m_totalForce
+                //     = Σ 各 IWindSource.GetVelocity()             (WindAccumulator.cs:44-51, 71-74)
+                //   而 ClientPlayerControlsImpl_Default.cs:902-906 的 ApplyWindForce()
+                //   **用的就是这个数**(RigidbodyMotion.Movement(v, dt) = MovePosition(pos + v*dt))。
+                //
+                // ⇒ **权威来源**。相比"把风区体积投影到格子再猜人在不在风里", 它一次解决四件事:
+                //   · 多股风**已经求和**(重叠的风区/风箱喷雾都不用手算)
+                //   · `m_windFilter` 层掩码**已经过掉**(体积可以配成"不吹厨师")
+                //   · 碰撞体的真实形状/旋转/层级不用管(那是 Unity 物理的事)
+                //   · `enabled` / `m_windSpeed` 的变化天然即时(GetVelocity 现算)
+                //   几何投影只需留给"规划"(哪几格会吹), 见 `InteractiveScan.WindExtra` 的 chefs[]。
+                bool windOk = false;
+                float wvx = 0f, wvz = 0f;
+                try
+                {
+                    var p = pcType.GetProperty("WindReceiver");
+                    var acc = (p == null) ? null : p.GetValue(comp, null);
+                    if (acc != null)
+                    {
+                        var m = acc.GetType().GetMethod("GetVelocity", Type.EmptyTypes);
+                        if (m != null)
+                        {
+                            var v = (Vector3)m.Invoke(acc, null);
+                            wvx = v.x;
+                            wvz = v.z;
+                            windOk = true;
+                        }
+                    }
+                }
+                catch (Exception) { }
+
+                // ---- 真实 RunSpeed / 轴向反转 ----
+                // `MovementData`(PlayerControls.cs:22-54)里 `RunSpeed` / `XAxisAllignment` /
+                //   `YAxisAllignment` 都是 **public 字段**, 从 `PlayerControls.Movement`(:388) 取一次实例就行。
+                // 为什么要它: 补偿公式要除以**摇杆增益** `RunSpeed * MovementScale` ——
+                //   Python 侧一直硬编码 `4.0 * 0.9`(`engine.py:115`, 那个 0.9 是按键欠冲用的),
+                //   拿它当除数会把风高估 11%。而 `RunSpeed` 是 prefab 上的 `[SerializeField]`,
+                //   只有游戏自己知道。`align*` 顺手把"轴是否被关卡反转"这个符号问题也堵上。
+                float run = 0f;
+                string alignx = "", aligny = "";
+                try
+                {
+                    var p = pcType.GetProperty("Movement");
+                    var mov = (p == null) ? null : p.GetValue(comp, null);
+                    if (mov != null)
+                    {
+                        var mt = mov.GetType();
+                        var fRun = mt.GetField("RunSpeed");
+                        if (fRun != null)
+                        {
+                            var v = fRun.GetValue(mov);
+                            if (v is float)
+                                run = (float)v;
+                        }
+                        var fx = mt.GetField("XAxisAllignment");
+                        if (fx != null)
+                        {
+                            var v = fx.GetValue(mov);
+                            alignx = (v == null) ? "" : v.ToString();
+                        }
+                        var fy = mt.GetField("YAxisAllignment");
+                        if (fy != null)
+                        {
+                            var v = fy.GetValue(mov);
+                            aligny = (v == null) ? "" : v.ToString();
+                        }
+                    }
+                }
+                catch (Exception) { }
+
                 return string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},\"canpress\":{4}",
+                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},"
+                    + "\"canpress\":{4},\"impacted\":{5},\"wind\":{{\"ok\":{6},\"vx\":{7:F2},\"vz\":{8:F2}}},"
+                    + "\"run\":{9:F2},\"alignx\":\"{10}\",\"aligny\":\"{11}\"",
                     respawning ? "true" : "false",
                     suppressed ? "true" : "false",
                     scale,
                     can ? "true" : "false",
-                    canpress ? "true" : "false");
+                    canpress ? "true" : "false",
+                    impacted ? "true" : "false",
+                    windOk ? "true" : "false",
+                    wvx,
+                    wvz,
+                    run,
+                    SafeName(alignx),
+                    SafeName(aligny));
             }
             catch (Exception) { }
             return "";
