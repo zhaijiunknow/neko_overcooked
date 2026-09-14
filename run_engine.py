@@ -1,18 +1,32 @@
 """单人自动做菜入口。
 
 用法(先进对局):
-  python run_engine.py                     # P1 自动做菜(合作模式)
+  python run_engine.py                     # **驱动 Player.Two 那只**(默认, 走虚拟手柄)
+                                           #   键盘留给玩家; 没有 Player.Two 会停下报错
+  python run_engine.py --cid 0             # 按**序号**显式指定厨师(单人调试用)
   python run_engine.py --dry               # 只规划不驱动(打印"当前订单要怎么做")
-  python run_engine.py --mode clumsy       # P1 用"失误"模式
-  python run_engine.py --mode sabotage     # P1 用"捣蛋"模式
+  python run_engine.py --mode clumsy       # 用"失误"模式
+  python run_engine.py --mode sabotage     # 用"捣蛋"模式
+  python run_engine.py --input keys        # 非要键盘注入时才加(见下)
+
+⚠ **`--cid` 是厨师序号, 不是玩家身份** —— 两者在单人局里**不一样**:
+  单人(Overcooked 单人也是两只厨师, 都归 Player.One, 你自己切换着玩)时
+  `--cid 1` 拿到的是**你的**厨师。所以默认改成**按身份找 Player.Two**。
 
   --mode 可写:  coop | clumsy | sabotage
                也可对多人分别指定(如 --cid 0 时用 "1:sabotage")
 
 输入层(环境变量 NEKO_INPUT):
-  keys     (默认) 系统级键盘注入(SendInput) —— **要求游戏在最前台**, 失焦就暂停
-  virtual  游戏内虚拟手柄 —— 直接换掉厨师的逻辑输入, **游戏放后台也照样做菜**
-           装不上会自动退回 keys(所以这个兜底是自动的)
+  virtual  (**默认**) 游戏内虚拟手柄 —— 直接换掉厨师的逻辑输入, **游戏放后台也照样做菜**,
+           而且**不占你的键盘/鼠标**(双人时键盘留给玩家)
+  keys     系统级键盘注入(SendInput) —— **要求游戏在最前台**, 失焦就暂停;
+           而且会真的按键, 玩家在用键盘时两边会抢
+           ⚠ **装不上虚拟手柄时不会自动退回这个** —— 见下
+
+⚠ **默认改成 virtual 的原因**(2026-09-14 实测): 双人时"键盘给玩家、手柄给脚本"是
+  正常用法, 而 `keys` 会把脚本的按键和玩家的键盘混在一起 —— 实测出现过
+  "脚本在玩玩家那只厨师"。虚拟手柄走的是**按玩家身份**接管(`installplayer`),
+  和谁在用键盘无关。
 """
 
 from __future__ import annotations
@@ -32,12 +46,35 @@ from modes import Roster, parse_mode_spec  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true", help="只规划不驱动")
-    ap.add_argument("--cid", type=int, default=0, help="驱动哪个厨师(0=P1, 1=P2)")
+    ap.add_argument("--cid", type=int, default=None,
+                    help="驱动哪个厨师(按**序号**: 0=P1, 1=P2)。"
+                         "**不给就按玩家身份自动挑 Player.Two 那只** —— "
+                         "单人局没有 Player.Two, 会报错让你先让 P2 加入")
     ap.add_argument("--mode", default="coop",
                     help="个体模式: coop | clumsy | sabotage(可写 1:sabotage,2:coop)")
-    ap.add_argument("--input", default=os.environ.get("NEKO_INPUT", "keys"),
-                    help="输入层: keys(默认, 键盘注入) | virtual(游戏内虚拟手柄, 后台也能跑)")
+    ap.add_argument("--input", default=os.environ.get("NEKO_INPUT", "virtual"),
+                    help="输入层: virtual(默认, 游戏内虚拟手柄, 后台也能跑) | keys(键盘注入)")
     args = ap.parse_args()
+
+    bridge = BridgeClient()
+    print("连桥...", flush=True)
+    bridge.connect(retries=None)
+
+    # ---- 挑要驱动的厨师 ----
+    # 不给 `--cid` 就**按玩家身份**挑 Player.Two, **不用序号猜** ——
+    #   厨师序号 ≠ 玩家身份: 单人局(两只厨师但都归 Player.One, 你自己切换着玩)里,
+    #   `--cid 1` 拿到的是**你的**厨师, 脚本会当场抢人(实测日志:
+    #   `已接管厨师#1(指定 Player=0 → 实际 0)` + `厨师#1 属于 One → 用 P1 键位`)。
+    if args.cid is None:
+        from bridge.virtual_pad import chef_of_player
+        args.cid = chef_of_player(bridge, "Two")
+        if args.cid is None:
+            print("[玩家] ✗ 这局没有 Player.Two —— **不知道要驱动谁, 停下**", flush=True)
+            print("[玩家]   双人: 先在主界面让 P2 加入:  python -u tools\\joinp2.py", flush=True)
+            print("[玩家]   单人: 只有你自己, 那本就不该跑脚本; 非要跑就显式 --cid 0", flush=True)
+            bridge.close()
+            return 1
+        print(f"[玩家] 自动选中 Player.Two 的厨师 = 厨师#{args.cid}", flush=True)
 
     # 模式册: 每个个体一份状态, 可热切换(v1 D6/D10)
     # ⚠ --mode none: **纯执行, 一个失误都不演** —— 调寻路/调流程时必须用这个。
@@ -55,19 +92,26 @@ def main() -> int:
     else:
         print(f"[模式] P{args.cid + 1} → 纯执行(不演任何失误, --mode none)", flush=True)
 
-    bridge = BridgeClient()
-    print("连桥...", flush=True)
-    bridge.connect(retries=None)
-
     # ---- 输入层选择 ----
-    mode = (args.input or "keys").strip().lower()
+    mode = (args.input or "virtual").strip().lower()
     pad = None
     if mode in ("virtual", "ver", "hook"):
         from bridge.virtual_pad import attach_virtual_input
         # 会自己等进对局, 并按"厨师归属的玩家"安装(不依赖对象枚举顺序)
         pad = attach_virtual_input(bridge, chef=args.cid, log=print)
         if pad is None:
-            print("[输入] ⚠ 虚拟手柄装不上, 自动退回键盘注入(需要游戏在前台)", flush=True)
+            # ☠ **绝不自动退回键盘**(2026-09-14 改)。
+            #   键盘注入发的是**真的系统按键** —— 双人时玩家也在用键盘,
+            #   两边会**互相抢**。实测就是这么出现"脚本在玩玩家那只厨师"的:
+            #   手柄没装上 → 静默退回键盘 → 脚本的键和玩家的键混在一起打给同一个人。
+            #   所以装不上就**停下来说清楚**, 由人决定(想用键盘就显式 --input keys)。
+            print("[输入] ✗ 虚拟手柄装不上 —— **不会自动退回键盘**", flush=True)
+            print("       常见原因: ① 起脚本时还没进对局(`wait_for_round` 等 300 秒);", flush=True)
+            print("                 ② 这局没有厨师#%d(单人只有一只 → 用 --cid 0)" % args.cid,
+                  flush=True)
+            print("       要键盘注入请**显式**加: --input keys", flush=True)
+            bridge.close()
+            return 1
         else:
             # 这一行就是"体检": 跑全程的同时把决定性的数字打出来, 不用再单独开终端查。
             #   paused 存在      -> 加载的是新 dll(BepInEx 只在游戏启动时读 dll, 改完必须重启游戏)
@@ -94,7 +138,8 @@ def main() -> int:
                 print(f"[输入] 厨师#{c.get('id')} local={c.get('local')} canpress={c.get('canpress')} "
                       f"pick={c.get('pick')!r}", flush=True)
     else:
-        print("[输入] 键盘注入(需要游戏在最前台; 想后台跑用 --input virtual)", flush=True)
+        print("[输入] ⚠ 键盘注入(需要游戏在最前台; 会真的按键 —— "
+              "玩家也在用键盘时会互相抢。默认是 --input virtual)", flush=True)
 
     eng = Engine(bridge, cid=args.cid,
                  mode_state=None if clean else roster.get(args.cid),

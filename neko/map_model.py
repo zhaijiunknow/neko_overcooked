@@ -340,6 +340,11 @@ class KitchenMap:
     #: 会动的东西(路人/车辆/移动危险物) —— 地形快照看不见的那一层
     movers: list = field(default_factory=list)
 
+    #: 判断 `movers` 里的东西**像不像"会动的"**用的半径上限(单位: 格)。
+    #: 真 movers(路人/车/推车)实测 `r = 0.5 ~ 0.6`; 而混进来的 `KillPlane` 是 12.5~35.0。
+    #: 取 3 格 —— 比任何真的会动的东西都大, 又远小于那些"面"。
+    MOVER_MAX_R_CELLS = 3.0
+
     def blocked_by_movers(self, tm) -> set:
         """**当前被会动的东西占住/威胁的格子**。给 A* 当动态禁行格。
 
@@ -357,12 +362,45 @@ class KitchenMap:
         if tm is None or not getattr(tm, "ok", False):
             return out
         cell = max(tm.cellx, tm.cellz, 1e-6)
+        # ☠ **台面本身不是"会动的东西"**。
+        #   `MoverScan.Snapshot()` 收的是"**所有挂 `RespawnCollider` 的物体**" ——
+        #   那是"**会弄死你**"的标记, 不是"**会动**"的标记。于是**食材箱**
+        #   (`dispenser_crate_04` 也挂了 RespawnCollider)被一起扫了进来:
+        #     实测 s_wonderland_1_5: 18 个"mover" 里 **10 个是食材箱**、8 个是路人。
+        #   ⇒ 引擎要去取的箱子**把自己禁掉了** ⇒ `find_path` 的 `ok()` 判目标不可走
+        #     ⇒ 规划不出路 ⇒ 直线硬冲 ⇒ 卡在"还差 1.0 格"(正好够不到箱子)。
+        #   判据用**名字**(台面名 = 同一个 Unity 对象名), 比关键词/半径都准。
+        statics = set(s.name for s in self.stations.values() if s.name)
         for m in self.movers:
+            if (getattr(m, "name", "") or "") in statics:
+                continue
+            # ☠ **别把"死亡面"当 mover**(实测踩过, 2026-09-14)。
+            #   `movers` 里混进了 `KillPlane`(关卡地板下方那层死亡面), 它的 `r` 是
+            #   **半边长** —— 实测 35.0 / 17.5 / 12.5。按半径展开后
+            #   **一个就盖住 61x61 = 3721 格**, 而地图才 984 格
+            #   ⇒ 禁行集算出来 **3845 格 > 整张图**。
+            #   后果是一整条链: `find_path` 永远无解 → 退回"不避让" → 还是无解 →
+            #   `navigate_smart` 走**直线硬冲**兜底 → 撞墙卡死。
+            #   症状就是日志里**每一跳**都刷:
+            #     `[导航] ⚠ 动态禁行(3845 格)导致无路可走`
+            #   KillPlane 在地形层已经按 `RespawnCollider` 处理成危险区了,
+            #   不该再进这个"会动的东西"的集合。
+            _n = (getattr(m, "name", "") or "").lower()
+            if "killplane" in _n or "falldeath" in _n:
+                continue
+            try:
+                _r = float(getattr(m, "r", 0) or 0)
+            except (TypeError, ValueError):
+                _r = 0.0
+            # 第二道保险: 半径超过 3 格的"会动的东西"(路人/车)不存在 ——
+            # 真 movers 实测 r=0.5~0.6。名字万一变了, 这条还兜得住。
+            if _r > self.MOVER_MAX_R_CELLS * cell:
+                continue
             try:
                 ci, cj = tm.cell_of(m.x, m.z)
             except Exception:
                 continue
-            n = max(1, int(m.r / cell + 0.999))     # 向上取整到整格, 不加余量
+            n = max(1, int(_r / cell + 0.999))      # 向上取整到整格, 不加余量
             for di in range(-n, n + 1):
                 for dj in range(-n, n + 1):
                     out.add((ci + di, cj + dj))
@@ -524,8 +562,16 @@ class KitchenMap:
                 return c
         return None
 
-    def find_source(self, ing_name: str, x: float = 0.0, z: float = 0.0) -> Optional[Station]:
-        """找提供某食材的箱子。优先精确匹配(prefab 名/食材名), 再退化到模糊匹配。"""
+    def find_source(self, ing_name: str, x: float = 0.0, z: float = 0.0,
+                    ok=None) -> Optional[Station]:
+        """找提供某食材的箱子。优先精确匹配(prefab 名/食材名), 再退化到模糊匹配。
+
+        `ok`: 可选的过滤函数 `ok(station) -> bool` —— **用来滤掉"走不到"的货源**。
+        为什么需要(实测 `s_wonderland_1_5`): 那关两个厨房被一道墙切开
+        (两块连通块 28 格 / 108 格, **交集 0**), 而本函数**只按距离挑** ——
+        于是挑中了对面厨房的箱子 ⇒ 到那儿才发现够不着 ⇒ 整步白费。
+        **"哪个箱子最近"和"哪个箱子到得了"是两件事, 后者必须先满足。**
+        """
         key = (ing_name or "").strip()
         if not key:
             return None
@@ -533,6 +579,8 @@ class KitchenMap:
         # 1) 精确: 箱子 prefab 名 或 ing 字段等于目标(或互为子串的基本形式)
         exact, loose = [], []
         for s in self.of("crate"):
+            if ok is not None and not ok(s):
+                continue                       # 走不到的货源, 直接不算候选
             hay = (s.spawn + " " + s.ing + " " + s.name)
             if hay.lower().find(low) >= 0:
                 d = (s.x - x) ** 2 + (s.z - z) ** 2

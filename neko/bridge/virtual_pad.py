@@ -353,3 +353,77 @@ def install_all_pads(bridge, log=print) -> dict:
     else:
         log(f"[虚拟手柄] ✗ 一次安装失败: {r.get('error')}")
     return r
+
+
+def chef_of_player(bridge, player: str = "Two", log=print):
+    """**按玩家身份找厨师** —— 返回 chef id, 找不到返回 None。
+
+    为什么要这个而不是"序号"(`--cid 1`): **厨师序号 ≠ 玩家身份**。
+      · 双人局: 厨师#0=One / 厨师#1=Two —— 序号恰好对上
+      · **单人局**: Overcooked 单人**也是两只厨师**, 但**都归 Player.One**
+        (你自己切换着玩) ⇒ `--cid 1` 拿到的是**玩家的厨师**, 脚本会当场抢人。
+        实测日志就是这么暴露的:
+          `[虚拟手柄] ✓ 已接管厨师#1(指定 Player=0 → 实际 0)` +
+          `[键位] 厨师#1 属于 One → 用 P1 键位`
+
+    所以"驱动 P2"要按**身份**找, 找不到就该停 —— 而不是默默地开走玩家的厨师。
+    """
+    try:
+        st = bridge.get_state() or {}
+    except Exception as e:
+        log(f"[玩家] 读状态失败: {e}")
+        return None
+    chefs = ((st.get("layout") or {}).get("chefs") or [])
+    if not chefs:
+        log("[玩家] 状态里没有厨师(还没进对局?)")
+        return None
+    want = (player or "").strip().lower()
+    hit = [int(c.get("id", -1)) for c in chefs
+           if str(c.get("player") or "").strip().lower() == want]
+    if not hit:
+        who = ", ".join("厨师#%s=%s" % (c.get("id"), c.get("player")) for c in chefs)
+        log(f"[玩家] 这局**没有** Player.{player} —— 现在是: {who}")
+        log(f"[玩家]   ({len(chefs)} 只厨师但都属于同一个玩家 = 单人局, 你自己在玩)")
+        return None
+    return hit[0]
+
+
+def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
+                log=print) -> bool:
+    """在**主界面**让第二个玩家加入(按虚拟手柄的 A)。
+
+    为什么非要有这一步 —— 这是个**鸡生蛋**, 只能走这条"旧路":
+      · `pad("installplayer")` 那套(真正消费输入的那个)要求场景里**已经有
+        `PlayerControls`** ⇒ 得先在对局里才能装(`VirtualInput.cs:226` 那句
+        "场景里没有 PlayerControls(还没进对局?)")
+      · 而要"对局里有第二只厨师", P2 得先在主界面加入
+      · 而 `VirtualInput` **故意绕开加入流程**(`VirtualInput.cs:99-103`: "不碰设备枚举、
+        不碰加入流程") —— 它替换的是 `ControlSchemeData`, 压根不参与设备接入
+      ⇒ **只有 `VirtualGamepads`(真的 InControl 设备)能触发
+        `PCPadInputProvider.OnDeviceAttached`, 也就是"有手柄接上了"那个事件。**
+
+    ⚠ **能否加入，本函数只能确认"命令被接受"** —— 大厅里有几个人在
+      `StartScreen` 是**读不到**的(要进对局才有 `PlayerControls`)。
+      真正加入没有要靠眼睛看, 或者进对局后数 `chefs`。
+
+    `pad`: 用第几个虚拟设备(0/1)。哪个对应"第二玩家"取决于游戏怎么分配槽位,
+           默认 1; 不行就试 0。
+    `hold`: 按住 A 的时长 —— 设备接上到被枚举可能要几帧, 太短会漏。
+    """
+    ok_any = False
+    for k in range(tries):
+        # ⚠ 整份覆盖: 这个接口是**状态写**不是增量, 少写一个字段就等于把它清零。
+        #   所以 `connected=1` 每次都要带上, 否则设备会被"拔掉"。
+        r1 = bridge.vpad(pad, connected=1, A=1)
+        time.sleep(hold)
+        r2 = bridge.vpad(pad, connected=1, A=0)
+        ok = bool(r1.get("ok") and r2.get("ok"))
+        ok_any = ok_any or ok
+        log(f"[加入] 第 {k + 1}/{tries} 次按 A (pad={pad}, 按住 {hold}s) -> "
+            f"{'命令已接受' if ok else '失败: ' + str(r1.get('error') or r2.get('error'))}")
+        if ok:
+            time.sleep(0.4)
+    if ok_any:
+        log(f"[加入] pad={pad} 的 A 已按过 {tries} 次 —— "
+            f"**去看一眼大厅里出没出第二个玩家**(这边读不到)")
+    return ok_any

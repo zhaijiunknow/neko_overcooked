@@ -84,8 +84,14 @@ class Engine:
         #: 而限时平台升降/荷叶沉浮/潮水都会改地形, 且**只改高度不改字符** ——
         #: 于是引擎会拿着"平台还升着"的旧图规划, 直接走进海里
         #: (实测 s_wonderland_1_2: 66 格高度在 0.00 ↔ -3.00 之间循环, 字符一格不变)。
-        #: 取 1.5 秒: 比 C# 默认的 5 秒缓存短, 所以会真的触发重取; 又不至于每帧都建图。
-        self.terrain_ttl = 1.5
+        #: ⚠ **2026-09-14 从 1.5 压到 0.5**(用户要求"提高地图更新的频率"):
+        #:   实测这一关强制扫一次只要 **32ms**(`s_wonderland_1_5` 41x24,
+        #:   逐格 2 条射线 ≈ 2000 次 raycast) ⇒ 0.5 秒的占空比才 6%, 完全付得起。
+        #:   1.5 秒的代价是实打实的: 厨师 4 u/s, 1.5 秒走出 **6 格** ——
+        #:   拿 6 格前的图规划, 平台/荷叶/潮水早就变了。
+        #:   ⚠ **大关卡会线性变慢**(耗时 ∝ 格子数), 所以留了 `NEKO_TERRAIN_TTL`
+        #:     覆盖; 真要调就按 `tools/gridwatch.py` 或日志里的实测耗时定。
+        self.terrain_ttl = float(os.environ.get("NEKO_TERRAIN_TTL") or 0.5)
         self._last_fail_step = ""                    # 最后失败在哪一步(供主循环判断重复失败)
         #: 台面传送带的"每格往哪传"表 + 速度, 按场景缓存(来自插件 dyn)
         self._belt_dirs_cache = None
@@ -948,6 +954,54 @@ class Engine:
         g, w = self._norm(got), self._norm(want)
         return bool(g) and (g == w or w in g or g in w)
 
+    def _align_for_place(self, spot, tries: int = 8) -> bool:
+        """朝 `spot` 挪到**游戏说"放置目标就是它"**为止。返回是否对齐。
+
+        ☠ 为什么必须确认(实测 `s_wonderland_1_5`, 整局报废):
+          导航只保证"站到了旁边", `face` 只保证"面朝那边" —— 而**两个台子挨得近时**,
+          游戏仍会把 `m_iHandlePlacement` 判成**旁边另一个台子**
+          (`placement target='workstation_mixer_01 (2)'` 而期望 `countertop_01 (2)`)。
+          原来的代码**读到了 `placeh` 却只打了行日志就照样按下去**,
+          连试 3 次全一样 → "同一步连续失败 3 次" → 停机。
+          ⇒ 判据用**游戏自己报的 `placeh`**, 和 `_aim_ok` 用 pick/use 同一个道理:
+            **别自己编阈值**(交互真实判据是"到碰撞体表面 < 1.0 且朝向前 180°",
+             拿格心距离比根本没有可比性)。
+        """
+        from bridge.keyboard_input import key_down, key_up
+        want = getattr(spot, "name", "") or ""
+        if not want:
+            return True                      # 不知道期望名字时只能放行(老 dll)
+        for k in range(tries):
+            st = self.state(force=True)
+            if not st or not st.get("inRound"):
+                return False
+            ph = (self.chef(st) or {}).get("placeh") or ""
+            if self._name_is(ph, want):
+                return True
+            cx, cz, _ = self.pos(st)
+            if cx is None:
+                return False
+            dx, dz = spot.x - cx, spot.z - cz
+            d = (dx * dx + dz * dz) ** 0.5
+            if d < 0.25:
+                # 已经贴到台子边上了还判错 → 只能转身换个朝向试试
+                self.face(spot.x, spot.z)
+                time.sleep(0.15)
+                continue
+            self.face(spot.x, spot.z)
+            dd = dir_for_step(dx, dz, deadzone=0.05)
+            if dd:
+                key = self._key({"left": "A", "right": "D",
+                                 "up": "W", "down": "S"}[dd])
+                key_down(key)
+                time.sleep(0.15)
+                key_up(key)
+            time.sleep(0.12)
+        st = self.state(force=True)
+        self.log("[步骤] ⚠ 挪了 %d 次, 游戏仍说放置目标是 %r(期望 %r) —— **不再按下去**"
+                 % (tries, (self.chef(st) or {}).get("placeh") or "", want))
+        return False
+
     def _aim_ok(self, st: dict, want: str) -> bool:
         """**用游戏自己的判定**确认"现在按交互键能作用到目标 want"。
 
@@ -1155,7 +1209,37 @@ class Engine:
             # 1.5) 实时找"能出这个食材的箱子"。know 表只读一次、坐标可能过时,
             #   而 state.layout 每秒刷新 —— 箱子换位/换内容后必须信实时的, 否则
             #   会走到旧坐标抓到旁边别的箱子(日志里"拿到 SushiFish 不是 Seaweed")。
-            live_src = km.find_source(op.target, cx or x, cz or z)
+            # ☠ **挑箱子必须先看"够不够得着"**(实测 s_wonderland_1_5)。
+            #   那关两个厨房被一道墙切开(连通块 28 格 vs 108 格, **交集 0**),
+            #   而 `find_source` 只按距离挑 ⇒ 挑中对面厨房的箱子 ⇒
+            #   `_stand_cell` 找不到可达的相邻格(唯一那个在对面) ⇒ 退到 2.4 格 >
+            #   交互半径 1.0 ⇒ 够不着 ⇒ **整步失败**。
+            #   判据和交互几何对齐: **正交相邻格里有"可走且可达"的**才算够得着
+            #   (斜角 1.70 格 > 半径 1.0, 不算)。
+            _tm0 = self.terrain()
+            _ok_src = None
+            if _tm0 is not None and _tm0.ok and cx is not None:
+                _r0 = _tm0.reachable_from(
+                    cx, cz, at_y=self.chef_y(st),
+                    extra_edges=self._travel_edges(km, _tm0))
+
+                def _ok_src(s, _tm=_tm0, _r=_r0):
+                    _c = _tm.cell_of(s.x, s.z)
+                    for _di, _dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        _n = (_c[0] + _di, _c[1] + _dj)
+                        if _tm.inside(*_n) and _tm.walkable(*_n) and _n in _r:
+                            return True
+                    return False
+
+            live_src = km.find_source(op.target, cx or x, cz or z, ok=_ok_src)
+            if live_src is None and _ok_src is not None:
+                # 区分"这关没有这个箱子"和"有, 但都够不着" —— 后者是**地图/订单**的问题,
+                # 不是导航的问题, 日志必须说清楚(否则下一个人会去查寻路)。
+                _all = km.find_source(op.target, cx or x, cz or z)
+                if _all is not None:
+                    self.log(f"[步骤] ⚠ 有出 {op.target} 的箱子({_all.id} "
+                             f"@{_all.x:.1f},{_all.z:.1f}), 但**这只厨师走不到它旁边** —— "
+                             f"多半是两个厨房(要传接球), 不是寻路问题")
             if live_src is not None:
                 tx, tz = live_src.x, live_src.z
                 self.log(f"[步骤] 取 {op.target} @实时箱子 {live_src.id}({tx:.1f},{tz:.1f})")
@@ -1581,6 +1665,57 @@ class Engine:
             self.log(f"[边] 传送带边构造失败: {e}")
         self._travel_cache = (tm, ed)
         return ed
+
+    def _dyn(self, ttl: float = 1.0) -> dict:
+        """机关表(`dyn`), 带短 TTL —— 一帧里好几个地方要用, 别各取各的。"""
+        now = time.time()
+        c = getattr(self, "_dyn_cache", None)
+        if c is not None and now - c[0] < ttl:
+            return c[1]
+        try:
+            d = self.bridge.get_dyn() or {}
+        except Exception as e:
+            self.log(f"[机关] 取 dyn 失败: {e}")
+            d = {}
+        self._dyn_cache = (now, d)
+        return d
+
+    def world_transitioning(self) -> list:
+        """**关卡此刻正在变形吗** —— 返回正在变的构件列表(空 = 没在变)。
+
+        依据(反编译 `InteractiveScan.Snapshot`): `transitions` 里**只上报
+        有变形标志为真**的构件 —— `IsTransitioning` / `IsTideTransitioning` /
+        `IsArtInMotion` / `InScene` 任一为真(`InteractiveScan.cs:161-162`:
+        "没有任何变形标志为真 = 这一关此刻没在变形, 不必上报")。
+        ⇒ **`transitions` 非空就是"关卡正在动"。**
+
+        ⚠ 为什么要当**导航闸门**: 变形期间地形正在改(潮水涨/画动/场景切换),
+          地形图上"现在能走"的格子可能正变成水或空洞。**硬走过去就是掉下去** ——
+          而且那和"寻路算错了"长得一模一样, 事后极难查。
+        """
+        return self._dyn().get("transitions") or []
+
+    def _log_triggers(self, km) -> None:
+        """把**触发机器**打出来 —— 它们不"操作", 而是**解释地形为什么会变**。
+
+        `TriggerIgniteArea`(会点火) / `TriggerCreateHazard`(会造危险区) /
+        `TriggerMoveSpawnPoints`(会挪出餐点) 之类, 存在就说明这一格附近有会变的玩意。
+        只在一关打一次。
+        """
+        if getattr(self, "_trig_logged_scene", "") == (self.scene or ""):
+            return
+        self._trig_logged_scene = self.scene or ""
+        tg = self._dyn().get("triggers") or []
+        if not tg:
+            return
+        from collections import Counter
+        c = Counter((t.get("type") or "?") for t in tg)
+        self.log("[机关] 触发机器 %d 个(它们会让地形/危险区变, 不是用来按的): %s"
+                 % (len(tg), ", ".join("%s×%d" % kv for kv in c.most_common())))
+        for t in tg[:6]:
+            self.log("        %-24s (%.1f,%.1f) 开=%s"
+                     % (t.get("type"), float(t.get("x") or 0),
+                        float(t.get("z") or 0), t.get("on")))
 
     def _pilot_probe(self, term) -> bool:
         """**"现在动的是平台还是厨师?"** —— 进/退会话的判据都靠它。
@@ -2060,6 +2195,9 @@ class Engine:
         self.log(f"[步骤] 去 {board.id} 切 → {op.target}")
         if not self.navigate_smart(km, board.x, board.z, tight=0.8):
             return False
+        self.face(board.x, board.z)
+        if not self._align_for_place(board):     # 见 _align_for_place: 挨得近会判到旁边台子
+            return False
         if held:
             self.interact("pickup", verify_hold_change=False)   # 先放上板
             time.sleep(0.25)
@@ -2488,6 +2626,8 @@ class Engine:
             fx = before.x if (before is not None and before.x) else stove.x
             fz = before.z if (before is not None and before.z) else stove.z
             self.face(fx, fz)
+            if not self._align_for_place(stove):   # 手拿盘对锅取菜: 别判到旁边台子
+                continue
             st0 = self.state(force=True)
             placeh = (self.chef(st0) or {}).get("placeh") or ""
             self.log(f"[步骤] 手拿盘子对 {stove.id} 按交互取菜(第 {k+1} 次, "
@@ -2572,6 +2712,101 @@ class Engine:
             return False
         return self.interact("pickup", verify_hold_change=True)
 
+    def op_press(self, km, st) -> bool:
+        """按一个**此刻可按**的机关按钮。
+
+        ⚠ 按钮的权威来源是 **`dyn.buttons`**, 不是台面表:
+          `InteractiveScan` 扫的是 `SwitchStation` / `ToggleSwitch` / `PressureSwitch`
+          三种组件(`InteractiveScan.cs:33`), 而 `map_model._KIND_SEM` **只映射了
+          `switchstation`** —— 另外两种在台面表里**压根查不到**。
+          **查不到不等于没有**, 所以这里直接读 dyn。
+          `pressable` = 那一刻游戏说它可交互(`Interactable.enabled`)。
+
+        按键用 `chop`(切/交互): 游戏那边它对应"使用" —— `InteractDirect` 的 `use`
+        分支会**同时**发 `ReceiveInteractEvent` + `ReceiveTriggerInteractEvent`,
+        而电锯/上菜铃那类靠的正是后者。
+        """
+        btns = [b for b in (self._dyn().get("buttons") or []) if b.get("pressable")]
+        if not btns:
+            return False
+        cx, cz, _ = self.pos(st)
+        if cx is None:
+            return False
+        b = min(btns, key=lambda t: (float(t.get("x") or 0) - cx) ** 2
+                + (float(t.get("z") or 0) - cz) ** 2)
+        bx, bz = float(b.get("x") or 0), float(b.get("z") or 0)
+        self.log("[机关] 去按 %s @(%.1f,%.1f)" % (b.get("type") or "?", bx, bz))
+        if not self._approach(km, bx, bz, want=(b.get("name") or "")):
+            self.log("[机关] 走不到按钮旁边")
+            return False
+        if not self.interact("chop", verify_hold_change=False):
+            return False
+        self.log("[机关] ✓ 按了 %s" % (b.get("type") or "?"))
+        return True
+
+    def op_wash(self, km, st, budget: float = 20.0) -> bool:
+        """洗盘子 —— **两步机制**(反编译 `WashingStation` + `ServerWashingStation`):
+
+          ① **把整叠脏盘放到洗手池上**: `WashingStation.CanHandlePlacement` 要求
+             手上是 `DirtyPlateStack`; 放下后**盘子叠被销毁**、`m_plateCount += size`
+             (`ServerWashingStation.HandlePlacement`)
+          ② **在洗手池按住交互键**: `UpdateSynchronising` 里每
+             `m_cleanPlateTime`(2 秒)洗好**一个**, 洗好的走
+             `m_plateReturnStation.ReturnPlate()` ⇒ 出现在**干燥台**(PlateReturnStation)
+
+        ⇒ 可观测的终点是"**干燥台上的盘子变多**" —— 洗手池自己看不到进度。
+        """
+        from bridge.keyboard_input import key_down, key_up
+        _, _, held = self.pos(st)
+        if held:
+            self.log(f"[洗盘] 手上有 {held}, 先腾出手")
+            return False
+        # ① 端一叠脏盘子
+        stacks = [s for s in km.of("dirty_plates") if int(getattr(s, "n", 0) or 0) > 0]
+        if not stacks:
+            return False                       # 没有脏盘子可洗 → 这件杂活不成立
+        cx, cz, _ = self.pos(st)
+        s0 = min(stacks, key=lambda s: (s.x - (cx or 0)) ** 2 + (s.z - (cz or 0)) ** 2)
+        self.log("[洗盘] 去端脏盘子 %s(%d 个) @(%.1f,%.1f)"
+                 % (s0.id, int(s0.n), s0.x, s0.z))
+        if not self._approach(km, s0.x, s0.z, want=s0.name):
+            self.log("[洗盘] 走不到脏盘堆")
+            return False
+        if not self.interact("pickup", verify_hold_change=True):
+            self.log("[洗盘] 拿不起脏盘子")
+            return False
+        # ② 放到洗手池
+        sinks = km.of("wash")
+        if not sinks:
+            self.log("[洗盘] 这关没有洗手池")
+            return False
+        sk = sink = min(sinks, key=lambda s: (s.x - s0.x) ** 2 + (s.z - s0.z) ** 2)
+        before = sum(int(getattr(d, "n", 0) or 0) for d in km.of("return_plates"))
+        self.log("[洗盘] 送到洗手池 %s @(%.1f,%.1f)" % (sk.id, sk.x, sk.z))
+        if not self._approach(km, sk.x, sk.z, want=sk.name):
+            self.log("[洗盘] 走不到洗手池")
+            return False
+        self.interact("pickup", verify_hold_change=True)   # 放下盘子叠
+        # ③ **按住**交互键洗 —— 每 2 秒一个, 用"干燥台的盘子数"当进度条
+        key = self.kb.b.get("pickup")
+        if not key:
+            return False
+        t0 = time.time()
+        try:
+            key_down(key)
+            while time.time() - t0 < budget:
+                time.sleep(0.5)
+                km2 = self.map(self.state(force=True) or {}) or km
+                now = sum(int(getattr(d, "n", 0) or 0) for d in km2.of("return_plates"))
+                if now > before:
+                    self.log("[洗盘] ✓ 洗好 %d 个(干燥台上 %d → %d)"
+                             % (now - before, before, now))
+                    return True
+        finally:
+            key_up(key)
+        self.log("[洗盘] 按了 %.0fs, 干燥台没见新的干净盘子" % (time.time() - t0))
+        return False
+
     def op_assemble(self, km, x, z, op: Op, st: dict) -> bool:
         """把手上的材料放到摆盘位 —— 台面上有盘子时, 这一步本身就是"摆盘"。
 
@@ -2604,6 +2839,11 @@ class Engine:
         # 导航只保证站到了旁边, 朝向还是"最后一次移动的方向"。放置必须面向台面,
         # 否则游戏会把 m_iHandlePlacement 判成旁边别的台面, 材料就放错地方。
         self.face(spot.x, spot.z)
+        # ⚠ **光转身还不够** —— 两个台子挨得近时游戏照样判到旁边那个(实测
+        #   `s_wonderland_1_5`: 期望 `countertop_01 (2)` 却报 `workstation_mixer_01 (2)`)。
+        #   这里挪到"游戏说放置目标就是它"为止, 对不上就**不按**。
+        if not self._align_for_place(spot):
+            return False
         # 手上端着盘子放到"已经有盘子"的台面 → 游戏做的其实是**两盘合并**:
         # ServerPlate.TransferToContainer → CombineWithContents, 然后把**自己清空**
         # (ServerPlate.cs:131-150), 盘子还在手上 —— 名字没变, 所以不能用
@@ -2674,6 +2914,9 @@ class Engine:
             return False
         self.log(f"[步骤] 送到 {serve.id}")
         if not self.navigate_smart(km, serve.x, serve.z, tight=0.8):
+            return False
+        self.face(serve.x, serve.z)
+        if not self._align_for_place(serve):     # 见 _align_for_place: 挨得近会判到旁边台子
             return False
         # ServerPlateStation 接到放置事件并不代表订单完成：错误菜品、空盘或
         # 交互没命中都不应标记成功。只接受目标订单从 live 列表消失。
@@ -2875,6 +3118,70 @@ class Engine:
         return True
 
     # ---------------- 规划 ----------------
+    def _needs_work(self, name: str) -> bool:
+        """这个物体放在加工台上**还没加工完**吗 —— 有 `next` = 还能变成别的东西。
+
+        (`Item.next` = "加工之后变成什么", 见 `cookbook.Item`。空 = 已经是成品。)
+        """
+        if not name or self.know is None:
+            return False
+        for it in getattr(self.know, "items", []) or []:
+            if getattr(it, "name", "") == name:
+                return bool(getattr(it, "next", ""))
+        return False
+
+    def _chores(self, km, st) -> str:
+        """主流程卡住 → **改做一件杂活**。返回做了什么(空串 = 没得做)。
+
+        用户的要求(原话):
+          "如果拿不到食材, 就检查能否做其他事 —— 切菜, 洗盘子, 交菜, 灭火,
+           控制机关, 搅拌, 烘培。我们需要脚本有完成菜谱的完整能力, 但是
+           我们不希望脚本自己做自己的 —— 这个游戏始终是个合作游戏,
+           可以让人类处理一部分评分不高的行为。"
+
+        ⚠ **定位: 杂活只在主流程卡住时才做。** 没卡住时脚本专心做菜,
+          那些低分值的活就摆在那儿 —— 人类想干就干。这样天然就"不抢着全干",
+          不需要去猜"人类是不是在挂机"。
+
+        ⚠ 灭火**不在这里** —— 它在主循环里优先级更高(火会把台面一片片烧失效)。
+        """
+        cx, cz, held = self.pos(st)
+        if cx is None:
+            return ""
+        if held:
+            return ""          # 手上有东西时先别做杂活(可能正要交给主流程用)
+
+        # ① 按机关按钮(闸门/开关/传送带开关) —— 最独立, 先试它
+        try:
+            if self.op_press(km, st):
+                return "按机关"
+        except Exception as e:
+            self.log(f"[杂活] 按机关没做成: {e}")
+
+        # ② 洗盘子 —— 脏盘子堆有货 + 这关有洗手池
+        try:
+            if self.op_wash(km, st):
+                return "洗盘子"
+        except Exception as e:
+            self.log(f"[杂活] 洗盘子没做成: {e}")
+
+        # ③ 台面上放着**该加工还没加工**的料 → 加工掉。
+        #   切菜/搅拌/烘培**是同一条路**: 都是"站到台子旁边按交互键",
+        #   所以不用按台子类型分开写(分开写迟早会漂)。
+        for sem in ("board", "mix", "hob", "oven", "fryer", "heat", "auto"):
+            for s in km.of(sem):
+                on = list(getattr(s, "on", []) or [])
+                if not on or not self._needs_work(on[0]):
+                    continue
+                self.log("[杂活] %s 上放着没加工完的 %s, 去加工" % (s.id, on[0]))
+                try:
+                    if self._approach(km, s.x, s.z, want=s.name):
+                        self.interact("chop", verify_hold_change=False)
+                        return f"加工 {on[0]}"
+                except Exception as e:
+                    self.log(f"[杂活] 加工 {on[0]} 没做成: {e}")
+        return ""
+
     def plan(self, st: dict) -> tuple | None:
         """根据状态规划"现在该做哪道菜", 返回 (订单名, 剩余比例, DishFlow) 或 None。
 
@@ -2904,6 +3211,7 @@ class Engine:
         self.log("[引擎]           按 " + (os.environ.get("NEKO_PANIC_KEY") or "F12") +
                  " 可以急停(只读按键状态, 不影响你在游戏里的操作)")
         _warned_unfocused = False
+        _warned_tr = False
         _fail_sig, _fail_n = None, 0
         while True:
             # ---- 焦点/急停闸门 ----
@@ -2939,6 +3247,22 @@ class Engine:
                 time.sleep(1)
                 continue
 
+            # **关卡正在变形 → 停手等**(理由见 `world_transitioning`)。
+            #   必须放在"灭火/规划/执行"**之前** —— 它们全都假设地图是稳的:
+            #   变形期间地形正在改, 按着旧图走过去就是掉水里/踩进新生成的空洞。
+            _tr = self.world_transitioning()
+            if _tr:
+                self.kb.release_all()
+                if not _warned_tr:
+                    self.log("[引擎] ⚠ 关卡正在变形(%s) —— 停手等它变完"
+                             % ", ".join(sorted(set(t.get("type") or "?" for t in _tr))))
+                    _warned_tr = True
+                time.sleep(0.3)
+                continue
+            if _warned_tr:
+                self.log("[引擎] 关卡变形结束, 继续")
+                _warned_tr = False
+
             km = self.map(st)
             if km is None:
                 time.sleep(0.5)
@@ -2946,6 +3270,7 @@ class Engine:
             if not self.ensure_knowledge(st):
                 time.sleep(2)
                 continue
+            self._log_triggers(km)
 
             # **有火先灭火** —— 优先级高于做菜。理由(反编译 ServerFlammable.cs:214-224):
             #   着火时台面上的 `Interactable` / `PickupItemSpawner` / `Workstation`
@@ -2984,6 +3309,19 @@ class Engine:
                 self.log(f"[引擎] ★ 完成 {name}")
                 _fail_sig, _fail_n = None, 0
             else:
+                # **★ 主流程卡住 → 改做一件杂活**, 别把这一轮白烧掉(用户要求:
+                #   "如果拿不到食材, 就检查能否做其他事")。
+                #   做成了就**不算原地打转** —— 重规划继续(世界多半也变了)。
+                _did = ""
+                try:
+                    _did = self._chores(km, st)
+                except Exception as _e:
+                    self.log(f"[杂活] 出错: {_e!r}")
+                if _did:
+                    self.log(f"[引擎] 主流程卡住 → 改做杂活: {_did}")
+                    _fail_sig, _fail_n = None, 0
+                    time.sleep(0.3)
+                    continue
                 self.log(f"[引擎] 订单 {name} 未完成")
                 # ---- 同一步反复同样失败 → 立刻停下报错, 别把整局烧光 ----
                 # 实测: 一个 bug(Station.sem)让引擎把 150 秒整局都耗在

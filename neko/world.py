@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -41,7 +42,13 @@ class World:
         self._tm_at = 0.0       # 上面那份是什么时候取的
         #: 地形保质期(秒)。**这是"跳海"的保险丝** —— 理由见 terrain() 的注释:
         #: 限时平台升降只改高度不改字符, 整局不刷新就会拿着旧图走进海里。
-        self.terrain_ttl = 1.5
+        #: ⚠ **2026-09-14 从 1.5 压到 0.5**(用户要求"提高地图更新的频率"):
+        #:   实测强制扫一次 **32ms**(41x24 关, 逐格 2 条射线) ⇒ 0.5 秒的占空比 6%。
+        #:   而 1.5 秒 = 厨师走出 **6 格**, 拿 6 格前的图规划就是往海里走。
+        #:   ⚠ 和 `Engine.terrain_ttl` **必须一致** —— 双人时两个引擎走的是
+        #:     这一条(`Engine.terrain()` 有 world 就直接 return `world.terrain()`)。
+        #:   `NEKO_TERRAIN_TTL` 可覆盖(大关卡耗时 ∝ 格子数)。
+        self.terrain_ttl = float(os.environ.get("NEKO_TERRAIN_TTL") or 0.5)
         self._resv: dict[tuple, tuple] = {}     # cell -> (cid, 过期时刻)
         self.state_fetches = 0
         self.state_cache_hits = 0

@@ -154,6 +154,28 @@ class BridgeClient:
         payload.update(kw)
         return self._send(payload)
 
+    def vpad(self, pad: int, **state) -> dict:
+        """**旧机制**: 喂一个"虚拟 InControl 手柄"的状态(整份覆盖, 不是增量)。
+
+        和 `pad("drive", ...)` 那套(替换 `ControlSchemeData`)是**两回事**:
+          · `pad("drive")` 那套**故意绕开加入流程** —— 它只对**已经在对局里**的厨师生效
+          · `vpad` 走的是 `VirtualGamepads`(真的 InControl 设备), 会触发
+            `PCPadInputProvider.OnDeviceAttached` —— **这是"按 A 加入"唯一能走的路**
+            (见 `VirtualInput.cs:99-103` 的注释: 那条被称作"死路", 但加入只能靠它)
+
+        ⚠ **`pad` 这个键必须排在 `cmd` 前面** —— 桥的 `GetStr`(`BridgeServer.cs:313`)
+          用的是 `IndexOf("\\"pad\\"")` 找**第一处**, 而 `{"cmd":"pad", ...}` 里
+          第一处 `"pad"` 是 **cmd 的值**不是键, 于是它读到 `"cmd":"pad"` 后面那个 `:`
+          再往后解析 → 失败 → 返回 -1 → 报 `pad index`。
+          **实测: 键顺序换一下就从报错变 `{'ok': True}`。**
+          正经修法是在 C# 的 `GetStr` 里匹配 `"key":` 而不是 `"key"`, 那要重编 DLL;
+          这里先用顺序绕开。
+        """
+        # dict 保序: pad 在 cmd 之前 => IndexOf 先撞到真正的键
+        payload = {"pad": int(pad), "cmd": "pad"}
+        payload.update(state)
+        return self._send(payload)
+
     def send_action(self, chef: int, kind: str, target: str = "", duration: float = 0.0) -> dict:
         return self._send({"cmd": "action", "chef": chef, "kind": kind,
                            "target": target, "duration": duration})

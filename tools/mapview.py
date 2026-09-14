@@ -774,7 +774,22 @@ def overlay_ascii(tm, stations, chefs=(), mark=None, movers=None,
             over[cell] = TERM_LIVE
         else:
             over.setdefault(cell, SEM_LETTER.get(_sem_of(s), UNKNOWN))
+    # ☠ **台面不是"会动的东西"** —— `MoverScan` 收的是"**所有挂 `RespawnCollider` 的物体**",
+    #   于是**食材箱**(`dispenser_crate_04` 也挂了它)被一起扫了进来;
+    #   而下面那句是**直接覆盖**(`over[cell] = ...`, 不像台面那样 `setdefault`)
+    #   ⇒ **箱子被画成 `%`**, 看着像"挡路的路人"。
+    #   用户实测指出: "这两处 `%%%%%` 其实是食材箱"。
+    #   判据和 `KitchenMap.blocked_by_movers` 里那条**保持一致**(名字对上台面名) ——
+    #   两处分开写迟早会漂(这一轮已经栽过好几次)。
+    _stat_names = set()
+    for s in stations or []:
+        _n = (s.get("name") if isinstance(s, dict) else getattr(s, "name", "")) or ""
+        if _n:
+            _stat_names.add(_n)
     for m in movers or []:
+        _mn = (m.get("name") if isinstance(m, dict) else getattr(m, "name", "")) or ""
+        if _mn and _mn in _stat_names:
+            continue                    # 它是台面(食材箱), 不是 mover —— 让上面那个字母留着
         try:
             x = float(m.get("x") if isinstance(m, dict) else getattr(m, "x", 0))
             z = float(m.get("z") if isinstance(m, dict) else getattr(m, "z", 0))
