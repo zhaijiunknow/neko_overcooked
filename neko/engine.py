@@ -5827,6 +5827,11 @@ class Engine:
             #   正是调参时要看的东西。见 `_redos`。
             if getattr(r["op"], "redo", False):
                 _act += " ↺回溯"
+            # ☠ **备料也一样** —— 它的 `action` 是现成的 `fetch`/`chop`,
+            #   光看动作名和菜谱那一步一模一样; 而"这是为**后面的单**提前备的"
+            #   正是要一眼看出来的东西(用户 2026-09-15 的"延迟收益")。
+            if getattr(r["op"], "prep", False):
+                _act += " ⊕备料"
             rows.append(scoring.row(n + 1, _act,
                                     d is not None, d if d is not None else 0.0,
                                     scoring.step_value(r["op"].action), r["follow"],
