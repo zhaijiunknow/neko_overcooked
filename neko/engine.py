@@ -7983,11 +7983,39 @@ class Engine:
             #   而 `pending` 每轮重建 ⇒ 下一轮它又回来了。这里用冷板凳跨轮压住。
             if self.step_benched(f"rescue {what}"):
                 continue
+            # ☠☠ **拾取一件"架在台面上"的东西时, 游戏报的是【台面名】, 不是锅名。**
+            #
+            # 依据(反编译, 规则 1): `ServerAttachStation.cs:107-119`
+            #     public bool CanHandlePickup(ICarrier _carrier) {
+            #         if (m_item != null) {
+            #             IHandlePickup h = m_item.AccessGameObject().RequireInterface<IHandlePickup>();
+            #             return h.CanHandlePickup(_carrier);      // ← 转发给 m_item(锅)
+            #         } ... }
+            #   `HandlePickup` 同样转发, 靠 `AttachChangedCallback` 判断"东西真被拿走了"。
+            #   ⇒ **台面自己不是拾取目标** —— "对着台面按拾取 = 把锅端走"。
+            #
+            # 而这里原来传的是**锅名** ⇒ `_approach` 拿"游戏说的抓取目标"去比, 永远
+            # "✗ 不是它" ⇒ **端不下来** ⇒ 米烧糊。实机账(`s_sushi_1_3`):
+            #     [救锅] SushiRice 已经过火(15/12 秒, 剩 9 秒糊) —— 端下来
+            #     [接近] (13.4,7.8) 距 1.17 格, 游戏说: 抓取='countertop_01_standard_wood (5)' ✗ 不是它
+            #     [接近] (13.4,8.3) 距 1.01 格, 游戏说: 抓取='countertop_01_standard_wood (5)' ✗ 不是它
+            #   ⇒ 用户原话: "**还有锅报警的或需要把锅移开**"。
+            #
+            # 判据用**挂载点**(`Item.on`, 上一轮刚报上来的): 挂着 → 要**台面名**;
+            #   没挂(在地上/端在手上)→ 要**物件自己的名字**(那时没人转发)。
+            #   ⚠ 查不到(老 dll 没 `ScanItems` 的 `on`, 或那件东西不在 `km.items` 里)
+            #     ⇒ **退回锅名**, 与改之前一致。
+            _pot_name = getattr(c, "name", "") or what
+            _mount = ""
+            for _it in (getattr(km, "items", None) or []):
+                if _it.name == _pot_name and getattr(_it, "on", ""):
+                    _mount = _it.on
+                    break
             out.append(Op(
                 "rescue", what,
                 "%s 已经过火(%.0f/%.0f 秒, 剩 %.0f 秒糊) —— 端下来" % (
                     what, prog, need, max(0.0, 2 * need - prog)),
-                at_name=getattr(c, "name", "") or what, at_x=x, at_z=z,
+                at_name=_mount or _pot_name, at_x=x, at_z=z,
                 urgency=scoring.burn_urgency(ratio)))
         return out
 
