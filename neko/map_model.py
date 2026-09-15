@@ -258,6 +258,18 @@ class Item:
     tag: str                   # Pre-Ingredient(生料) / Ingredient(处理过的)
     x: float
     z: float
+    #: **这个实例还能不能被加工**(= 生料还是成品)。来自 C# `ScanItems` 的 `work`
+    #: (该实例身上有没有 `WorkableItem.m_nextPrefab`)。
+    #:
+    #: ☠ **判断加工阶段不能靠 `tag`, 也不能靠名字** —— 这是本轮(2026-09-15)为"传递指令"
+    #: 补的字段, 两边的坑都在代码里记着:
+    #:   · `tag` 不可靠: 同一关里**生虾的 tag 是 `Ingredient`、生鱼却是 `Pre-Ingredient`**
+    #:     (见 `cookbook.raw_for` 的注释), 靠它会漏;
+    #:   · 名字查知识表也不行: "生料和成品同名"那一族(`SushiFish --切8次--> SushiFish`)
+    #:     在表里是**两条同名记录**, 查表取第一条 ⇒ 分不出手上这个是哪个
+    #:     (见 `Engine._needs_work` 的注释)。
+    #:   ⇒ 只有**实例自己**说得准。`workable=True` = 还是生料。
+    workable: bool = False
 
 
 @dataclass
@@ -307,6 +319,14 @@ class Cooking:
     z: float
     tag: str = ""              # 游戏 Unity Tag(CookingUtensil = 锅)
     inside: str = ""           # 容器里装了什么("SushiRice" / "")
+    #: **这个容器是哪种加热方式** —— `CookingHandler.m_cookingType.m_uID`。
+    #: 它就是游戏"这道菜能不能进这口锅"的**权威判据**(和食材的 `cook_steps` 比):
+    #:   `CookableContainer.cs:46-47` `cp.AllowsCookingStep(_handler.AccessCookingType)`
+    #:   `CookableProperties.cs:11-13` 比的是 `CookingStepData.m_uID`
+    #: ⚠ 只在**同一局内**可比值(两边都现读, 够用)。老 dll 没这字段 ⇒ 0 = 未知。
+    cook_id: int = 0
+    #: 上面那个 id 对应的资产名(只为**日志/离线**可读; 判据只用 `cook_id`)。
+    cook_name: str = ""
 
     @property
     def ready(self) -> bool:
@@ -546,7 +566,8 @@ class KitchenMap:
         for it in _aslist(layout.get("items"), "items"):
             km.items.append(Item(
                 name=it.get("name", ""), tag=it.get("tag", ""),
-                x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0)))
+                x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0),
+                workable=bool(it.get("work"))))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),
@@ -554,7 +575,10 @@ class KitchenMap:
                 state=c.get("state", ""), burning=bool(c.get("burning")),
                 station=c.get("station", ""),
                 x=float(c.get("x", 0)), z=float(c.get("z", 0)),
-                tag=c.get("tag", ""), inside=c.get("in", "")))
+                tag=c.get("tag", ""), inside=c.get("in", ""),
+                # 老 dll 没有这两个键 ⇒ 0/"" = 未知 ⇒ 调用方退回"离我最近"那条老路
+                cook_id=int(c.get("cookId", 0) or 0),
+                cook_name=c.get("cookName", "") or ""))
         return km
 
     # ---- 查询 ----

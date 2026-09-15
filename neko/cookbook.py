@@ -41,6 +41,21 @@ class Item:
     spawnNext: str = ""    # 箱子出的生料切完后是什么
     spawnStages: int = 0   # 生料的切片数
     prefab: bool = False   # true = 来自 prefab 资源(没位置, 只用于查加工参数)
+    #: **这个食材允许进哪些容器**(加热方式), 元素是 `CookingStepData.m_uID`。
+    #:
+    #: 权威判据(反编译, 规则 1):
+    #:   `CookableContainer.cs:46-47` `cp.AllowsCookingStep(_handler.AccessCookingType)`
+    #:   `CookableProperties.cs:11-13` 比的是 `CookingStepData.m_uID`
+    #: ⇒ "**米进锅、肉进平底锅**"这条规矩就长在这儿, 不在名字上。
+    #: ⚠ 空列表 = **拿不到这件信息**(老 dll / 这食材没有 `CookableProperties`)
+    #:   ⇒ 调用方**退回老行为**, 别把它当成"哪儿都不能进"。
+    cook_steps: list = field(default_factory=list)
+
+    def allows_cook(self, cook_id: int) -> bool:
+        """这个食材能不能进"加热方式 = `cook_id`"的容器。**不知道就放行**(退回老行为)。"""
+        if not self.cook_steps or not cook_id:
+            return True
+        return int(cook_id) in self.cook_steps
 
     @property
     def cookable(self) -> bool:
@@ -60,6 +75,10 @@ def item_from_json(d: dict) -> Item:
         spawn=d.get("spawn", ""), spawnIng=d.get("spawnIng", ""),
         spawnNext=d.get("spawnNext", ""), spawnStages=int(d.get("spawnStages", 0) or 0),
         prefab=bool(d.get("prefab", False)),
+        #: `cookSteps` = `[{"id":N,"name":"..."}]`(见 `Item.cook_steps`)。
+        #: ⚠ 老 dll 没这个键 ⇒ 空列表 ⇒ `allows_cook` 一律放行(退回老行为)。
+        cook_steps=[int(s.get("id", 0) or 0)
+                    for s in (d.get("cookSteps") or []) if s],
     )
 
 
@@ -91,15 +110,28 @@ class Knowledge:
         return self.by_tag("Crate")
 
     # ---- 查询 ----
-    def raw_for(self, ing: str) -> Item | None:
-        """要得到 ing, 场上有没有需要先切的生料(有 next == ing 的物体)。
+    def raw_for(self, ing: str, scene_only: bool = True) -> Item | None:
+        """要得到 ing, 有没有需要先切的生料(有 `next == ing` 的物体)。
 
         注意: **不能用 Unity Tag 判断是否需切** —— 实测同一关卡里生虾的 tag 是
-        Ingredient、生鱼却是 Pre-Ingredient, 靠 tag 会漏。看 next 字段才可靠。
-        也只看场景实例(prefab 没有位置, 导航不过去)。
+        Ingredient、生鱼却是 Pre-Ingredient, 靠 tag 会漏。看 `next` 字段才可靠。
+
+        ☠☠ **`scene_only=False` 是给"判要不要切"用的**(`resolve_leaf` 用的就是它) ——
+          "切完变什么、切几片"这些加工参数**只存在于 prefab 上**, 这是 C# 那边
+          `ItemKnowledge.Snapshot()` 第 2 段自己写的理由:
+            *"食材还在箱子里时场景里根本没有它的实例, 但'要用什么灶、煮多久、切几片'
+              这些加工参数只存在于 prefab 上, 不扫就查不到(煮这一步会直接失败)"*
+          ⇒ 开局限定"只看场景实例"时, 生鱼还没实例化 ⇒ 生料这一条查不到 ⇒
+            `resolve_leaf` 落空 ⇒ **整条链丢掉 `chop`** ⇒ 脚本拿到生料**直接去装盘**
+            (2026-09-15 实机打回来的"0 分那一局"就是这么来的)。
+        ⚠ 但 **"去哪取"仍然必须只看场景实例**(默认 `scene_only=True`):
+          prefab 没有位置, 导航不过去(`audit_leaves` 和 `resolve_leaf` 的
+          `src = crate or raw` 用的是那一份)。
         """
         for i in self.items:
-            if not i.prefab and i.next == ing:
+            if scene_only and i.prefab:
+                continue
+            if i.next == ing:
                 return i
         return None
 
@@ -242,7 +274,11 @@ def resolve_leaf(kb: "Knowledge", name: str) -> dict:
         · `brief.py` 按猜的键名找游戏那条链, 键名根本不存在 ⇒ 它一直在骗人
       所以自检**不允许**自己再写一遍解析逻辑, 只能调这个函数。
     """
-    raw = kb.raw_for(name)
+    raw = kb.raw_for(name)                      # 场景实例 —— "**去哪取**"要用它(有位置)
+    # 判"**要不要切**"时**连 prefab 一起看**: 加工参数(prefab 名/切几片)只写在 prefab 上,
+    # 开局限定"只看实例"会让整条链丢掉 `chop`(见 `raw_for` 的长注释)。
+    # ⚠ `src` 仍然只取场景实例/箱子 —— prefab 没有位置, 导航不过去。
+    raw_k = raw if raw is not None else kb.raw_for(name, scene_only=False)
     ready = kb.ready_for(name)
     crate = kb.crate_for(name)
     from_crate_raw = crate is not None and crate.spawnNext == name
@@ -257,15 +293,18 @@ def resolve_leaf(kb: "Knowledge", name: str) -> dict:
     if len(crates_hit) > 1:
         warn.append("有 %d 个箱子都出这种生料, 只取了第一个" % len(crates_hit))
     # **多来源**: 既有要切的、又有现成的 → derive 会优先切(多花几刀)
-    if (raw is not None or from_crate_raw) and ready is not None:
+    # ⚠ 判据跟着**实际走的那个分支**用 `raw_k`(连 prefab 一起看), 否则这条提示
+    #   会和 `derive` 真做的事对不上(而"提示骗人"正是这个文件里踩过的坑)。
+    if (raw_k is not None or from_crate_raw) and ready is not None:
         warn.append("既有要切的又有现成的 —— derive 会**优先切**")
 
-    if raw is not None or from_crate_raw:
-        if raw is not None:
-            src = crate or raw
-            fetch = raw.ing or raw.name
-            stages = raw.stages
-            basis = "场上有东西 next==%s" % name
+    if raw_k is not None or from_crate_raw:
+        if raw_k is not None:
+            src = crate or raw          # ⚠ `raw` 才是场景实例; prefab 不进 `src`
+            fetch = raw_k.ing or raw_k.name
+            stages = raw_k.stages
+            basis = ("场上有东西 next==%s" % name) if raw is not None else \
+                    ("**prefab** 上写着 next==%s(还没实例化)" % name)
         else:
             src, fetch, stages = crate, (crate.spawnIng or crate.spawn or name), crate.spawnStages
             basis = "箱子 spawnNext==%s" % name
@@ -340,6 +379,25 @@ class Op:
     #: ⚠ 和 `redo` 一样: `action` 是**现成的**(`fetch`/`chop`/`cook`), 所以认它只能靠
     #:   这个显式标记 —— 日志里也靠它打出"备料"两个字。
     prep: bool = False
+    #: **这条 `pass` 替的是菜谱里的哪一步**(`"chop"` / `"cook"` / `"mix"` / `"assemble"`)。
+    #: 只有 `pass` 会填它 —— 其余动作留空串。
+    #:
+    #: 为什么要它: `pass` op 自己的 `action` 是 `"pass"`、`target` 是那份料,
+    #: **底层动作只写在 `note` 那串人话里**。而"传递指令"的台账要按
+    #: `(被交出去那一步的 action, target)` 记账(记一笔、止重复提、拦回溯都要查它),
+    #: 解析 `note` 拿字符串当判据是**不能接受**的 —— 见 `redo` 那段注释:
+    #: "后者等于赌'以后不会有 fetch 类杂活'"。所以给个显式字段。
+    handoff: str = ""
+    #: **这一步的货源根本没解析出来**(`resolve_leaf` 落到了"没找到货源"那条兜底)。
+    #:
+    #: 它是"**这张知识表看着不全**"的**症状信号** —— 引擎据此重拉一次知识表
+    #: (见 `Engine._derive_with_retry`)。为什么要有这个显式标记:
+    #:   `resolve_leaf` 的 `raw_for`/`ready_for` **只看场景实例**(`not i.prefab`),
+    #:   而知识表是**每场景拉一次的备份数据** ⇒ 传送带关卡开局时食材 prefab
+    #:   **还没实例化** ⇒ 表里光秃秃 ⇒ 整条链**丢掉 `chop`**, 脚本拿到生料直接去装盘。
+    #: ⚠ 认它只能靠这个字段, **不能去解析 `note`** —— 和 `redo`/`prep` 同一个理由
+    #:   (那条注释在这儿也得再说一遍: 拿人话当判据等于赌"以后不会改措辞")。
+    nosrc: bool = False
 
     def __str__(self) -> str:
         extra = f"  ({self.note})" if self.note else ""
@@ -385,9 +443,21 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
         res = resolve_leaf(kb, name)
         src = res["src"]
         if res["kind"] == "chop":
-            ops.append(Op("fetch", res["fetch"], f"生料, 来自 {src.name}",
-                          optional=optional,
-                          at_name=src.name, at_x=src.x, at_z=src.z))
+            # ☠ **`src` 可能是 `None`** —— "判要不要切"连 prefab 一起看
+            #   (`raw_for(..., scene_only=False)`), 而 **prefab 没有位置、导航不过去**
+            #   ⇒ 它不进 `src`(见 `resolve_leaf`)。这时 `at_name`/坐标**留空**,
+            #   由 `_op_target_for_score` **运行时**解析真实货源
+            #   (计划坐标 → 实时台面 → 可达箱子 → **地上的料**)。
+            #   ⚠ **绝不能拿 prefab 名当取货点** —— 那是一类没有位置的资源,
+            #     `_stand_cell_of` 会拿不到站位格 ⇒ 整步判"够不着"。
+            if src is None:
+                ops.append(Op("fetch", res["fetch"],
+                              f"生料({res['basis']}) —— 取货点**运行时再解析**",
+                              optional=optional))
+            else:
+                ops.append(Op("fetch", res["fetch"], f"生料, 来自 {src.name}",
+                              optional=optional,
+                              at_name=src.name, at_x=src.x, at_z=src.z))
             stages = res["stages"]
             ops.append(Op("chop", name,
                           f"切到变成 {name}" + (f" ({stages} 片)" if stages else ""),
@@ -401,8 +471,10 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
                           optional=optional,
                           at_name=src.name, at_x=src.x, at_z=src.z))
         else:
+            # `nosrc=True` = "**这一步的货源没解析出来**"。这是"知识表看着不全"的
+            # 症状信号, 引擎据此重拉一次(见 `Op.nosrc` 与 `Engine._derive_with_retry`)。
             ops.append(Op("fetch", name, "⚠ 找不到货源(箱子/生料/成品都没匹配上)",
-                          optional=optional))
+                          optional=optional, nosrc=True))
 
         if cooked:
             tool = kb.cook_tool_for(name)
