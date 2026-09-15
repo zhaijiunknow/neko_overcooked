@@ -7317,11 +7317,29 @@ class Engine:
         #   (那要地形表, 而探测层刻意不碰地形) —— 够不着就是白跑一趟, 靠
         #   "杂活不重试 + 本轮记账上限"把代价压到一趟。日志里会把洗手池打出来。
         if km.of("wash"):
-            for s0 in km.of("dirty_plates"):
-                if int(getattr(s0, "n", 0) or 0) <= 0:
-                    continue
-                out.append(Op("wash", s0.id, note="洗盘子", at_name=s0.name,
-                              at_x=s0.x, at_z=s0.z))
+            dirty_stacks = [s0 for s0 in km.of("dirty_plates")
+                            if int(getattr(s0, "n", 0) or 0) > 0]
+            if dirty_stacks:
+                # ★ **还有没有干净盘子可用** —— 决定"该不该鼓励洗碗"(见 `wash_urgency`)。
+                #   用户 2026-09-15: "**然后需要鼓励脚本去洗碗**"。
+                #   原来这条候选的 `urgency` 恒为 0, 于是它只是一个"顺手做的事" ⇒
+                #   被 `_chore_admitted` 的"顺路"闸门按住(实测日志里全是
+                #   `wash dirty_plates0 ✗ 闸门: 不顺路(要 4 格)` —— 才 4 格!),
+                #   而脏盘越堆越多、干净盘越来越少 ⇒ **摆盘/取菜都卡住**。
+                #   ⚠ 份数**没有常数**: 干净盘 = 干净盘堆的 `n` + 台面上放着的空盘;
+                #     脏盘 = 各脏盘堆的 `n` 之和。
+                clean = sum(int(getattr(s, "n", 0) or 0) for s in km.of("plates"))
+                clean += sum(len(s.empty_plate_names())
+                             for s in km.stations.values()
+                             if not (s.id or "").startswith("dirty_plates"))
+                dirty = sum(int(getattr(s, "n", 0) or 0) for s in dirty_stacks)
+                u = scoring.wash_urgency(clean, dirty)
+                if u > 0:
+                    self.log(f"[杂活] ⚠ 一个干净盘都没有了(脏盘 {dirty} 个) —— "
+                             f"洗碗紧迫度 {u:.0f} 分, **不再按'顺路'卡它**")
+                for s0 in dirty_stacks:
+                    out.append(Op("wash", s0.id, note="洗盘子", at_name=s0.name,
+                                  at_x=s0.x, at_z=s0.z, urgency=u))
 
         # ③ 加工台面上"该加工还没加工"的料(切菜/搅拌/烘培是同一条路: 站旁边按交互)
         for sem in ("board", "mix", "hob", "oven", "fryer", "heat", "auto"):
@@ -8222,6 +8240,16 @@ class Engine:
         key = chore_key(chore)
         if used.get(key, 0) >= scoring.CHORE_REPEAT_MAX:
             return False, f"本轮已经做过 {used.get(key, 0)} 次"
+        if getattr(chore, "urgency", 0.0) > 0:
+            # ☠ **"该做的事"不吃"顺路"闸门** —— 那道门是给"**顺手做的事**"设的
+            #   (见本函数开头的档说明: "能插就插")。紧迫度非 0 就说明它**已经不是顺手**了:
+            #   比如"一个干净盘都没有了"时的 `wash`(`wash_urgency`) —— 再卡"顺路",
+            #   脏盘只会越堆越多, 而摆盘/取菜全都卡住。
+            #   ⚠ 与 `rescue` 同一条道理(它靠自己的规则豁免); 这里用一个**通则**表达,
+            #     免得以后每加一个"该做的事"都要记得再开一次洞。
+            #   ⚠ 位置**必须在这之后**: 总开关(`NEKO_CHORES=0` 那条拔保险丝)和
+            #     "本轮做过几次"的上限 —— 调试期的保险丝不该被紧迫度绕过。
+            return True, ""
         if a == "serve_any":
             return True, ""            # 交菜不受"顺路"限制(见 scoring.STEP_VALUE 的注释)
         if CHORE_MODE == "always":

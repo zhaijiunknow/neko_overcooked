@@ -73,6 +73,14 @@ STEP_VALUE_DEFAULT = 10.0   # 没见过的动作
 #: 而 1.0~1.2 之间(刚熟、还有 8 秒以上)不该抢别人的活 —— 那时让位给站在旁边的人更合理。
 BURN_URGENCY_MAX = 200.0
 
+#: **"一个干净盘都没有了"时的紧迫度上限**(分) —— 和 `BURN_URGENCY_MAX` 同一个形状。
+#: 用户 2026-09-15: "**然后需要鼓励脚本去洗碗**"。见 `wash_urgency`。
+#: ⚠ 40 是故意压在 `BURN_URGENCY_MAX`(200) 之下的: 缺盘子卡的是"取菜/摆盘",
+#:   而糊锅是**把菜毁掉** —— 两件事不该同级。
+WASH_URGENCY_MAX = 40.0
+#: 每个脏盘贡献几分(封顶在 `WASH_URGENCY_MAX`)。
+WASH_URGENCY_PER_PLATE = 8.0
+
 #: **"手上这份先做完"的加成分**。用户 2026-09-15 讲的机制:
 #:   > "比如 SushiRice, 想要放在盘子上需要**先煮熟**" —— 生米**永远**上不了盘,
 #:   > 它唯一的出路就是进锅; 而腾出手又只能靠"放进盘子"或"丢地上"。
@@ -127,6 +135,27 @@ NEG_INF = float("-inf")
 
 def step_value(action: str) -> float:
     return STEP_VALUE.get(action, STEP_VALUE_DEFAULT)
+
+
+def wash_urgency(clean: int, dirty: int) -> float:
+    """**该不该鼓励去洗碗** —— 干净盘子**用光了**才涨, 脏盘堆得越高越急。
+
+    用户 2026-09-15:
+      > "**然后需要鼓励脚本去洗碗。**"
+
+    为什么**不是**"把 `wash` 的步骤价调高": 洗盘子本身没有价值, **干净盘子才有** ——
+      不乱洗才对。所以判据是"**还有没有干净盘子可用**":
+        · 还有干净盘(干净盘堆里 / 台面上放着空盘) ⇒ **0 分**: 洗它只是顺手, 该让位给菜谱;
+        · 一个都没有了 ⇒ 按**脏盘堆的高度**涨(堆越高越急), 封顶 `WASH_URGENCY_MAX`。
+
+    ⚠ 判据里**没有"应该洗几个"的常数** —— 份数完全由场上的干净/脏盘决定
+      (和 `_preps` 那条"份数由订单算"同一个规矩)。
+    ⚠ 上限 40 是**故意**远低于 `rescue`(能到 200): 缺盘子会卡住"取菜/摆盘",
+      但**不会把菜烧糊** —— 两件事的紧急程度不该同级。
+    """
+    if clean > 0 or dirty <= 0:
+        return 0.0
+    return min(WASH_URGENCY_MAX, WASH_URGENCY_PER_PLATE * float(dirty))
 
 
 def burn_urgency(ratio: float) -> float:
