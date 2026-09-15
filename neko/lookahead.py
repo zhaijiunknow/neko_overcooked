@@ -46,6 +46,19 @@ from map_model import _norm_name as norm
 #: `NEKO_PREP_MAX` 可调。
 PREP_MAX = int(float(os.environ.get("NEKO_PREP_MAX") or 4))
 
+#: **每种材料在"订单算出来的份数"之上多备几份** —— 用户 2026-09-15:
+#: "提前备料的份数**可以比订单多一两份**"。
+#:
+#: 为什么该有余量(三条都是实测会遇到的):
+#:   · **订单会陆续来** —— 备料本来就是为"下一张单"做的, 只按当前订单栏算会永远差一口;
+#:   · **人类队友也会拿** —— 我们备的料不专属;
+#:   · **我们自己会失手** —— 掉地上、被传走、切废。
+#:
+#: ⚠ **它和"别把 3 写进代码"不冲突**: 份数**仍然由订单算**(`demand` 的累加那半),
+#:   这一项是**额外的一层余量**, 不是份数的来源。`0` = 严格按订单(回到老行为)。
+#: `NEKO_PREP_BUFFER` 可调。
+PREP_BUFFER = int(float(os.environ.get("NEKO_PREP_BUFFER") or 1))
+
 
 def required(flow) -> list:
     """一张单**必需**哪些材料 —— 归一化名, **按出现次数**(同名料要两份就出现两次)。
@@ -70,7 +83,7 @@ def required(flow) -> list:
     return out
 
 
-def demand(flows, have=None, cap=None) -> dict:
+def demand(flows, have=None, cap=None, buffer=None) -> dict:
     """按订单栏算出**每种材料还缺几份**。返回**只含缺口 > 0** 的 `{材料: 份数}`。
 
     `flows` —— `[(DishFlow, 剩余时间比例 t), …]`。**按 `t` 升序**满足
@@ -79,14 +92,19 @@ def demand(flows, have=None, cap=None) -> dict:
     `have`  —— `{归一化材料名: 现有份数}`, 来自 `Engine._inventory`。
     `cap`   —— **整个计划的总份数上限**(不是每种), `None` 用 `PREP_MAX`。
               **它只是刹车**: 订单要 2 份 ⇒ **2**(不是 4); 订单要 9 份而 cap=4 ⇒ 4。
+    `buffer` —— 每种材料在订单份数之上**多备几份**, `None` 用 `PREP_BUFFER`(默认 1)。
+              用户 2026-09-15: "提前备料的份数**可以比订单多一两份**"。
+              **不受 `cap` 约束**(理由见常量注释)。`0` = 严格按订单。
 
-    顺序是 **先按订单汇总(带总上限) → 再扣库存**: "订单要 5、最多备 4、现有 2" ⇒ 缺 2。
+    顺序是 **先按订单汇总(带总上限) → 加余量 → 再扣库存**:
+    "订单要 5、最多备 4、余量 1、现有 2" ⇒ 缺 3。
     这样 `cap` 的含义始终是"**这张订单栏最多值得铺开几件**", 而库存算在计划之内
     (已经躺在那儿的当然也算占了一件)。
 
     **订单栏空 ⇒ 返回 `{}`** —— 调用方据此"什么都不提"。
     """
     cap = PREP_MAX if cap is None else int(cap)
+    buf = PREP_BUFFER if buffer is None else int(buffer)
     need, used = {}, 0
     for item in sorted(flows or [],
                        key=lambda ft: float(ft[1] if ft[1] is not None else 1.0)):
@@ -95,9 +113,18 @@ def demand(flows, have=None, cap=None) -> dict:
             continue
         for n in required(flow):
             if used >= cap:
-                return _shortfall(need, have)   # 额度用完 ⇒ 后面更不紧急的单就不算了
+                # 额度用完 ⇒ 后面更不紧急的单就不算了。
+                # ⚠ **但余量照加**(见下), 所以不能在这里直接 return。
+                break
             need[n] = need.get(n, 0) + 1
             used += 1
+        if used >= cap:
+            break
+    # ★ **余量**: 每种材料在"订单推出来的份数"之上多备 `buf` 份(用户要求)。
+    #   ⚠ **不受 `cap` 约束** —— `cap` 管的是"订单推出来多少"(别铺开太大),
+    #     而余量的意义本来就是"**比订单多一点**"; 被 cap 吃掉就白设了。
+    for n in need:
+        need[n] += buf
     return _shortfall(need, have)
 
 

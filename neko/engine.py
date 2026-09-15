@@ -6804,7 +6804,7 @@ class Engine:
                 continue
             out.append(Op(src.action, src.target, wait=src.wait,
                           chop_stages=src.chop_stages, in_pot=src.in_pot,
-                          prep=True, note=f"提前备料(订单要 {n} 份)"))
+                          prep=True, note=f"提前备料(还缺 {n} 份)"))
         return out
 
     def _rescues(self, km, st) -> list:
