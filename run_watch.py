@@ -54,6 +54,9 @@ from bridge.virtual_pad import join_player, lobby_users       # noqa: E402
 INTERVAL = float(os.environ.get("NEKO_WATCH_INTERVAL") or 2.5)
 MISSES = int(os.environ.get("NEKO_WATCH_MISSES") or 3)
 HEARTBEAT = float(os.environ.get("NEKO_WATCH_HEARTBEAT") or 30.0)
+#: **连续**读状态失败几次才收工。`NEKO_WATCH_READ_FAILS` 可调。
+#: ⚠ 这不是"重连次数" —— 中间**不重连**, 是在同一条连接上再读(见 `_read_fail`)。
+READ_FAILS = int(os.environ.get("NEKO_WATCH_READ_FAILS") or 5)
 #: 收掉子进程时等它自己退多久(秒)。**超时不 kill** —— 见模块 docstring。
 STOP_TIMEOUT = float(os.environ.get("NEKO_WATCH_STOP_TIMEOUT") or 30.0)
 #: 要不要在启动时 / 按 A 之前把游戏切到前台。见模块 docstring 里那条**前提**。
@@ -107,7 +110,8 @@ class Watcher:
     """
 
     def __init__(self, get_state, start_engine, stop_engine, join_lobby,
-                 log=print, misses: int = MISSES, heartbeat: float = HEARTBEAT):
+                 log=print, misses: int = MISSES, heartbeat: float = HEARTBEAT,
+                 interval: float = INTERVAL, read_fails: int = READ_FAILS):
         self.get_state = get_state
         self.start_engine = start_engine
         self.stop_engine = stop_engine
@@ -115,6 +119,9 @@ class Watcher:
         self.log = log
         self.misses = max(1, int(misses))
         self.heartbeat = heartbeat
+        self.interval = interval
+        self.read_fails_max = max(1, int(read_fails))
+        self._read_fails = 0        # 连续读状态失败了几次(成功一次就清零)
 
         self.in_round = False       # 防抖之后的"在不在局里"
         self._miss = 0              # 连续读到"不在局里"的次数
@@ -191,19 +198,47 @@ class Watcher:
             self.join_lobby(st, users)
 
     # ---------------- 真循环 ----------------
+    def _read_fail(self, e) -> bool:
+        """读状态失败了一次 —— 返回**还要不要继续**。
+
+        ☠☠ **"不重连" ≠ "一次空读就收摊"**(2026-09-15 用户实测打回来的一条):
+          看护原来是"读状态抛一次异常就 `return`", 于是这一局**白跑**:
+            `[看护] 补 P2 这一步完成`
+            `[看护] ✗ 读状态失败: 桥返回空(可能掉线)` → 直接退出
+          而那时游戏好好的 —— "桥返回空"多半是**瞬时**的(正赶上场景切换/加载)。
+          · **不重连**这条规矩是对的(桥的 `AcceptLoop` 一出异常就 `break`,
+            之后整个会话不再接新连接) —— 但那是**重连**, 和"**在同一个 socket 上
+            再读一次**"是两回事;
+          · 所以这里改成**容忍连续 N 次**(默认 5, `NEKO_WATCH_READ_FAILS` 可调),
+            期间照常按 `interval` 重试**同一个连接**。真断了才会在 N 次后收工。
+        """
+        self._read_fails += 1
+        if self._read_fails >= self.read_fails_max:
+            self.log(f"[看护] ✗ 连续 {self._read_fails} 次读不到状态({e}) —— **收工**。")
+            self.log("[看护]   桥多半是真断了。**不做重连**(桥的 accept 循环一出异常"
+                     "就永久退出), 请重启游戏/插件后再跑。")
+            return False
+        if self._read_fails == 1:
+            self.log(f"[看护] ⚠ 读状态失败(第 1/{self.read_fails_max} 次): {e}"
+                     f" —— 在**同一个连接上**再读(不重连)")
+        return True
+
     def run(self) -> None:
         while True:
             try:
                 st = self.get_state() or {}
             except BridgeError as e:
-                # ⚠ **不重连** —— 见模块 docstring。读不到就是读不到。
-                self.log(f"[看护] ✗ 读状态失败: {e}")
-                self.log("[看护]   桥可能断了。**不做重连**(桥的 accept 循环一出异常就永久退出), "
-                         "请重启游戏/插件后再跑。")
-                return
+                if not self._read_fail(e):
+                    return
+                time.sleep(self.interval)
+                continue
+            if self._read_fails:
+                self.log(f"[看护] ✓ 状态恢复(刚才连续 {self._read_fails} 次读不到) "
+                         f"—— 没重连, 还是那条连接")
+                self._read_fails = 0
             self.tick(st)
             self._beat(st)
-            time.sleep(INTERVAL)
+            time.sleep(self.interval)
 
     def _beat(self, st) -> None:
         """长时间没变化时打一行心跳 —— 否则"没输出"会被读成"挂了"。
