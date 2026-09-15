@@ -120,6 +120,7 @@ class Watcher:
         self._miss = 0              # 连续读到"不在局里"的次数
         self._pressed = False       # **这一趟大厅**里补过 P2 没有
         self._no_p2_logged = False  # "这局没有 P2"只打一次
+        self._wait_menu_logged = False   # "还没进主菜单"只打一次(见 tick 里那段)
         self._started = False       # 这一局启动过引擎没有
         self._last_beat = time.time()
 
@@ -166,9 +167,28 @@ class Watcher:
 
         # ---- 真的在大厅/主界面 ----
         self.stop_engine("在大厅")               # 幂等: 没在跑就什么都不做
+        users = lobby_users_of(st)
+        # ☠☠ **"不在对局里" ≠ "已经到主菜单"** —— 标题画面 / 加载画面 / 过场
+        #   全都满足"不在对局", 而那时 `users` 是 **0 人**(**本地玩家都还没生成**)。
+        #   用户 2026-09-15 实测(先起看护、后开游戏):
+        #     `[看护] 大厅玩家: 0 人 —— 检查是否需要补 P2`
+        #     `[加入] 第 1/3 次按 A … -> 按完还是 0 人`
+        #     `[加入] 第 2/3 次按 A … -> 按完还是 1 人`      ← 这时才到大厅
+        #   前两下按在了**标题画面**上; 而"每趟大厅只按一次"是按"不在对局"记的
+        #   ⇒ 那一次白费, **真正进大厅时反而不按了**。
+        #   ⇒ 判据: **本地玩家已经生成(`users >= 1`)才算到了大厅**; 在那之前只等。
+        #   ⚠ `users is None`(读不到/旧 dll)**不走这条** —— 交给 `join_lobby` 去
+        #     提示"读不到就不按", 那是另一回事。
+        if users == []:
+            if not self._wait_menu_logged:
+                self._wait_menu_logged = True
+                self.log("[看护] ⏳ 还没进主菜单(大厅玩家 0 人 —— 本地玩家都没生成)"
+                         " —— **先不按 A**, 等着")
+            return
+        self._wait_menu_logged = False
         if not self._pressed:
             self._pressed = True
-            self.join_lobby(st, lobby_users_of(st))
+            self.join_lobby(st, users)
 
     # ---------------- 真循环 ----------------
     def run(self) -> None:
