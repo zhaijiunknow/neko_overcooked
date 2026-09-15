@@ -6083,6 +6083,19 @@ class Engine:
             # 手上的生料要放进去 —— 或者锅里已经"等着我下锅"的那份就是手上这个。
             if self._held_is(held, op.target):
                 return True, ""
+            # ☠☠ **"手上端着装着它的容器"也算** —— 用户 2026-09-15:
+            #   > "**烤箱的前置是搅拌碗**, 需要把**搅拌完的搅拌碗拿到烤箱前交互**"
+            #   ⇒ 那条链走到这一步时, 手上是**碗**(不是料) ⇒ 只判 `_held_is` 会永远不成立
+            #     ⇒ `cook` 判死 ⇒ 整条链断在这儿。
+            #   判据**问游戏**(`heldhas` = 插件报的"这件容器里装了什么"), 不猜名字也不猜阶段。
+            #   ⚠ 读不到 `heldhas`(旧 dll)时 `_held_contents` 返回空集 ⇒ 不放行 ⇒ 退回旧行为
+            #     (`_held_is` 那条仍然在, 所以"手上就是它"的老路一个字没变)。
+            if held and self._norm(op.target) in self._held_contents(st):
+                return True, ""
+            if not strict and held:
+                return True, ""
+            return False, (f"手上是 {held!r} 不是 {op.target}" if held
+                           else "手上没有可煮的")
             if not strict and held:
                 return True, ""
             return False, (f"手上是 {held!r} 不是 {op.target}" if held
