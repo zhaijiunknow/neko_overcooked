@@ -3550,6 +3550,12 @@ class Engine:
     #:   ⇒ 取的时候要贴着 `m_mixingTime`, 不能拖。
     MIX_TIME = float(os.environ.get("NEKO_MIX_TIME") or 10.0)
 
+    #: **搅拌碗最多装几份** —— 用户 2026-09-15 实测: "碗的容量是'**<=4 份**任意处理过的料'"。
+    #: ⚠ 这是**游戏事实**(像 `MIX_TIME`/`BRANCH_RETRY_MAX` 一样), 不是我们的偏好 ⇒ 写成常量。
+    #:   游戏自己也拦(满了拒绝放置), 这里提前拦是为了**别白跑一趟**。
+    #: `NEKO_BOWL_MAX` 可调(万一哪关的碗不一样)。
+    BOWL_MAX = int(float(os.environ.get("NEKO_BOWL_MAX") or 4))
+
     def op_mix(self, km, x, z, op: Op, st: dict) -> bool:
         """把材料放进**搅拌台**搅好, 再取回来。
 
@@ -6105,6 +6111,18 @@ class Engine:
             #   不查"碗在不在/满没满" —— 那要 `ScanMixing` 的实时数据, 由 `op_assemble`
             #   到跟前再判(探测层刻意不碰那么多), 而且满了游戏会自己拒收。
             if getattr(op, "into_bowl", False):
+                # ☠ **容量校验**(用户: "碗的容量是'<=4 份任意处理过的料'"):
+                #   碗里已经满了 ⇒ 再放也放不进去(游戏会拒) ⇒ **别白跑**, 现在就拦。
+                #   份数从 `ScanMixing` 的 `in` 数出来(`+` 拼的, 见 `Cooking.count`)。
+                #   ⚠ **找不到碗就不拦**(这关没报 mixing / 老 dll) —— "不知道就放行"。
+                _bowl = None
+                for _c in (getattr(km, "cooking", None) or []):
+                    if (getattr(_c, "kind", "") or "") == "mix" and getattr(_c, "mount", ""):
+                        _bowl = _c
+                        break
+                if _bowl is not None and _bowl.count >= self.BOWL_MAX:
+                    return False, (f"碗里已经有 {_bowl.count} 份了(上限 {self.BOWL_MAX}) "
+                                   f"—— 放不进去, 先去搅")
                 if self._held_is(held, op.target) and km.nearest("mix", x, z) is not None:
                     return True, ""
                 if km.nearest("mix", x, z) is None:

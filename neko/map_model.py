@@ -358,6 +358,10 @@ class Cooking:
     #: 搅拌器身上是 `MixingHandler`(不是 `CookingHandler`), 数据形状却**一模一样**
     #: (prog/need/state/内容物/坐标/挂载) ⇒ 合并进同一个列表, 靠这个字段区分。
     kind: str = "cook"
+    #: **这个容器挂在哪张台面上**(物体名; 空 = 没挂/地上/手上)。
+    #: 只有 `ScanMixing` 会报(它照抄了 `MountOf`), 所以**煮的那条一般是空**。
+    #: ⚠ 不叫 `on` —— `Station.on` 是"台面上放着的东西", 同名会看错。
+    mount: str = ""
     #: **报警从几倍开始**(`prog/need` 的比值)。这是**游戏的阈值**, 不是我们的偏好:
     #:   · 煮: `> 1×` ⇒ OverDoing(`ServerCookingHandler`);
     #:   · 搅: `> 1.3×` ⇒ OverDoing(`ServerMixingHandler.cs:56`)。
@@ -368,6 +372,18 @@ class Cooking:
     @property
     def ready(self) -> bool:
         return self.state == "Cooked"
+
+    @property
+    def count(self) -> int:
+        """**里面装了几份** —— 由 `inside` 数出来。
+
+        ☠ 不用新字段: C# 那边 `ItemKnowledge.AppendNodeName` 是**用 `+` 拼**的
+          (`if (sb.Length > 0) sb.Append("+")`), 所以 `"Egg+Flour"` 就是**两份**。
+        用途: 搅拌碗的**容量校验**(用户 2026-09-15: "碗的容量是'**<=4 份**任意处理过的料'") ——
+          "碗满了还去放"游戏也会拒, 但**白跑一趟**; 早知道就早拦住。
+        ⚠ 名字里**本来带 `+`** 的情况没有(食材名不含加号), 所以切开数不会数错。
+        """
+        return len([p for p in (self.inside or "").split("+") if p.strip()])
 
     @property
     def burn_at(self) -> float:
@@ -620,6 +636,7 @@ class KitchenMap:
                 cook_id=int(c.get("cookId", 0) or 0),
                 cook_name=c.get("cookName", "") or "",
                 kind=c.get("kind", "") or "cook",
+                mount=c.get("on", "") or "",
                 alert=1.0))
         # 搅拌器**并进同一个列表**(形状一样), 只是报警阈值是 1.3 倍 —— 见 `Cooking.kind/alert`
         for c in layout.get("mixing") or []:
@@ -632,7 +649,7 @@ class KitchenMap:
                 tag=c.get("tag", ""), inside=c.get("in", ""),
                 cook_id=int(c.get("cookId", 0) or 0),
                 cook_name=c.get("cookName", "") or "",
-                kind="mix", alert=1.3))
+                kind="mix", mount=c.get("on", "") or "", alert=1.3))
         return km
 
     # ---- 查询 ----
