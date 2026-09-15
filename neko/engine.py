@@ -345,6 +345,11 @@ class Engine:
         #: **"撞住过"的格子** `{(i,j): 到期时间}` —— 地图说能走、物理上过不去的那种
         #: (见 `_note_blocked` / `_dynamic_blocks`)。
         self._blocked = {}
+        #: 上一次 `navigate()` 是不是"**卡住、而且没能记下是哪一格**"。
+        #: 那种失败下重规划**没有任何信息增量**(同一张图必然同一条路) ⇒
+        #: `navigate_smart` 据此直接放弃这一趟, 不烧 `replans` 那几轮。
+        #: 每次 `navigate()` 开头都会复位(见那里), 别读残留值。
+        self._last_stuck_no_learn = False
         #: **外部命令**(`neko/control.py` 的命令文件): 指定做的下一步 / 暂停 / 收工。
         self._forced = None          # (action, target) —— `do` 命令指定的那一步, 做一次就清
         self._ctrl_paused = False    # `pause` 之后松手等 `resume`
@@ -646,6 +651,9 @@ class Engine:
         按交互键就会拿错东西。先粗到保证不卡在障碍上, 再限时收紧到 tight。
         """
         from bridge.keyboard_input import key_down, key_up, ensure_focus, get_driver
+        # ⚠ **每次开头复位** —— 调用方(`navigate_smart`)会在失败后读它,
+        #   读到上一趟的残留值就会误判"这次也学不到"(同 `_execute_scored` 那条变量不隔离的教训)。
+        self._last_stuck_no_learn = False
         # 默认**不抢焦点**: 游戏不在前台就暂停等它回来。
         #
         # ⚠ 这里必须"等", 不能直接 return False —— 这是踩过的坑:
@@ -853,10 +861,19 @@ class Engine:
                     #     新路径的**第一步方向本来就不一样**(这就是一次有依据的侧移),
                     #     而且它是从**当前位置**重算的、还会绕开已记下的格。
                     #   ⚠ 重规划是**有界**的(`replans`), 不会变成另一个死循环。
-                    self._note_blocked(tm, x, z, dx, dz, dist)
+                    _rec = self._note_blocked(tm, x, z, dx, dz, dist)
                     self.kb.release_all()
-                    self.log(f"[导航] ✗ 这一格推不过去 (~{x:.1f},{z:.1f}) —— "
-                             f"记下它, 中止这一趟让外层带新禁行格重规划")
+                    if _rec:
+                        self.log(f"[导航] ✗ 这一格推不过去 (~{x:.1f},{z:.1f}) —— "
+                                 f"记下它, 中止这一趟让外层带新禁行格重规划")
+                    else:
+                        # ☠ **没记下就别再谎报"记下它"** —— 上面那句原来无论记没记都打,
+                        #   于是"重规划"看起来有信息增量、其实没有(实机 `s_sushi_4_1`
+                        #   读了半天才看出它一次都没记)。改由 `navigate_smart` 决定放弃。
+                        self.log(f"[导航] ✗ 这一格推不过去 (~{x:.1f},{z:.1f}) —— "
+                                 f"而且**没能记下是哪一格**(跨不出自己那格/方向太小), "
+                                 f"重规划也是同一条路")
+                    self._last_stuck_no_learn = not _rec
                     return False
 
                 # ☠ **迈步之前先探一下"下一步那格"** —— 这是"直接走进水里"的根因(用户实机指出:
@@ -2986,18 +3003,33 @@ class Engine:
         用户原话: "寻路…还是有很大的问题" —— 这就是其中一类:
         **地图和物理打架时, 引擎以前只会硬撞, 不会记住。**
 
-        记的是**前方 0.7 格那一格**(厨师站在好格子里、往坏格子里推)。
+        记的是**按方向相邻的那一格**(厨师站在好格子里、往坏格子里推)。
+
+        **返回值 = 到底记下没有** —— 调用方靠它区分"学到了"和"白撞一趟"
+        (见 `navigate_smart` 里那条"学不到就别重规划")。
+
+        ☠☠ **不能用"前方 0.7 格采样"**(2026-09-15 实机 `s_sushi_4_1`, 用户:
+          "会站在传送门前发呆"): 格子步长 **1.20**, 而采样只往前 **0.7** ——
+          厨师只要站得离格心近一点就**跨不出边界**, 采到的正是**自己那格**,
+          于是被下面那条"别记自己站的格"的守卫吞掉 ⇒ **什么也没记**。
+          而"卡住"恰恰就是"**没离开自己的格子**" ⇒ 这个写法**专挑真卡住的时候失效**。
+          闭环: 卡住 → 学不到 → 整趟重规划 → 同一张图同一条路 → 又卡住 →
+          `replans` 四轮跑满、**厨师一步没动**, 日志读起来就是"站着发呆"。
+          ⇒ 改成**按方向取相邻格**: 学不学得到从此和"站得离格心多远"无关。
         """
         # ⚠ `dist` 太小的时候**方向是没有意义的**(人在目标上原地蹭) —— 那时记下的
         #   会是一个随机邻居。只有"真的在往那儿推"才值得记。
         if BLOCKED_TTL <= 0 or tm is None or not getattr(tm, "ok", False) or dist <= 0.5:
-            return
-        c = tm.cell_of(x + dx / dist * 0.7, z + dz / dist * 0.7)
-        if not tm.inside(*c) or c == tm.cell_of(x, z):
-            return
+            return False
+        here = tm.cell_of(x, z)
+        c = (here[0] + (1 if dx > 1e-6 else (-1 if dx < -1e-6 else 0)),
+             here[1] + (1 if dz > 1e-6 else (-1 if dz < -1e-6 else 0)))
+        if not tm.inside(*c) or c == here:
+            return False
         self._blocked[c] = time.time() + BLOCKED_TTL
         self.log(f"[导航] ⚠ 记下「这一格过不去」{c}(地图说能走, 人撞住了) —— "
                  f"接下来 {BLOCKED_TTL:.0f} 秒规划时绕开它")
+        return True
 
     def _dynamic_blocks(self, km, tm) -> set:
         """**当前不能走的格子** = 会动的东西占住的 + **撞住过的**(学来的)。
@@ -3168,6 +3200,18 @@ class Engine:
                         self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 撞到地图上看不见的障碍 "
                                  f"—— **带上新禁行格重规划**(不再沿原路硬撞)")
                         break
+                    # ☠☠ **卡住 + 没学到新格 ⇒ 重规划也是同一条路, 直接放弃这一趟**
+                    #   (2026-09-15 实机 `s_sushi_4_1`): 那种情形下 `_blocked` 不变,
+                    #   于是外层 `for attempt in range(replans+1)` 拿着**同一张图**
+                    #   又规划出**同一条路径**、同样这一批路点、同样在**同一格**卡住 ——
+                    #   实测四轮跑满而**厨师一步没动**; 而这里原来的 `continue` 只是
+                    #   把六颗路点跳完, 照样进下一轮。用户看到的就是"站在传送门前发呆"。
+                    #   ⇒ 没信息增量就别重试, `return False` 让上层换支/换目标
+                    #     (那才是真正会改变局面的动作)。见 `navigate` 里的 `_last_stuck_no_learn`。
+                    if getattr(self, "_last_stuck_no_learn", False):
+                        self.log("[导航] ⚠ 卡住且**没学到新格** —— 重规划还是同一条路, "
+                                 "这一趟到此为止(交给上层换支/换目标)")
+                        return False
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
                     continue                       # 跳过去, 别把整条路径判死
                 x, z = px, pz
