@@ -2326,6 +2326,8 @@ class Engine:
         tm = self.terrain()
         t_end = time.time() + budget
         grabs = 0
+        #: **拿到的是别的东西**的次数 —— 和 `grabs` 分开计(见下面那段注释)。
+        wrong = 0
         dashed = False
         while time.time() < t_end:
             if not self.round_active():
@@ -2356,7 +2358,20 @@ class Engine:
                 #   地上/箱子那两条路本来就过 `_approach`(它的微调会一直挪到游戏说能作用
                 #   为止), 所以地上那次成功是"距 0.73 格"—— **比一格还近**。只有传送带
                 #   这条绕过了它, 这里补上同一套。
-                self._approach(km, live.x, live.z, tight=0.5, want=op.target)
+                # ☠☠ **`want` 在传送带上不能用食材名** —— 这是"拿不到传送带上的东西"
+                #   的**根**, 2026-09-15 `s_sushi_4_1` 实测:
+                #     游戏报的抓取目标是**传送带台面本身**(`ConveyorStation (15)`),
+                #     **不是带子上那件食材**。而 `_aim_ok` 是拿游戏报的名字和 `want` 比的
+                #     (`_name_is(pick, want)`) ⇒ `want='SushiRice'` **恒为假** ⇒
+                #     微调循环一直转到 `tight_timeout`, 日志里就是
+                #     `✗ 微调后游戏仍说作用不到目标(抓取='ConveyorStation (15)' …, 差 1.34 格)`。
+                #   ⇒ 这里要的是"**站到能对带子按抓取键的地方**" —— 传 `""`
+                #     (`_aim_ok`: 空 `want` = 范围里**有任意可交互物**就算到位)。
+                #   ⚠ 别改成 `live.name`(某一个带段的名字): **东西在带子上一直换段**
+                #     (日志里同一次里就出现过 `ConveyorStation (4)` 和 `(15)`),
+                #     要求"必须是那一段"会在东西漂走时把微调卡死。
+                #   ⚠ "抓没抓对"不靠 `want` 管 —— 按完之后有**独立**的一次核对(见下)。
+                self._approach(km, live.x, live.z, tight=0.5, want="")
                 if self.interact("pickup", verify_hold_change=True):
                     # interact 只判"手上有没有变"，不判"是不是目标"。传送带上一格
                     # 一格连着好几个食材，手伸过去很可能抓到旁边那一个(SushiPrawn
@@ -2367,11 +2382,20 @@ class Engine:
                         return True
                     self.log(f"[步骤] 拿到 {got!r}，不是 {op.target!r}，放回继续等")
                     self.interact("pickup", verify_hold_change=False)
-                    grabs += 1
-                    if grabs >= 5:
+                    # ☠☠ **"拿错了"是进展, 不是失败** —— 它恰好证明**站位是对的**
+                    #   (够得着带子), 只是带子上**这一刻**过来的不是那件。
+                    #   它不该和"按不上"共用一个上限: 要等几次是**关卡决定的**
+                    #   (带子上排了几件东西), 不是 5 —— 实机就见过排得多时白放弃。
+                    #   ⇒ 分开计; 真正管住它的是上面的时间预算(`budget`)。
+                    #   ⚠ 留一个**远大于任何关卡排布**的硬顶只是防病态死循环。
+                    wrong += 1
+                    if wrong >= 30:
+                        self.log(f"[步骤] ⚠ 带子上拿到 {wrong} 次都不是 {op.target!r} —— "
+                                 f"这件多半根本不在这条带子上, 收工")
                         return False
                     time.sleep(0.2)
                     continue
+                # 按不上(够不着/没目标)才是真的"这一轮没做成" —— 只有它计数。
                 grabs += 1
                 if grabs >= 5:
                     return False
