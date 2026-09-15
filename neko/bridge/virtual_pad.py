@@ -391,9 +391,38 @@ def chef_of_player(bridge, player: str = "Two", log=print):
     return hit[0]
 
 
+#: 大厅里"已经加入的玩家"从 state 顶层读(字段名)。
+#: 由 `Overcooked2AI/Game/SceneScanner.cs` 的 `ScanUsers` 上报 ——
+#: 权威来源是游戏自己的 `Team17.Online.ClientUserSystem.m_Users`
+#: (反编译依据: `GamepadEngagementManager.cs:92-105`, 那正是"按 A 加入下一个玩家"的
+#:  轮询器**自己**, 它先判 `ClientUserSystem.m_Users.Count < 4` 才放行)。
+USERS_KEY = "users"
+
+
+def lobby_users(bridge, st=None, log=None):
+    """大厅里已加入的玩家 → `[{'slot':…, 'local':…, 'name':…}, …]`。
+
+    **返回 `None` 表示"读不到"**, 和"读到 0 个人(`[]`)"是两回事 ——
+    调用方必须分开处理: 把"读不到"当 0 人会去按 A, 而按 A 会**引进 P3**。
+    (插件侧读不到时上报的就是 `null`, 见 `ScanUsers` 的注释。)
+    """
+    try:
+        s = st if st is not None else (bridge.get_state() or {})
+    except Exception as e:                                         # noqa: BLE001
+        if log:
+            log(f"[加入] 读状态失败: {e}")
+        return None
+    if USERS_KEY not in s:
+        return None                     # 旧 dll: 压根没有这个字段
+    u = s.get(USERS_KEY)
+    if u is None:
+        return None                     # 插件报的是"读不到"
+    return u if isinstance(u, list) else None
+
+
 def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
-                log=print) -> bool:
-    """在**主界面**让第二个玩家加入(按虚拟手柄的 A)。
+                log=print, force: bool = False) -> bool:
+    """在**主界面**让**下一个**玩家加入(按虚拟手柄的 A)。**已经是双人就跳过。**
 
     为什么非要有这一步 —— 这是个**鸡生蛋**, 只能走这条"旧路":
       · `pad("installplayer")` 那套(真正消费输入的那个)要求场景里**已经有
@@ -405,14 +434,38 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
       ⇒ **只有 `VirtualGamepads`(真的 InControl 设备)能触发
         `PCPadInputProvider.OnDeviceAttached`, 也就是"有手柄接上了"那个事件。**
 
-    ⚠ **能否加入，本函数只能确认"命令被接受"** —— 大厅里有几个人在
-      `StartScreen` 是**读不到**的(要进对局才有 `PlayerControls`)。
-      真正加入没有要靠眼睛看, 或者进对局后数 `chefs`。
+    ☠☠ **A 是"加入下一个玩家", 不是 toggle** ⇒ 按多了会**引进第三个人**
+      (用户 2026-09-15 实测; 游戏自己的守卫只挡到 4 人, 挡不住第 3 个)。
+      所以进这个函数**先检查是不是已经双人, 是就跳过** —— 判据只有这一条,
+      而且做在这里(不是做在调用方): **手动跑 `tools\\joinp2.py` 同样受保护**。
+
+    ⚠ **能否加入, 本函数只能确认"命令被接受"** —— 按完要**看一眼大厅**,
+      或者进对局后数 `chefs`(那才是"真的加进来了"的证据)。
+      (这里以前写着"大厅里有几个人读不到" —— **那句是错的**,
+       见 `lobby_users` 与 `ScanUsers` 的反编译依据。现在读得到, 也正因此才敢判。)
 
     `pad`: 用第几个虚拟设备(0/1)。哪个对应"第二玩家"取决于游戏怎么分配槽位,
            默认 1; 不行就试 0。
     `hold`: 按住 A 的时长 —— 设备接上到被枚举可能要几帧, 太短会漏。
+    `force`: **越过"已经双人就跳过"的检查**(也会越过"读不到就不按")。
+             只在确知自己在干什么时用。
     """
+    users = lobby_users(bridge, log=log)
+    if not force:
+        if users is None:
+            log("[加入] ⚠ **读不到大厅玩家名单** —— 不按 A(猜错就是引进第三个人)。")
+            log("[加入]   多半是插件是旧的(没有 `users` 字段): 重编重装 "
+                "`build\\Overcooked2AI.dll`, 并**完全退出游戏再开**(BepInEx 只在启动读 dll)。")
+            log("[加入]   确知大厅里只有自己、要强行按: 加 `--force`。")
+            return False
+        if len(users) >= 2:
+            who = ", ".join(
+                "%s%s" % (u.get("slot") or "?", "(本地)" if u.get("local") else "")
+                for u in users)
+            log(f"[加入] 大厅里**已经有 {len(users)} 个人**({who}) —— "
+                f"已经是双人, **跳过加入**(再按 A 会引进第三个人)")
+            return True
+
     ok_any = False
     for k in range(tries):
         # ⚠ 整份覆盖: 这个接口是**状态写**不是增量, 少写一个字段就等于把它清零。
@@ -428,5 +481,6 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
             time.sleep(0.4)
     if ok_any:
         log(f"[加入] pad={pad} 的 A 已按过 {tries} 次 —— "
-            f"**去看一眼大厅里出没出第二个玩家**(这边读不到)")
+            f"**去看一眼大厅里出没出第二个玩家**"
+            f"(这个接口只报'命令被接受'; 想确知就读 state 的 `users`)")
     return ok_any

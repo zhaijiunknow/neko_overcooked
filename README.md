@@ -95,6 +95,21 @@ python -u run_engine.py --mode sabotage     :: 三模式: coop | clumsy | sabota
 python -u run_team.py
 ```
 
+**看护（开着不用管）** —— 轮询游戏状态, 大厅缺 P2 就补, 进对局自动拉起 `run_engine.py`,
+对局结束把它收掉(**一局一连**):
+
+```bat
+python -u run_watch.py
+```
+
+> - **收尾走 `CTRL_BREAK_EVENT`(等价 Ctrl+C), 不 kill** —— 引擎的 `finally` 里要跑
+>   `pad.uninstall()`; 不跑的话那只厨师的输入**持续被虚拟手柄接管**, 直到重开游戏。
+> - `tools\joinp2.py` 现在会**先检查是不是已经双人, 是就跳过** ——
+>   **A 是"加入下一个玩家"不是 toggle**, 按多了会引进第三个人。
+>   判据来自游戏自己的 `ClientUserSystem.m_Users`(反编译依据见 `SceneScanner.ScanUsers`)。
+> - 环境变量: `NEKO_WATCH_INTERVAL` / `NEKO_WATCH_MISSES` / `NEKO_WATCH_HEARTBEAT`。
+
+
 > ⚠ **`--mode none` 是调 bug 时的默认档**。`coop` 也带"低概率自然失误"（发呆/绕路/多切/忘盘），
 > 拿它测出来的卡顿**分不清是 bug 还是演的**。
 

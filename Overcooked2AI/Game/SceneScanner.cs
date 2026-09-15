@@ -295,6 +295,163 @@ namespace Overcooked2AI.Game
             return "[" + chefs + "]";
         }
 
+        /// <summary>**大厅/主界面里已加入的玩家名单** —— 数组, 每项 `{slot, local, name}`。
+        ///
+        /// ☠☠ **为什么必须有这个**(2026-09-15, 用户: "**需要去检查一下游戏本体的数据**"):
+        ///   `tools/joinp2.py` 的注释原来写着"大厅里有几个人在 `StartScreen` 读不到,
+        ///   要进对局才有 `PlayerControls`" —— **那句是错的**, 它让"要不要按 A 加入 P2"
+        ///   变成了一个只能靠猜的决定。而按 A 是**"加入下一个玩家"**(不是 toggle):
+        ///   猜错就会把 **P3 引进来**(用户实测)。所以这一条必须读准。
+        ///
+        /// 真正的名单在 `Team17.Online.ClientUserSystem.m_Users`
+        ///   (`overcooked_decomp/Team17.Online/ClientUserSystem.cs:36`):
+        ///     `public static FastList<User> m_Users = new FastList<User>(4);`
+        ///   (主机/权威视图是 `ServerUserSystem.m_Users`, 同签名, 作后备)
+        /// **铁证**: `GamepadEngagementManager.cs:92-105` —— 那正是"按 A 加入下一个玩家"的
+        ///   轮询器**自己**, 它先判 `ClientUserSystem.m_Users.Count < 4` 才允许 engage。
+        ///   也就是说"够不够人"这条判据, 我们和游戏用的是**同一个数据源**。
+        ///   `FrontendPlayerLobby.cs` 也到处读 `Count` 来渲染玩家槽位。
+        ///
+        /// 沿用 `ScanChefs` 的做法: 能读到就叫"读到了", 读不到就 `[]` ——
+        ///   ⚠ **Python 侧要靠"键在不在"区分"读不到"和"真的只有 0 人"**,
+        ///     所以 `[]` 在这里表示"没读到"(见 `engine`/`virtual_pad` 那边的守卫)。
+        ///
+        /// ⚠ 这是**每帧**都跑的路径(由 `StateCollector.Refresh` 调) ⇒ 反射查出来的
+        ///   `FieldInfo`/`PropertyInfo` **必须缓存**(同 `ItemKnowledge.ContentsMethod`
+        ///   那条教训: 不缓存就是拿帧率换新鲜度)。类型在一次会话里不变, 缓存安全。
+        /// </summary>
+        public static string ScanUsers()
+        {
+            var sb = new StringBuilder();
+            sb.Append("[");
+            int n = 0;
+            bool any = false;       // 有没有**成功读到**过名单(见下面 `return "null"`)
+            // 客户端视图优先(大厅 UI 读的就是它); 读不到再退到 ServerUserSystem。
+            foreach (var typeName in new[] { "Team17.Online.ClientUserSystem",
+                                             "Team17.Online.ServerUserSystem" })
+            {
+                if (!ResolveUserReflection(typeName))
+                    continue;
+                any = true;
+                try
+                {
+                    object list = _usersListField.GetValue(null);
+                    if (list == null)
+                        continue;
+                    // ⚠ **必须给两个参数** —— 目标是 .NET 2.0(`build.bat` 里 `FW=v2.0.50727`),
+                    //   那时 `PropertyInfo.GetValue(object)` 这个单参数重载**还不存在**
+                    //   (CS1501)。`PropStr`/`PropBool` 里也是这个写法。
+                    int cnt = (int)_usersCountProp.GetValue(list, null);
+                    var arr = _usersItemsField.GetValue(list) as Array;
+                    if (arr == null || cnt <= 0)
+                        continue;
+                    for (int i = 0; i < cnt && i < arr.Length && n < MaxUsersShown; i++)
+                    {
+                        object u = arr.GetValue(i);
+                        if (u == null)
+                            continue;
+                        if (n > 0)
+                            sb.Append(",");
+                        // ⚠ 片段自带前导逗号是给"插进别人 JSON"用的; 这里是一个**独立数组**,
+                        //   逗号必须由循环自己控制(上面那行), 别照抄字符串片段那套。
+                        sb.Append(string.Format(
+                            "{{\"slot\":\"{0}\",\"local\":{1},\"name\":\"{2}\"}}",
+                            SafeName(PropStr(_usersEngProp, u)),
+                            PropBool(_usersLocalProp, u) ? "true" : "false",
+                            SafeName(PropStr(_usersNameProp, u))));
+                        n++;
+                    }
+                    break;          // 读到了就不再翻后备
+                }
+                catch (Exception) { }
+            }
+            // ☠☠ **读不到必须与"0 人"区分开** —— 否则 Python 侧会把"读不到"当成
+            //   "大厅里没人", 于是去按 A ⇒ 而按 A 是"加入**下一个**玩家" ⇒ **引进 P3**。
+            //   所以两个类型**一个都没解析出来**时返回 `null`(不是 `[]`)。
+            if (!any)
+                return "null";
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        /// <summary>`on`/`ontags`/`onhas` 之外, **`users` 最多报几项**。
+        /// 和 `MaxOnShown` 同理: 上限只是别让一条状态撑爆, 这个列表本来就 ≤4。</summary>
+        public const int MaxUsersShown = 4;
+
+        /// <summary>`ScanUsers` 的反射句柄 —— **解析一次、全程复用**(见那边的注释)。
+        /// 只在**成功**时置 `_usersReady`, 否则下次还会重试(程序集可能还没加载完)。</summary>
+        private static bool _usersReady;
+        private static FieldInfo _usersListField;
+        private static PropertyInfo _usersCountProp;
+        private static FieldInfo _usersItemsField;
+        private static PropertyInfo _usersEngProp, _usersLocalProp, _usersNameProp;
+        private static string _usersTypeName = "";
+
+        private static bool ResolveUserReflection(string typeName)
+        {
+            if (_usersReady && _usersTypeName == typeName)
+                return true;
+            _usersReady = false;
+            try
+            {
+                var t = FindType(typeName);
+                if (t == null)
+                    return false;
+                var lf = t.GetField("m_Users",
+                                    BindingFlags.Public | BindingFlags.Static);
+                if (lf == null)
+                    return false;
+                var lt = lf.FieldType;                       // FastList<User>
+                var cnt = lt.GetProperty("Count");
+                var items = lt.GetField("_items");
+                if (cnt == null || items == null)
+                    return false;
+                var et = items.FieldType.GetElementType();   // User
+                if (et == null)
+                    return false;
+                var eng = et.GetProperty("Engagement");
+                var loc = et.GetProperty("IsLocal");
+                var nam = et.GetProperty("DisplayName");
+                if (eng == null || loc == null)
+                    return false;
+                _usersListField = lf;
+                _usersCountProp = cnt;
+                _usersItemsField = items;
+                _usersEngProp = eng;
+                _usersLocalProp = loc;
+                _usersNameProp = nam;                        // DisplayName 可能没有, 允许 null
+                _usersTypeName = typeName;
+                _usersReady = true;
+                return true;
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        private static string PropStr(PropertyInfo p, object o)
+        {
+            if (p == null)
+                return "";
+            try
+            {
+                object v = p.GetValue(o, null);
+                return v == null ? "" : v.ToString();
+            }
+            catch (Exception) { return ""; }
+        }
+
+        private static bool PropBool(PropertyInfo p, object o)
+        {
+            if (p == null)
+                return false;
+            try
+            {
+                object v = p.GetValue(o, null);
+                return v is bool && (bool)v;
+            }
+            catch (Exception) { return false; }
+        }
+
         /// <summary>读厨师"现在能不能被指挥"(PlayerControls 的几个 public 成员)。
         ///
         /// respawning / suppressed / scale 三者任何一个不满足, 发方向键都是白费:

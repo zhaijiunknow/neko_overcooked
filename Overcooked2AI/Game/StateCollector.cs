@@ -289,14 +289,19 @@ namespace Overcooked2AI.Game
             string round = inRound ? "true" : "false";
             string app = "{}";
             try { app = VirtualInput.AppState(); } catch (Exception) { }
+            // **大厅里的玩家名单** —— 和 `inRound` **无关**: 恰恰是"还没进对局"时才最需要它
+            //   (要不要按 A 把 P2 加进来, 只能在不用局里判断; 见 `SceneScanner.ScanUsers`)。
+            //   ⚠ 所以它也在 `if (inRound)` 块**外**。
+            string users = "[]";
+            try { users = SceneScanner.ScanUsers(); } catch (Exception) { }
             lock (_lock)
             {
                 // ⚠ 这两块挂在 `if (inRound)` **块外** —— 出局之后照样要报 `lastResult`,
                 //   否则"上一局赢没赢"在对局结束那一刻就没了。
                 _snapshot = string.Format(
-                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"app\":{6},{7},\"bridge\":\"ok\"}}",
+                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"app\":{6},\"users\":{7},{8},\"bridge\":\"ok\"}}",
                     scene, round, mode, layout, recipePool, _recipeDetailCache, app,
-                    RoundScore.Json(inRound));
+                    users, RoundScore.Json(inRound));
             }
         }
 
