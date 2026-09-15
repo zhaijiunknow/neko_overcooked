@@ -27,10 +27,23 @@ import time
 class World:
     """共享的只读世界视图 + 一张"占位预约表"。"""
 
-    def __init__(self, bridge, log=print, state_ttl: float = 0.10):
+    def __init__(self, bridge, log=print, state_ttl: float = None):
         self.br = bridge
         self.log = log
-        self.state_ttl = state_ttl
+        #: 状态快照的保质期(秒)。**默认 0 —— 每次读都要最新的一帧。**
+        #:
+        #: ☠ **2026-09-15 从 0.10 改成 0**(用户定的规矩, 原话):
+        #:   "我们的地图更新是**和雷达一样**的机制, 使用要求脚本**每次都使用最新的地图**,
+        #:    本身地图就小, 占用无关紧要。"
+        #:   原来那个 0.1 秒服务的是"整帧一致性 + 省桥流量"(见类文档), 那是给**规划**用的;
+        #:   可它同时喂给了**判据** —— 台面上还有没有那个盘子、我手上是不是已经空了,
+        #:   于是判据读到的最多可以是 0.1 秒前的世界。0.1 秒在这个游戏里是**半个动作**
+        #:   (一次交互认定 0.35 秒、按一下切菜 0.35 秒) ⇒ 陈旧读数直接变成
+        #:   "对着空台子按放置""东西明明在手上却报了空"。
+        #:   ⚠ 桥读本身不贵(插件主线程**每帧刷新的字符串**, 读一次就一个本地 TCP 往返),
+        #:     真正贵的 map/raw 另有缓存。`NEKO_STATE_TTL` 可以调回去(双人省流量时)。
+        self.state_ttl = (float(os.environ.get("NEKO_STATE_TTL") or 0.0)
+                          if state_ttl is None else float(state_ttl))
         self._lock = threading.RLock()
         self._st: dict | None = None
         self._st_t = 0.0

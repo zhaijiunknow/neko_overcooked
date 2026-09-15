@@ -97,16 +97,29 @@ class BridgeClient:
         """
         return self._send({"cmd": "path", "chef": chef, "tx": tx, "tz": tz})
 
-    def get_map(self, force: bool = False, max_age: float = None) -> dict:
+    def get_map(self, force: bool = False, max_age: float = None,
+                foot: bool = False) -> dict:
         """整张关卡网格 + 危险区 + 空洞 + 平台。见 neko/terrain.py 的 TerrainMap。
 
         `max_age` = **最多接受多旧的数据**(秒)。C# 侧默认缓存 5 秒 —— 对人看地图
         够用, 但**寻路前**太旧: 限时平台升降这类变化, 5 秒足够厨师走出 20 格,
         拿着旧图规划就是往海里走。传小的值(如 1.0)会强制它更新鲜。
+
+        `foot=True` —— 额外算 **交互足迹**: 每个台面"站在哪些格子上、面朝它,
+        游戏说能作用到"。返回里多一个 `foot` 数组
+        (`[{"iid":N,"n":"名字","cells":[n,…]}]`, `n = j*w + i`, 和 `grid` 同索引)。
+
+        ⚠ **为什么这个能替代 fork 游戏状态**: 判据 `InteractWithItemHelper.IsColliderInArc`
+          只依赖 (厨师位置, 朝向, 碰撞体几何) —— 是**纯几何**的, 所以能对**还没站上去**
+          的格子问。完整理由见 `Overcooked2AI/Game/LevelInfo.cs:Footprint` 的注释。
+        ⚠ 它比建图本身还贵(每台面 × 每能站格 × 每碰撞体一次判定), 所以 C# 侧
+          **只在 arg 里有 `foot` 时才跑**, 而且**不走缓存也不写缓存**。
         """
         arg = "force" if force else ""
         if max_age is not None and not force:
             arg = ("%s maxage=%s" % (arg, float(max_age))).strip()
+        if foot:
+            arg = ("%s foot" % arg).strip()
         return self._send({"cmd": "map", "arg": arg})
 
     def get_dyn(self) -> dict:

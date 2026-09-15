@@ -231,6 +231,11 @@ namespace Overcooked2AI.Game
                     catch (Exception) { }
                 }
 
+                // 本局分数/星级/剩余时间: 跟着 0.1 秒档, 且**必须在 C# 这一侧留快照**。
+                //   理由见 `RoundScore` 的类注释: 引擎的焦点闸门在 `state()` 之前,
+                //   用户切出游戏时 Python 一次都读不到, 结果就永久丢了。
+                RoundScore.CaptureRound(scene);
+
                 // 配方池: 1 秒(要读游戏对象, 有开销)
                 if (now - _lastLayoutScan >= 1f)
                 {
@@ -277,6 +282,8 @@ namespace Overcooked2AI.Game
                 _moversCache = "[]";
                 // 台面静态缓存的引用会指向已销毁的对象 —— 换关必须作废重建
                 try { SceneScanner.InvalidateStationCache(); } catch (Exception) { }
+                // 出局: **只翻标志位, 快照冻住** —— `lastResult` 靠它才能报出去。
+                RoundScore.NoteOutOfRound();
             }
 
             string round = inRound ? "true" : "false";
@@ -284,9 +291,12 @@ namespace Overcooked2AI.Game
             try { app = VirtualInput.AppState(); } catch (Exception) { }
             lock (_lock)
             {
+                // ⚠ 这两块挂在 `if (inRound)` **块外** —— 出局之后照样要报 `lastResult`,
+                //   否则"上一局赢没赢"在对局结束那一刻就没了。
                 _snapshot = string.Format(
-                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"app\":{6},\"bridge\":\"ok\"}}",
-                    scene, round, mode, layout, recipePool, _recipeDetailCache, app);
+                    "{{\"scene\":\"{0}\",\"inRound\":{1},\"mode\":\"{2}\",\"layout\":{3},\"recipes\":{4},\"details\":{5},\"app\":{6},{7},\"bridge\":\"ok\"}}",
+                    scene, round, mode, layout, recipePool, _recipeDetailCache, app,
+                    RoundScore.Json(inRound));
             }
         }
 

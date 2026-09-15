@@ -54,7 +54,8 @@ dotnet %CSC% -nologo -target:library -langversion:7.3 -platform:x86 -nostdlib+ ^
   "%SRC%\Game\GridInfo.cs" ^
   "%SRC%\Game\CellMap.cs" ^
   "%SRC%\Game\InteractDirect.cs" ^
-  "%SRC%\Game\MoverScan.cs"
+  "%SRC%\Game\MoverScan.cs" ^
+  "%SRC%\Game\RoundScore.cs"
 
 if errorlevel 1 (
   echo BUILD FAILED

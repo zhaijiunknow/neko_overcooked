@@ -408,26 +408,42 @@ class KitchenMap:
         return out
 
     def unseen_items(self) -> list:
-        """**我们地图看不见的食材**: 在 `items` 里, 但既不在任何台面的 `on`/`onhas` 里,
-        也不在任何厨师手上。
+        """**没主的**食材 —— 在 `items` 里, 但**按位置**看既不在任何台面上、也不在任何厨师手上:
+        掉在地上的、被丢出来的、在移动平台/荷叶上的、台面类型没覆盖到的。
 
-        这是回答"地图建模还有遗漏吗"的直接手段 ——
-        比如掉在地上的料、放在移动平台上的料, 都会出现在这里。
+        两个用途(都是**唯一**的判据, 别人别自己再写一份):
+          · 取料三源之一 —— "**地上那件能不能去捡**"(见 `Engine._fetch_source_live`)
+          · `mapview` 的"地图看不见的食材" —— 回答"建模还有遗漏吗"
+
+        ☠☠ **必须按"位置"认领, 不能按"名字"**(实测踩过, 用户原话"**不会拿地上的食物啊**"):
+          旧写法是「`items` 里有没有哪个**名字**没在台面/手上出现过」——
+          于是台面上放着一块 `SushiFish`、地上**另外**躺着三条 `SushiFish` 时,
+          名字出现过 ⇒ 地上那三条**被一起吞掉** ⇒ 报告说"看不见 0 件"(假的),
+          而脚本也就当脚边没料(它那时还在用同一个判据)。
+          ⇒ 改成**按位置认领**: 台面/厨师报出的东西只认领"**就在它那个位置**"的那一件。
+            容差 0.9 格: 台面报的是**台面中心**, 而它上面的东西就在同一格附近。
         """
-        seen = set()
+        claimed = []                      # (归一化名, x, z)
         for s in self.stations.values():
             for i, o in enumerate(s.on or []):
-                seen.add(_norm_name(o))
+                claimed.append((_norm_name(o), s.x, s.z))
                 for part in (s.has_of(i) or "").split("+"):
                     if part.strip():
-                        seen.add(_norm_name(part))
+                        claimed.append((_norm_name(part), s.x, s.z))
         for c in self.chefs:
-            if c.held:
-                seen.add(_norm_name(c.held))
+            if getattr(c, "held", ""):
+                claimed.append((_norm_name(c.held), c.x, c.z))
         out = []
         for it in self.items:
-            if _norm_name(it.name) not in seen:
-                out.append(it)
+            n = _norm_name(getattr(it, "name", ""))
+            if not n:
+                continue
+            ix = float(getattr(it, "x", 0.0) or 0.0)
+            iz = float(getattr(it, "z", 0.0) or 0.0)
+            if any(cn == n and abs(cx - ix) < 0.9 and abs(cz - iz) < 0.9
+                   for cn, cx, cz in claimed):
+                continue                  # 有主了(在台面上 / 在某人手上)
+            out.append(it)
         return out
 
     # ---- 语义归类 ----

@@ -10,7 +10,7 @@
       Cooked; 生(Raw)和焦(Burnt)都不匹配 ⇒ 必须盯着实时进度取下
   · 组装顺序无关(CompositeAssembledNode.AssumeTypeMatch 是集合配对)
 
-防御设计: 对局结束即中止 / 异常路径必释放按键 / 卡住侧移脱困 / 每步闭环验证。
+防御设计: 对局结束即中止 / 异常路径必释放按键 / 卡住即中止让外层重规划 / 每步闭环验证。
 """
 
 from __future__ import annotations
@@ -93,7 +93,11 @@ RUN_SPEED = 4.0
 #: **杂活动作的四个名字** —— 它们和菜谱 op 进**同一张评分表**(阶段二: 全局行为驱动)。
 #: 判据/执行都走 `Engine` 里对应的方法, 这里只是一份名单, 给评分侧的两个 dispatch 用
 #: (`_op_target_for_score` / `_op_actionable`)。
-CHORE_ACTIONS = ("press", "wash", "work", "serve_any")
+#: 和菜谱 op 走**同一条评分/重试/日志**的"顺手活"。
+#: `rescue`(救快糊的锅)也挂在这一族里 —— 它和杂活共用"手要空、目标在探测阶段解析好"
+#: 那两条规则(`_op_actionable` / `_op_target_for_score`), 但**不吃顺路闸门**
+#: (见 `_chore_admitted`), 因为它不是"顺手", 是"再不动就废了"。
+CHORE_ACTIONS = ("press", "wash", "work", "serve_any", "rescue")
 
 #: **杂活什么时候进候选池**(用户选的"混合: 能插就插"):
 #:   `enroute`(默认) —— 菜谱还有能做的动作时, 只有**明显顺路**的杂活能插进来
@@ -118,6 +122,25 @@ CHORE_MODE = (os.environ.get("NEKO_CHORES") or "enroute").strip().lower()
 #:   只是"没得做"和"卡在一个 bug 里"要分开对待(前者等得起, 后者要立刻停)。
 IDLE_WAIT = float(os.environ.get("NEKO_IDLE_WAIT") or 20.0)
 
+#: **预置**(把料丢/放到"下一步要用的地方"附近)的记账保质期(秒)。
+#: 用户 2026-09-15: "**鼓励丢食物**" —— 取货时把料朝下一步的方向丢过去, 之后再过去
+#: 一趟并行处理好几份(那关有 3 口锅并排)。这块记账就是"我把某份料预置在哪了"。
+#: 过期就作废: 东西可能被队友拿走/被传送带送走/被火烧了 —— 记太久会跑回一个空点。
+PREPOSE_TTL = float(os.environ.get("NEKO_PREPOSE_TTL") or 60.0)
+
+#: 下一步的处理站**至少这么远**才值得预置(格)。太近就直接抱着走(丢一趟要两次交互)。
+TOSS_MIN_CELLS = float(os.environ.get("NEKO_TOSS_MIN") or 4.0)
+
+#: **取货时"多备几份再走"的上限**(份)。`NEKO_BATCH` 可调, `1` = 回到"只备一份"。
+#:
+#: 用户 2026-09-15: "**他拿食材抛的时候不能多拿一点, 只抛一个那不如不抛。多拿几个抛**"。
+#: 为什么单份不值得丢: 丢一份 = 多一次"取+转身+丢" + **回头单独跑一趟去捡**
+#:   (那趟是纯多的); 而抱着走本来就只有一趟。**收益全在批量**:
+#:   取货点和丢的方向是**同一个点**(站在箱子旁取、就地朝下一步丢) ⇒ 连备 N 份
+#:   **几乎不额外走路**, 只是 N 次拾取 + N 次投掷; 之后**一趟**过去并行处理
+#:   (那关有 3 口锅并排, 并行吞吐是串行的 3 倍 —— 不预置就没有东西同时下锅)。
+TOSS_BATCH_MAX = int(float(os.environ.get("NEKO_BATCH") or 3))
+
 #: **某一步反复失败后, 让它坐多久冷板凳**(秒)。`NEKO_STEP_COOLDOWN` 可调, `0` = 不坐。
 #:
 #: 用户要求(2026-09-14): "**不允许退出，如果持续失败，就去做其他事**"。
@@ -126,6 +149,41 @@ IDLE_WAIT = float(os.environ.get("NEKO_IDLE_WAIT") or 20.0)
 #: 冷板凳到期后它又会回到候选里(失败往往是暂时的: 东西被队友拿走了、路被 NPC 堵了)。
 #: ⚠ 和 `IDLE_WAIT` 的分工: 这个管"这一步做不成", 那个管"一件事都做不成"。
 STEP_COOLDOWN = float(os.environ.get("NEKO_STEP_COOLDOWN") or 20.0)
+
+#: **"这一支刚试过、不行" 记多久**(秒)。`NEKO_BRANCH_TTL` 可调, `0` = 不记。
+#:
+#: 用户 2026-09-15 定的规矩: "**按一次没有得到对应的结果这条路就失败了, 可以返回到其他路**"。
+#: ⇒ 失败要记在**具体的台面**上, 不能记在动作上。现在的 `_last_fail_step` 是
+#:   `f"{action} {target}"` —— **不含台面** ⇒ 一块板走不到就把**所有**板封掉
+#:   (实测日志里 `work board1`/`board3` 走不到, 而 board0/board2 明明好用)。
+#:   粒度也不对: 那是"这一步整类别做了", 而这里要的是"这块板这一趟算了, 换一块"。
+#:
+#: ⚠ **必须有限**: 世界会变(板被腾空、路被让开、东西被队友拿走) ⇒ 划掉的分支要自动回池。
+BRANCH_TTL = float(os.environ.get("NEKO_BRANCH_TTL") or 25.0)
+
+#: **失败的种类** —— 决定"下一步该怎么办", 不是拿来打日志的。
+#:
+#:   `"branch"` —— **这一支不行**(板是空的 / 站位到不了 / 游戏 `CanHandlePlacement=false`)。
+#:                 ⇒ **换支**(别的台面/别的站位), 别原地重试, 更不是整单报废。
+#:   `"death"`  —— 摔死到上限, 路本身走不通(原样保留, `op` 里已在用)。
+#:   `""`(空)   —— 执行抖动(差 1.0 格、被推开、被抢) ⇒ 值得原地重试。
+#:
+#: 为什么必须分: 这三类的处置**互相冲突**。混在一起的后果已经实测到了 ——
+#: `placeCanHandle=False` 连试 3 次 → `✗ 放弃: assemble` → **整单报废**,
+#: 而那条路本来只需要"换个台面再试"。
+KIND_BRANCH = "branch"
+
+#: 同一单里"换一支再试"最多几回。
+#: ⚠ **必须有上限**: 台面划掉会到期回池(25 秒), 于是"重选→失败→划掉→到期→重选"
+#:   会变成一个**慢循环** —— 每一圈都要走一趟路, 一局 150 秒能烧光。
+#:   超过这个数就落到原来的"放弃整单"那条路, 让外层重新规划/坐冷板凳(规则 5 的兜底)。
+BRANCH_RETRY_MAX = 4
+
+#: **"这个台面放不下东西"** 这条分支的 key 里的"目标"。
+#: `assemble` 的失败不是"某个材料不行", 而是"**这块台面**现在接不住放置"
+#: (游戏 `CanHandlePlacement=false`) —— 和材料名无关, 换个材料来放一样不行。
+#: 所以用一个人造 target 占位, 好让 `pick_assemble_spot` 按台面把它筛掉。
+PLACE_SENTINEL = "__place__"
 
 #: **一趟导航里最多允许摔死几次**(超过就放弃这条路)。
 #: 为什么单独有这个数: 摔死 → 等重生(实测 6 秒/次) → 接着走 → 再摔死,
@@ -137,7 +195,7 @@ MAX_RESPAWNS = int(float(os.environ.get("NEKO_MAX_RESPAWNS") or 2))
 #: 为什么要有这个数(用户: "**寻路…还是有很大的问题**"):
 #:   C# 报的物理阻挡(`phys`)是**探针球采样**(`LevelInfo.BlockedBy`), 会漏;
 #:   漏掉的格在 A* 眼里是 `.` ⇒ 每次规划都从那儿走、每次都撞住
-#:   (`卡住→侧移脱困→超时(还差 1.0 格)`, 一轮白烧十几秒, **下一轮还走同一条路**)。
+#:   (`卡住→超时(还差 1.0 格)`, 一轮白烧十几秒, **下一轮还走同一条路**)。
 #: ⇒ 撞住就记下来, 并进 A* 的禁行集; 但**必须带 TTL** —— 挡住人的可能是临时的
 #:   (另一个厨师、一辆车、传送带上堆的货), 永久封路会把路越走越窄。
 BLOCKED_TTL = float(os.environ.get("NEKO_BLOCKED_TTL") or 25.0)
@@ -149,9 +207,12 @@ BLOCKED_TTL = float(os.environ.get("NEKO_BLOCKED_TTL") or 25.0)
 #:
 #: 机制(反编译): `ServerAttachmentThrower.CalculateThrowVelocity` = `方向 × m_throwForce`
 #: —— **prefab 上的定值, 没有蓄力**, 所以"丢多远"我们控制不了, 只能**走近了再丢**。
-#: ⚠ `m_throwForce` 没上报(读不到那件东西能飞多远) ⇒ 这个数是**保守的估计值**,
-#:   实机看不准就调它。丢不到也只是掉在地上, 人类捡起来就行(不是灾难)。
-PASS_RANGE = float(os.environ.get("NEKO_PASS_RANGE") or 3.0)
+#: ⚠ **实测射程 = 平地约 6 格**(用户 2026-09-15 自己数出来的; `m_throwForce` 插件读不到,
+#:   所以一直是靠估的 —— 原来写的 3.0 太保守, 会让人多走一倍的路)。
+#:   取 5.0 而不是 6.0: 留 1 格余量 —— 丢**不到**队友手里会掉在地上(人类还得去捡),
+#:   比多走一格贵。有落差时射程会变(落点越低飞得越远), 这个数只当平地基准。
+TOSS_RANGE_CELLS = float(os.environ.get("NEKO_TOSS_RANGE") or 6.0)
+PASS_RANGE = float(os.environ.get("NEKO_PASS_RANGE") or 5.0)
 
 
 class _GroundItem:
@@ -272,8 +333,15 @@ class Engine:
         self._no_ext_told = False
         #: **冷板凳**: `{"fetch Flour": 到什么时候为止}` —— 反复失败的那一步先别选它。
         self._step_bench = {}
-        #: 上一次失败是**哪一类**(`"death"` = 摔死) —— 摔死不做原路重试(见 `_execute_scored`)。
+        #: **预置记账**: `norm(材料名) -> (x, z, 什么时候预置的)` —— 见 `PREPOSE_TTL`。
+        #: "我把某份料丢/放在哪了"。丢出去手上就空了, 所以 `cook/chop/mix/assemble`
+        #: 得先靠这张表知道"它躺在附近, 先去捡回来"(见 `_pickup_preposed`)。
+        self._preposed = {}
+        #: 上一次失败是**哪一类**(见 `KIND_BRANCH` / `"death"`) —— 决定"下一步该怎么办",
+        #: 不是拿来打日志的: 摔死不原路重试, 分支不可行**换支**, 其余才值得原地重试。
         self._last_fail_kind = ""
+        #: **划掉的分支**: `(归一化 target, 台面 id) -> 过期时刻`。见 `BRANCH_TTL` 的注释。
+        self._branch_dead: dict = {}
         #: **"撞住过"的格子** `{(i,j): 到期时间}` —— 地图说能走、物理上过不去的那种
         #: (见 `_note_blocked` / `_dynamic_blocks`)。
         self._blocked = {}
@@ -286,6 +354,16 @@ class Engine:
         #: 已经报过"计划货源够不着, 改用另一个"的 (action, target, id) 集合(每个决策点都会走到)。
         self._src_swap_told = set()
         self._last_fire_check = 0.0                  # 上次查火的时间(节流见 run())
+        # ---- 状态出口(见 `neko/status.py`) ----
+        #: 上一次写出去的 payload —— 用来**跨引擎重启保留 `result`**(上一局赢没赢
+        #: 不该因为脚本重启就消失)。启动时先把文件里已有的那份读回来。
+        self._status_prev = None
+        self._status_at = 0.0                        # 上次落盘时间(节流 1 秒)
+        try:
+            import status as _status
+            self._status_prev = _status.read()
+        except Exception:
+            pass
         self._terrain = None                         # 关卡地形(含危险区), 见 terrain()
         self._terrain_scene = ""
         self._terrain_at = 0.0                       # 上面那份是什么时候取的(见 terrain 的 TTL)
@@ -373,7 +451,7 @@ class Engine:
         """正在死亡重生中(PlayerControls.m_bRespawning)。
 
         这期间游戏接管了角色, 发任何方向键都不会有反应 —— 旧代码不知道这件事,
-        于是把它当成"卡住", 一边按侧移一边把超时耗光。
+        于是把它当成"卡住", 一边硬推一边把超时耗光。
         """
         return bool(self.chef(st).get("respawning"))
 
@@ -760,20 +838,26 @@ class Engine:
                 last_pos = (x, z)
 
                 if stuck >= 8:
-                    # **按了不走 = 这一格物理上过不去**(地图说能走也没用) —— 记下来,
-                    # 下次规划绕开它(见 `_note_blocked`)。记完照样试一次侧移脱困。
+                    # **按了不走 = 这一格物理上过不去**(地图说能走也没用) ⇒ 记下来,
+                    # 然后**中止这一趟, 交给外层重规划**。
+                    #
+                    # ☠ **这里原来写的是"侧移脱困"**(朝垂直于目标的方向按 0.35 秒, 然后
+                    #   `continue` 继续朝同一个目标推) —— 那是个**死循环**:
+                    #   撞 8 下 → 侧移 → 又撞 8 下 → 又侧移 … 直到 `step_timeout`。
+                    #   实测(`s_sushi_1_3` 切鱼那次) 同一格连着 5 遍"卡住, 侧移脱困",
+                    #   每遍都记一次"这一格过不去", 然后超时 —— 而**一次重规划都没有**,
+                    #   所以学到的那格永远用不上(记了 5 遍同一格就是证据)。
+                    # ⇒ 现在: 记下这一格 → `return False` ⇒ `navigate_smart` 看到
+                    #   "这一趟学到了新禁行格" ⇒ **带着它重规划**(绕开走)。
+                    #   ⚠ 侧移想解决的"被卡住"这类情形, 重规划**也能解决而且更好**:
+                    #     新路径的**第一步方向本来就不一样**(这就是一次有依据的侧移),
+                    #     而且它是从**当前位置**重算的、还会绕开已记下的格。
+                    #   ⚠ 重规划是**有界**的(`replans`), 不会变成另一个死循环。
                     self._note_blocked(tm, x, z, dx, dz, dist)
-                    self.log("[导航] 卡住, 侧移脱困")
-                    if abs(dx) >= abs(dz):
-                        key = self._key("W" if dz > 0 else "S")
-                    else:
-                        key = self._key("D" if dx > 0 else "A")
-                    key_down(key)
-                    time.sleep(0.35)
-                    key_up(key)
-                    time.sleep(0.1)
-                    stuck = 0
-                    continue
+                    self.kb.release_all()
+                    self.log(f"[导航] ✗ 这一格推不过去 (~{x:.1f},{z:.1f}) —— "
+                             f"记下它, 中止这一趟让外层带新禁行格重规划")
+                    return False
 
                 # ☠ **迈步之前先探一下"下一步那格"** —— 这是"直接走进水里"的根因(用户实机指出:
                 #   "**没有按地图的可达图移动，直接去水里了**")。
@@ -950,13 +1034,29 @@ class Engine:
                 self.log("[朝向] 目标方向是危险格, 不转身")
                 return False
 
-        d = dir_for_step(dx, dz, deadzone=0.02)
-        if not d:
-            return True
-        key = self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])
-        key_down(key)
+        # ☠ **斜方向要两个轴一起按**（2026-09-15 用户指出"**应该是往左上方丢**"）:
+        #   面朝方向 = 它**最后一次移动的方向**, 而 `dir_for_step` 只给**单轴** ⇒
+        #   原来这里只能做出正左/正右/正上/正下四种朝向。目标在斜方向时**差 45°** ——
+        #   投掷按朝向飞 6 格, 45° 的偏差 = 横向偏出 **4.2 格**, 等于丢到隔壁去了。
+        #   (实测: 黄瓜该往左上(菜板)丢, 飞出去的却是另一个方向。)
+        #   两个键同时按 ⇒ 虚拟手柄的摇杆落到那个斜角 ⇒ 朝向就是斜的 ✓。
+        #   ⚠ 死区按**比例**取: 目标几乎正对着某个轴时只按那一根, 免得为了 2° 之差去抖两个轴。
+        dead = max(0.05, 0.12 * dist)
+        keys = []
+        if abs(dx) > dead:
+            keys.append(self._key("D" if dx > 0 else "A"))
+        if abs(dz) > dead:
+            keys.append(self._key("W" if dz > 0 else "S"))
+        if not keys:                      # 两轴都在死区内(几乎在正上方/正右方这种)
+            d = dir_for_step(dx, dz, deadzone=0.02)
+            if not d:
+                return True
+            keys = [self._key({"left": "A", "right": "D", "up": "W", "down": "S"}[d])]
+        for k in keys:
+            key_down(k)
         time.sleep(hold)
-        key_up(key)
+        for k in keys:
+            key_up(k)
         time.sleep(0.08)
         return True
 
@@ -1064,9 +1164,19 @@ class Engine:
             r = getattr(d, "last_direct", None)
             if not r:
                 return ""
-            return ("\n         直调那一趟: ok=%s method=%s target=%r pick=%r place=%r"
+            # `placeCanHandle` = **游戏自己说**"这个台面此刻收不收手里的东西"
+            # (C# 侧 `InteractDirect.PlaceCanHandle`, 复现 `PlaceHeldItem_Server` 里
+            # 那次 `CanHandlePlacement`; 拿不到答案就是 None)。有它就能一眼分开:
+            #   · `placeCanHandle=false` ⇒ 站位/朝向对、名字也对, 但**游戏就是不收**
+            #     (锅在煮/盘子满/台面类型不对) —— 再挪站位也没用
+            #   · `placeCanHandle=true` 却仍然失败 ⇒ 问题在**后面**(消息链/容器判据)
+            # `placeCanHandleBefore` = **强制刷新那行之前**的同一个判决。两者不同就说明
+            # `UpdateNearbyObjects()` 确实在改放置判决(见 `InteractDirect` 里那段悬案注释)。
+            return ("\n         直调那一趟: ok=%s method=%s target=%r pick=%r place=%r "
+                    "placeCanHandle=%s (刷新前=%s)"
                     % (r.get("ok"), r.get("method"), r.get("target"),
-                       r.get("pick"), r.get("place")))
+                       r.get("pick"), r.get("place"), r.get("placeCanHandle"),
+                       r.get("placeCanHandleBefore")))
         except Exception:
             return ""
 
@@ -1100,10 +1210,23 @@ class Engine:
         `claim=False` —— **只读模式**: 算出来但不写 `_assemble_sid`、不在黑板上占位。
         评分层给候选打分时要**替队友**也算一遍目标, 那种调用绝不能以我的 cid 占走台面。
         """
-        allc = [s for s in (km.of("counter") or km.of("board"))
+        _raw = [s for s in (km.of("counter") or km.of("board"))
                 if not s.spawn and s.kind != "CookingStation"]
+        # **放不下东西的台面先别挑**(用户: "返回到其他路")。见 `PLACE_SENTINEL`:
+        # 这条记的是"这个台面接不住放置", 和材料名无关。
+        # ☠☠ **但全被划掉时必须退回不过滤的那份** —— 返回 None 是"整局卡死"的命门
+        #   (见 `_prepare_plate` 那段的注释): 没有摆盘位 ⇒ `assemble` 永远 `-inf`
+        #   ⇒ 手里那份料再也放不下去, 一路等到 `IDLE_WAIT`。宁可去试一个已知不好的台面
+        #   (规则 5 的老话: 宁可做错也别让死)。
+        allc = [s for s in _raw if self._branch_ok(PLACE_SENTINEL, s.id)] or _raw
         if not allc:
             return None
+        # **队友正用着的台面先排后面**(用户实机: "这个盘子被我用了, 脚本就会卡住")。
+        # 全被占着时不动 `allc` —— 和 `_pick_board` 的兜底同理, 宁可去挤也别没有。
+        _mate = self._mate(self.state())
+        _free = [s for s in allc if not self._mate_near(s, _mate)]
+        if _free:
+            allc = _free
         with_plate = [s for s in allc if self._has_plate(s)]
 
         # 先认上一次用的那个 —— 按 id 到**新鲜的 km** 里取, 保证 `.on` 不是陈旧快照
@@ -1116,7 +1239,9 @@ class Engine:
         if self._assemble_sid:
             prev = km.stations.get(self._assemble_sid)
             if prev is not None:
-                if self._has_plate(prev) or not with_plate:
+                # ⚠ **队友正在用那个台面时不许"守旧"** —— 整局粘住 + 人类占用 = 卡死
+                #   (用户实机: "这个盘子被我用了, 脚本就会卡住")。让他一下, 去挑别的。
+                if not self._mate_near(prev, _mate) and (self._has_plate(prev) or not with_plate):
                     return prev
             elif claim:
                 self._assemble_sid = ""    # 台面没了(换关/被拆) → 重新挑
@@ -1495,6 +1620,24 @@ class Engine:
         g, w = self._norm(got), self._norm(want)
         return bool(g) and (g == w or w in g or g in w)
 
+    def _fresh_station_name(self, spot) -> str:
+        """按 **id** 到**新鲜**的 km 里取这个台面的当前名字(带实例号)。
+
+        ⚠ 不能直接用 `spot.name`: `self.assemble_spot` 可能是几百毫秒前的快照,
+          而实例号在物体被销毁/重建后会变 —— 拿旧名字去做**精确比**会永远对不上,
+          比"宽松比"更糟(那会把每一步都卡死)。取不到就退回旧名字。
+        """
+        try:
+            st = self.state()
+            km = self.map(st) if st else None
+            if km is not None:
+                now = km.stations.get(getattr(spot, "id", ""))
+                if now is not None and getattr(now, "name", ""):
+                    return now.name
+        except Exception:                                         # noqa: BLE001
+            pass
+        return getattr(spot, "name", "") or ""
+
     def _align_for_place(self, spot, tries: int = 8) -> bool:
         """朝 `spot` 挪到**游戏说"放置目标就是它"**为止。返回是否对齐。
 
@@ -1509,7 +1652,7 @@ class Engine:
              拿格心距离比根本没有可比性)。
         """
         from bridge.keyboard_input import key_down, key_up
-        want = getattr(spot, "name", "") or ""
+        want = self._fresh_station_name(spot)
         if not want:
             return True                      # 不知道期望名字时只能放行(老 dll)
         for k in range(tries):
@@ -1517,7 +1660,15 @@ class Engine:
             if not st or not st.get("inRound"):
                 return False
             ph = (self.chef(st) or {}).get("placeh") or ""
-            if self._name_is(ph, want):
+            # ☠☠ **这里必须精确比(连实例号一起), 不能用 `_name_is`** —— 实测 `s_sushi_1_3`:
+            #   `placeh='countertop_01_standard_wood'`(裸名) 而我们期望 `'(2)'`,
+            #   而 `_name_is` 的规则是"**只有一方带编号时**退化成归一化比" —— 于是判"对上了",
+            #   按下去 → 游戏 `placeCanHandle=False`(那个台面不是有盘子的那个) →
+            #   材料放不进去 → 重试 3 次全一样 → **整单放弃**。
+            #   那条宽松规则是为"计划里写裸名"留的; 而**放置目标两侧的名字都来自游戏自己**
+            #   (`go.name` 对 `go.name`) ⇒ "一方没编号"只可能是**两个不同的物体**
+            #   (同类型台面里第一个叫裸名、第二个叫 `(2)`) ⇒ 编号就是身份。
+            if ph and ph == want:
                 return True
             cx, cz, _ = self.pos(st)
             if cx is None:
@@ -1696,17 +1847,24 @@ class Engine:
         for s in km.stations.values():
             if exclude_ids and s.id in exclude_ids:
                 continue
-            for o in s.on:
+            # ⚠ 要**下标**: 下面判"是不是容器"要拿 `tag_of(i)`(tag 是**按格位**给的)
+            for i, o in enumerate(s.on or []):
                 on = self._norm(o)
                 if not on:
                     continue
                 if on == tn:
                     exact.append(s)
                     break
-                # 子串也要认: 订单说的容器是 "Plate", 场景里的实例却叫 "equipment_plate_01"
-                if tn in on or on in tn:
-                    loose.append(s)
-                    break
+                # 子串兜底**只给容器**: 订单说的容器是 "Plate", 场景里的实例却叫 "equipment_plate_01"。
+                # ☠☠ **食材绝不许子串匹配** —— 加工阶段改的**正是名字**:
+                #   `SushiPrawn` → `ChoppedSushiPrawn`, 而 "sushiprawn" 是它的子串 ⇒
+                #   `fetch SushiPrawn`(要**生的**)会把板子上**切好的**认成货源 ⇒
+                #   抓到手 → 校验"不是它" → 放回去 → 重试 3 次 → 放弃整单。
+                #   (实测 2026-09-15 用户: "**如果板子上已经是切好的，脚本就会卡住**"。)
+                if is_plate(o, s.tag_of(i)) or is_pot(o, s.tag_of(i)):
+                    if tn in on or on in tn:
+                        loose.append(s)
+                        break
         best = exact or loose
         if not best:
             return None
@@ -1752,35 +1910,16 @@ class Engine:
         return bool(pred(it)) if pred is not None else True
 
     def _unclaimed_items(self, km) -> list:
-        """**没主的**料 —— 不在任何台面上、也不在任何厨师手上的那些(掉地上的/被丢出来的)。
+        """**没主的**料 —— 掉地上的/被丢出来的那些(不在任何台面上、也不在任何厨师手上)。
 
-        ☠ **不能直接用 `km.unseen_items()`**: 它是按**名字**算的
-          (「`items` 里有没有哪个名字没在台面/手上出现过」), 而这里要的是**按件**:
-          台面上放着一块 Chocolate、地上**另外**掉着一块 Chocolate —— 两个东西,
-          按名字去重会把地上那块一起吞掉(实测就是这么漏的)。
-          ⇒ 改成**按位置认领**: 台面/厨师报出的东西只认领"就在它那个位置"的那一件。
+        ☠ 判据**只有一份**: 就是 `map_model.KitchenMap.unseen_items()`
+          (2026-09-15 从这儿挪过去的 —— 原来这儿和 `mapview` 各写一份, 结果
+           `mapview` 那份是**按名字**算的: 台面上有一块 `SushiFish`、地上另外躺着三条时,
+           名字出现过 ⇒ 地上那三条被一起吞掉 ⇒ 报告说"看不见 0 件"(假的),
+           而用户正是靠那个报告判断"脚本看不见地上的料")。
+          挪过去之后两边同源, 谁也不会再各错各的。
         """
-        claimed = []                      # (归一化名, x, z)
-        for s in km.stations.values():
-            for i, o in enumerate(s.on or []):
-                claimed.append((self._norm(o), s.x, s.z))
-                for part in (s.has_of(i) or "").split("+"):
-                    if part.strip():
-                        claimed.append((self._norm(part), s.x, s.z))
-        for c in km.chefs:
-            if getattr(c, "held", ""):
-                claimed.append((self._norm(c.held), c.x, c.z))
-        out = []
-        for it in km.items:
-            n = self._norm(getattr(it, "name", ""))
-            if not n:
-                continue
-            ix, iz = float(getattr(it, "x", 0.0) or 0.0), float(getattr(it, "z", 0.0) or 0.0)
-            if any(cn == n and abs(cx - ix) < 0.9 and abs(cz - iz) < 0.9
-                   for cn, cx, cz in claimed):
-                continue                  # 有主了(在台面上 / 在某人手上)
-            out.append(it)
-        return out
+        return km.unseen_items()
 
     def _find_ground_item(self, km, target: str, x: float, z: float,
                           tm=None, reach=None):
@@ -1854,7 +1993,29 @@ class Engine:
             return None
         if x is None:
             return cands[0]
-        return min(cands, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
+        # ☠ **"最近"要按"走得到的步数", 不是直线距离**(用户 2026-09-15:
+        #   "地上的食材和箱子里的、台面上的**需要判断距离, 去距离最近的拿取**")。
+        #   直线 3 格但隔着一道墙 = 得绕 10 格, 而脚边那件可能只 2 步 —— 按直线比就会
+        #   挑中那个"看起来近、其实绕远"的, 表现成"**脚边有料却跑去开箱子**"。
+        #   `reach` 就是**从厨师出发的那张 BFS 步数表**(调用方已经算好了, 这里不再跑 BFS);
+        #   站位格和评分层用同一个 `_stand_cell_of` —— 两处判据必须是同一条。
+        # ⚠ 没有地形/步数表时**退回直线**: 那正是老行为, 不能因为拿不到数据就把候选全弄成 inf。
+        def _walk(s):
+            # ☠☠ **`reach` 可能是 set, 也可能是 dict —— 必须分开对待**。
+            #   `TerrainMap.reachable_from()` 返回 **set**(到不到得了),
+            #   `TerrainMap.distances_from()` 返回 **dict**(到那一格几步)。
+            #   两者在"够不够得着"那个判据里**通用**(都是 `c in reach`), 所以历史上
+            #   调用方各传各的、一直没出事 —— 直到这里要**排序**, 用了 `reach.get`
+            #   ⇒ `'set' object has no attribute 'get'` ⇒ **每次 fetch 都抛异常**,
+            #   重试 3 次 → 放弃 → 冷板凳 → 整局空转(2026-09-15 实机整整一局就这么废了)。
+            #   ⇒ 拿到 set 就**退回直线距离**: 它只答得了"到不到得了", 答不了"多远"。
+            if not isinstance(reach, dict) or tm is None or not getattr(tm, "ok", False):
+                return (s.x - x) ** 2 + (s.z - z) ** 2
+            cell = self._stand_cell_of(tm, s.x, s.z, x, z, ortho_only=True, reach=reach)
+            if cell is None:
+                return float("inf")
+            return reach.get(cell, float("inf"))
+        return min(cands, key=_walk)
 
     def _wait_for_item(self, target: str, x: float, z: float,
                        timeout: float = 20.0) -> Station | None:
@@ -1894,10 +2055,28 @@ class Engine:
             if self._norm(held) and self._norm(held) == self._norm(op.target):
                 self.log(f"[步骤] 手上已经是 {held!r} —— 这一步不用再跑一趟")
                 return True
-            self.log(f"[步骤] 手上还有 {held}, 先放到组装台面")
+            # ☠ **腾手: 加工好的进盘, 没加工完的丢脚下**(用户 2026-09-15 定的规矩):
+            #   > "**没有处理过的食材无法放在盘子上, 直接丢地上就好了**"
+            #   实测(`s_sushi_1_3`): 生 `SushiRice` 往"有盘子的组装台面"上放, 游戏判
+            #   `CanHandlePlacement=false` → `OnFailedToPlace` → **东西留在手上**;
+            #   而那次我们把"盘子内容变了"(其实是上一步的 seaweed)误判成成功 ⇒
+            #   后面 `fetch` 发现"腾不出手"→ 失败 → 重试 3 次 → 重新规划 → **同一个循环**,
+            #   一整局就这么烧掉(直调统计还是 hits=N fails=0, 因为直调**确实命中了**,
+            #   是游戏自己拒绝了 —— 判据在 `placeCanHandle`)。
+            #   ⇒ 先按老路试一次(加工好的料本来就该进盘, 那条路是通的),
+            #     **游戏不收就地丢下**: `direct("take")` → `ReceiveTakeEvent(target=null)`
+            #     → 游戏的 `carrier.TakeItem()` = **丢在脚下**。那份料留在原地, 之后要它再回来拿。
+            self.log(f"[步骤] 手上还有 {held}, 先腾出手")
             if not self.op_assemble(km, x, z, Op("assemble", held), st):
-                return False
-            _, _, held = self.pos(self.state() or {})
+                self.log(f"[步骤] {held} 进不了盘(多半是**没加工完**的料, 进不了盘子) "
+                         f"—— 按用户要求**直接丢脚下**")
+                try:
+                    self.bridge.direct("take", player=self._my_player_index(st))
+                except Exception as e:                           # noqa: BLE001
+                    self.log(f"[步骤] 丢下失败: {e!r}")
+                    return False
+                time.sleep(0.35)
+            _, _, held = self.pos(self.state(force=True) or {})
             # 组装台面那边"并盘"之后手上会剩一个空盘 —— 拿着它去货源台面按键,
             # 会把盘子放到货源上(实测: 盘子被丢到食材箱上, 然后一直在两个台面之间来回).
             if held and self._is_plate(held):
@@ -1928,7 +2107,11 @@ class Engine:
             _tm0 = self.terrain()
             _r0 = None
             if _tm0 is not None and _tm0.ok and cx is not None:
-                _r0 = _tm0.reachable_from(
+                # ⚠ **这里传 `distances_from`(dict), 不是 `reachable_from`(set)** ——
+                #   `_fetch_source_live` 现在要靠它**按步数挑最近**(用户要求"去距离最近的拿取"),
+                #   而 set 只答得了"到不到得了"。两者都是**同一次 BFS**、代价一样, 所以
+                #   这里换成更信息量的那个; `c in reach` 那几处判据对 dict 同样成立(查键) ✓。
+                _r0 = _tm0.distances_from(
                     cx, cz, at_y=self.chef_y(st),
                     extra_edges=self._travel_edges(km, _tm0))
             # ☠ **规则只有 `_fetch_source_live` 一份**(评分层调的是同一个):
@@ -1984,6 +2167,8 @@ class Engine:
         if live is not None and live.id.startswith("conveyor"):
             self.log(f"[步骤] {op.target} 在传送带上 @{live.id}({tx:.1f},{tz:.1f}), 站旁边等它过来")
             if self._grab_from_belt(km, op, x, z):
+                _g = self.pos(self.state(force=True) or {})[2]
+                self.log(f"[步骤] ✓ fetch 走**传送带**这条路成功, 手上={_g!r}")
                 return True
             return False
 
@@ -2008,6 +2193,11 @@ class Engine:
             self.log(f"[步骤] 拿到的是 {got!r}, 不是 {op.target!r} → 放回去")
             self.interact("pickup", verify_hold_change=False)
             return False
+        # ⚠ **报成功时必须说清手上到底是什么** —— 实机 2026-09-15 出现过
+        #   `✓ fetch SushiFish` 而下一步 `手持''` 的**假成功**, 整条链就此断掉。
+        #   `op_fetch` 有三个 `return True`(手上已经是它 / 传送带 / 这里), 不打这一行
+        #   就分不清是**哪条路**报的成功 —— 和当初钉 `op_chop` 假 ✓ 是同一招。
+        self.log(f"[步骤] ✓ fetch {op.target} 成功, 手上={got!r}")
         return True
 
     # ---------------- 传送带拦截 ----------------
@@ -2077,7 +2267,6 @@ class Engine:
             return None
         ci, cj = cell
         belt_speed = max(0.1, self._belt_speeds_cache.get(cell, self.BELT_SPEED))
-        cell_len = abs(tm.cellx) or 1.2
 
         for k in range(1, 10):
             ti, tj = ci + step[0] * k, cj + step[1] * k
@@ -2095,7 +2284,15 @@ class Engine:
                 continue
             dist = ((spot[0] - cx) ** 2 + (spot[1] - cz) ** 2) ** 0.5
             t_chef = dist / self.CHEF_SPEED_DASH        # 用冲刺速度估, 偏乐观一点
-            t_item = (k * cell_len) / belt_speed
+            # 依据(`ConveyorStation.m_conveySpeed` 的单位是**格/秒**, 不是世界单位/秒):
+            #   · `ServerConveyorStation.cs:192` `m_arriveTime = now + 1f / GetConveySpeed()`
+            #     ⇒ 传一格耗时 `1/speed` 秒
+            #   · 插件侧也是按这个单位报的: `InteractiveScan.cs:231-233,276`
+            #     (`cellsPerSecond = true`, 取的字段就是 `m_conveySpeed`)
+            # ⇒ 走 k 格 = `k / speed` 秒。**不能再乘格长** —— 那是把它当"世界单位/秒"了,
+            #   会把 t_item 放大 1.2 倍(cellx), 把其实赶不上的格子判成"赶得上",
+            #   拦截点选到厨师到不了的地方。
+            t_item = k / belt_speed
             if t_chef <= t_item + 1.2:                  # 留 1.2 秒余量
                 return (spot, (wx, wz), max(0.0, t_item - t_chef))
         return None
@@ -2130,7 +2327,19 @@ class Engine:
 
             d = ((live.x - cx) ** 2 + (live.z - cz) ** 2) ** 0.5
             if d <= 1.5:
-                self.face(live.x, live.z)      # 朝它**当前**位置转身(只认前方 180°)
+                # ☠☠ **不能只 `face` 一下就按 —— 要先"就地微调"到游戏确认够得着**
+                #   (2026-09-15 用户: "**我发现脚本不会拿地上和传送带上的食材**")。
+                #   小东西(地上的/带子上的)碰撞体小: 站在**相邻格心**时(格距 1.2),
+                #   到**碰撞体表面**的距离可能刚好在半径 1.0 之外, 或者落在
+                #   "前方 180°"那个判据的边界上 ⇒ 游戏直接报 `抓取='(空)'`。
+                #   台面能拿是因为**柜台碰撞体大**(站相邻格就贴到表面) —— 这一条差别
+                #   就是"台面拿得到、地上的/带子上的拿不到"的根源。
+                #   实测(`s_moonfestival_1_4`): 厨师(2.6,-7.0) 巧克力(2.4,-6.0) 距 1.02,
+                #   游戏报 `抓取='(空)'`, 干等 14 秒后那件东西**被送进了垃圾桶**。
+                #   地上/箱子那两条路本来就过 `_approach`(它的微调会一直挪到游戏说能作用
+                #   为止), 所以地上那次成功是"距 0.73 格"—— **比一格还近**。只有传送带
+                #   这条绕过了它, 这里补上同一套。
+                self._approach(km, live.x, live.z, tight=0.5, want=op.target)
                 if self.interact("pickup", verify_hold_change=True):
                     # interact 只判"手上有没有变"，不判"是不是目标"。传送带上一格
                     # 一格连着好几个食材，手伸过去很可能抓到旁边那一个(SushiPrawn
@@ -2241,7 +2450,7 @@ class Engine:
         """**我(本地这只厨师)现在在遥感驾驶吗?** 是则返回那个控制台工位, 否则 None。
 
         为什么非知道不可: 不知道就会**把平台当厨师开** ——
-          `navigate()` 发的移动键全落到平台上; 卡住检测判"厨师卡住"→ 侧移脱困 → 更乱。
+          `navigate()` 发的移动键全落到平台上; 卡住检测判"厨师卡住"→ 中止→重规划 → 更乱。
           而且**退出用的正是交互键**, 所以会话中调 `interact()` 等于踩刹车。
         """
         for s in ((st or {}).get("layout") or {}).get("stations") or []:
@@ -2636,7 +2845,7 @@ class Engine:
         为什么不能用 `navigate()`:
           · 门那一格在地形上是**障碍**(`teleport_edges` 的注释写着"边必须经过门自己那格"),
             所以"走到目标附近"这个判据**永远不成立** —— 人顶在门上被判 `stuck>=8`,
-            侧移脱困反复几次, 把 `step_timeout` 白耗光
+            一次次被判"卡住"→中止, 把 `step_timeout` 白耗光
           · 更糟的是 `navigate()` 只判"没动"(`abs(x-last)<0.05`), **不判位置跳变** ——
             被传到对岸之后它还在朝原方向走, 可能掉头走回出口那扇门**被再传回来**
 
@@ -2773,7 +2982,7 @@ class Engine:
 
         为什么让引擎"学这一课": C# 的物理阻挡是**探针球采样**出来的(`LevelInfo.BlockedBy`),
         会漏格; 漏掉的格在 A* 眼里是 `.` ⇒ 每次规划都从那儿走、每次都撞住
-        (`卡住→侧移脱困→超时(还差 1.0 格)`), **而且下一轮还走同一条路**。
+        (`卡住→超时(还差 1.0 格)`), **而且下一轮还走同一条路**。
         用户原话: "寻路…还是有很大的问题" —— 这就是其中一类:
         **地图和物理打架时, 引擎以前只会硬撞, 不会记住。**
 
@@ -2935,7 +3144,30 @@ class Engine:
                         continue
                     x, z = px, pz
                     continue
-                if not self.navigate(px, pz, arrive=0.9, step_timeout=6.0):
+                # ☠ **超时必须随距离走**。以前每个路点只有相邻一格(1.2u ≈ 0.33s),
+                #   写死 6 秒是 18 倍余量; 而 `find_path` 现在会**拉直路径**
+                #   (视线裁剪), 一个路点可能跨十几格 —— 17u 按 `self.speed`(3.6 u/s)
+                #   要走 4.7 秒, 6 秒只剩 1.3 倍, 路上再被顶一下/等个门就判"到不了",
+                #   而那个点往往**就是唯一那个点**, 跳过去等于这条路白规划。
+                #   按运动学给: 位移/有效速度 × 2.5 倍余量 + 2 秒(起步/转身/状态读取的开销)。
+                _seg = ((px - x) ** 2 + (pz - z) ** 2) ** 0.5
+                _budget = max(6.0, _seg / max(1.0, self.speed) * 2.5 + 2.0)
+                _blk0 = len(self._blocked)
+                if not self.navigate(px, pz, arrive=0.9, step_timeout=_budget):
+                    # ☠☠ **这一趟里学到新的"过不去"格子 ⇒ 立刻重规划, 不要"继续下一个"**
+                    #   (2026-09-15 实机: 一次导航把同一面墙撞了 **5 遍**, 每遍都记一次
+                    #    `记下「这一格过不去」(19,9)`, 然后超时 —— 一共白烧十几秒)。
+                    #   为什么"继续下一个"救不了: 剩下那些路点是**同一条路**上的点,
+                    #   撞墙的那格还在它们中间; 而学到的禁行格只有**规划时**才会被
+                    #   `_dynamic_blocks` 并进 A* 的禁行集(见 `_note_blocked`)。
+                    #   ⇒ 地图知识变了, 剩下那些路点就都不可信了 —— 跳出内层, 让外层
+                    #     `for attempt in range(replans+1)` 拿着**新禁行格**重新规划。
+                    #   ⚠ 没学到新格子时仍然"继续下一个"(老行为): 那种失败多半是
+                    #     路点本身不好(原生路径的末点卡在台子碰撞体边缘), 跳过去是对的。
+                    if len(self._blocked) > _blk0:
+                        self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 撞到地图上看不见的障碍 "
+                                 f"—— **带上新禁行格重规划**(不再沿原路硬撞)")
+                        break
                     self.log(f"[导航] 路径点 ({px:.1f},{pz:.1f}) 到不了, 继续下一个")
                     continue                       # 跳过去, 别把整条路径判死
                 x, z = px, pz
@@ -2958,7 +3190,19 @@ class Engine:
                     ok = self.navigate(tx, tz, arrive=1.4, tight=tight)
             if ok:
                 self.face(tx, tz)
-            return ok
+                return True
+            # ☠☠ **失败要真的重规划, 不能直接判死** —— 这个循环本来就叫 `replans`,
+            #   docstring 也写着"失败就重新规划", 可这里原来写的是 `return ok`:
+            #   **第一次就返回**, 于是 `replans=3` 从来没生效过(循环体只跑一次, 那个
+            #   `for attempt` 形同虚设)。实测(`s_sushi_1_3` 那次切鱼): 一趟导航把同一面墙
+            #   撞了 5 遍、超时, 然后就放弃了 —— 没有任何一次"带着新知识重新规划"。
+            #   ⇒ 现在失败就再来一轮; 而**重规划是有信息增量的**(不是盲目重试):
+            #     这一趟里撞到过的格子已经记进 `_blocked`(见 `_note_blocked`),
+            #     下一轮的 `_dynamic_blocks` 会把它并进 A* 的禁行集 ⇒ 绕开它走。
+            #     `attempt > 0` 时还会 `terrain(force=True)` 重取地图(荷叶/按钮/火会改地形)。
+            if attempt < replans:
+                self.log(f"[导航] 这一趟没到 ({tx:.1f},{tz:.1f}) —— "
+                         f"带上新禁行格重规划(第 {attempt + 2}/{replans + 1} 次)")
         return False
 
     def _game_path(self, tx: float, tz: float) -> list:
@@ -3107,6 +3351,48 @@ class Engine:
         has = [h for h in (s.onhas or []) if h]
         return "%s%s" % (on, ("〔%s〕" % ",".join(has)) if has else "") or "(空)"
 
+    def _pick_board(self, km, x: float, z: float, target: str = ""):
+        """挑一块**"这块料放得上去"**的切菜板(离厨师最近的优先)。
+
+        ☠ 原来两处都写 `km.nearest("board", …)` —— **只看最近那块**。它被别人的东西占着时
+          `chop` 就判"别白切", 可场上**不止一块板** ⇒ 整条链卡死
+          (实测 2026-09-15 用户: "**如果板子上已经是切好的，脚本就会卡住**")。
+
+        优先级: ① 已经放着 `target` 的(走过去就能切) → ② **空板**(把料放上去切) → ③ None。
+        ⚠ **③ 就是"没有"**, 不要退而求其次挑一块被占着的 —— 那样只会白跑一趟再失败
+          (见 `op_chop` 的"别白切"注释: 按十几刀、板上一点没变)。
+        """
+        mate = self._mate(self.state())      # 队友的坐标也在这张图上(见 `_mate_near`)
+        best, best_key = None, None
+        fallback, fallback_key = None, None  # 被队友占着的那块 —— 兜底用
+        for s in (km.of("board") or []):
+            on = list(getattr(s, "on", None) or [])
+            if target and any(self._held_is(o, target) for o in on):
+                pri = 0
+            elif not on:
+                pri = 1
+            else:
+                continue                  # 占着别的东西 → 这块用不了
+            # **这一支刚试过、不行** → 换一块(用户: "按一次没结果这条路就失败了,
+            # 可以**返回到其他路**")。⚠ 只在**板**这一维上划掉 —— 见 `BRANCH_TTL`:
+            # 记在动作上会让一块板走不到就把所有板封掉。
+            if not self._branch_ok(target, s.id):
+                continue
+            d = (s.x - x) ** 2 + (s.z - z) ** 2
+            key = (pri, d)
+            # ☠ **队友正站在这块板旁边 ⇒ 他正在用它, 别去排队**(用户实机指出的)。
+            #   记下来当兜底, 但先不挑 —— "换一块板"比"走过去挤"便宜得多。
+            if self._mate_near(s, mate):
+                if fallback_key is None or key < fallback_key:
+                    fallback, fallback_key = s, key
+                continue
+            if best_key is None or key < best_key:
+                best, best_key = s, key
+        # ☠ **全被队友占着时退回兜底** —— 否则"唯一一块板有人正在用"会变成
+        #   `chop` 不可达 ⇒ 整条链卡死, **比排队更糟**(规则 5)。
+        #   和 `_branch_ok` 那个"全划掉就退回不过滤"是同一个道理。
+        return best if best is not None else fallback
+
     def op_chop(self, km, x, z, op: Op, st: dict) -> bool:
         """在切菜板上把东西切到完成。
 
@@ -3116,16 +3402,28 @@ class Engine:
         完成判定优先看"板上的东西名字变了"(完成时 GameObject 会被 m_nextPrefab 替换),
         比字符串猜名字可靠 —— 生料名往往就包含成品名(CucumberWhole ⊃ Cucumber)。
         """
-        board = km.nearest("board", x, z)
+        board = self._pick_board(km, x, z, op.target)
         if board is None:
-            self.log("[步骤] 没有切菜板(Workstation)")
+            # ⚠ 说清是"没有"还是"都被占着" —— 后者是"等腾出来/换一块"的问题, 不是关卡没板
+            _allb = km.of("board") or []
+            self.log("[步骤] 没有**能用的**切菜板" +
+                     ("(场上 %d 块都被别人的东西占着)" % len(_allb) if _allb
+                      else "(这关没有 Workstation)"))
             return False
         _, _, held = self.pos(st)
         self.log(f"[步骤] 去 {board.id} 切 → {op.target}")
+        # ⚠ **走不到 / 对不齐都算"这一支不行"** —— 用户 2026-09-15: "按一次没得到对应的
+        #   结果这条路就失败了, 可以**返回到其他路**"。实测日志里那两条正是这样:
+        #     `[导航] ✗ 这一格推不过去 (~20.4,-6.2)` → `走不到 ChoppingBoard_Side 5 (4) 旁边`
+        #   处置不是原地重试(还是撞同一面墙), 而是把**这块板**划掉、换一块再选。
         if not self.navigate_smart(km, board.x, board.z, tight=0.8):
+            self._last_fail_kind = KIND_BRANCH
+            self.mark_branch_dead(op.target, board.id, "走不到旁边")
             return False
         self.face(board.x, board.z)
         if not self._align_for_place(board):     # 见 _align_for_place: 挨得近会判到旁边台子
+            self._last_fail_kind = KIND_BRANCH
+            self.mark_branch_dead(op.target, board.id, "对不齐台面")
             return False
         if held:
             self.interact("pickup", verify_hold_change=False)   # 先放上板
@@ -3143,13 +3441,53 @@ class Engine:
         if base and not self._held_is(base, op.target):
             self.log(f"[步骤] ✗ {board.id} 上是 {base!r}, 不是要切的 {op.target!r} —— "
                      f"别白切(先把它处理掉/换个板)")
+            self._last_fail_kind = KIND_BRANCH
+            self.mark_branch_dead(op.target, board.id, f"板上是 {base}")
             return False
         self.log(f"[步骤] 需切 {max_chops} 刀" + (f" (板上: {base})" if base else ""))
 
+        # ☠☠ **"按下去"必须有回执, 不能只数次数** —— 实机 2026-09-15 打回来的一整局:
+        #   `base` 为空时下面那条兜底会"按满刀数就当切完" ⇒
+        #     `需切 7 刀`(没有板名那一截) → `直调 use 失败: 身边没有可互动的东西` ×7 → `✓ chop`
+        #   那 7 下**一下都没落到板上**: 板是**空的** ⇒ 游戏的 `m_interactable` 是 null
+        #   ⇒ `use` 没有目标 ⇒ 纯空按。
+        #   ⚠ `_align_for_place` 通过**不代表**有活可干 —— 它看的是 `placeh`("**能往这儿放**"),
+        #     和"这上面**有东西可切**"是两件事; 实测那两次它都通过了。
+        #   代价不是白按三秒: `chop` 这一步**销了号**(`_execute_scored` 把下标从 `pending` 去掉),
+        #   手里的料也一块丢了 ⇒ 后面的 `assemble` 永远 `不可达(手空, ...)` ⇒ **整局空转**
+        #   (第一份日志里"只剩 assemble/deliver 两个都手空"就是这么来的)。
+        #   ⇒ 判据改成"要有回执", 二选一:
+        #     ① 板上的东西**换了名字**(`base` 非空时走上面的分支);
+        #     ② 游戏自己说 `use` **作用得到这块板**(`m_interactable` 非空且就是它)。
+        #   一个都没有 ⇒ 这一刀根本没落下去, **不许报成功**。
+        _want_board = self._norm(getattr(board, "name", ""))
+
+        def _board_workable() -> bool:
+            """游戏自己说「`use` 作用得到**这块板**」吗 —— 这是"这一刀落得下去"的唯一回执。"""
+            _u = self.interaction_targets(self.state(force=True))[1]
+            return bool(_u) and (not _want_board or self._norm(_u) == _want_board)
+
+        # ⚠ **读不到板名时, 那条"按刀数收工"的兜底必须有个前提**: 游戏说这板上有活可干。
+        #   不是的话它就是块**空板**, 按下去是纯空按 —— 所以**先问再按**, 别把十来下
+        #   烧在这儿(实机那次就是这么白按了 7 下)。先停手重问一次(同 `_approach` 的
+        #   做法: 按键的按下状态会影响 `m_interactable`), 还不行就立刻收手。
+        if not base and not _board_workable():
+            self.kb.release_all()
+            time.sleep(0.25)
+            if not _board_workable():
+                self.log(f"[步骤] ✗ {board.id} 上读不到要切的 {op.target!r}, 而游戏说 "
+                         f"`use` 作用不到它 —— 这块板是空的, 这一趟**没活可干**(不白按)")
+                self._last_fail_kind = KIND_BRANCH
+                self.mark_branch_dead(op.target, board.id, "板是空的")
+                return False
+
+        landed = 0
         done = False
         for i in range(max_chops + 3):
             if not self.round_active():
                 return False
+            if _board_workable():
+                landed += 1
             self.kb.chop()
             time.sleep(0.35)
             cur = self._board_item(board.id)
@@ -3157,15 +3495,33 @@ class Engine:
                 self.log(f"[步骤] 切好了({i+1} 刀): {base} → {cur}")
                 done = True
                 break
-            if not base and i + 1 >= max_chops:
-                done = True   # 读不到板上的名字, 按刀数收工
+            if not base and landed and i + 1 >= max_chops:
+                done = True   # 读不到板上的名字, 按刀数收工(**但要有回执**)
                 break
         if not done:
-            # ClientWorkableItem 完成时会替换板上的物件。若名字仍未变化，说明
-            # use 没有送到游戏；把生料拿回手里不能算切菜完成。
-            self.log("[步骤] ✗ 切完但板上物品没有变化，拒绝把生料当成成品")
+            if not landed:
+                self.log(f"[步骤] ✗ 按了但**一下都没落到 {board.id} 上**"
+                         f"(游戏说 use 作用不到它) —— 多半是这块板**空的**; "
+                         f"不把「原地空按」当成切好了")
+            else:
+                # ClientWorkableItem 完成时会替换板上的物件。若名字仍未变化，说明
+                # use 没有送到游戏；把生料拿回手里不能算切菜完成。
+                self.log("[步骤] ✗ 切完但板上物品没有变化，拒绝把生料当成成品")
+            # 这一类 = **这块板这一趟办不成** ⇒ 换一块, 别原地重试(用户: "返回到其他路")。
+            self._last_fail_kind = KIND_BRANCH
+            self.mark_branch_dead(op.target, board.id, "切不动")
             return False
-        return self.interact("pickup", verify_hold_change=True)
+        # ⚠ **收尾那一下必须是「拿起」, 不能是「放下」** —— `verify_hold_change` 的判据是
+        #   "持有物变了没有", 而**放下也会让它变** ⇒ 原来对着空板按一下就把手里的料
+        #   丢在那儿, 却报 `✓`(实机日志里 `✓ chop` 的**下一格**就是 `assemble 手空`)。
+        if not self.interact("pickup", verify_hold_change=True):
+            return False
+        _, _, _held_after = self.pos(self.state(force=True) or {})
+        if not _held_after:
+            self.log("[步骤] ✗ 切完收尾那一下把手里的料**放下去了**(收工时手是空的) —— "
+                     "这不是「拿起」, 判失败")
+            return False
+        return True
 
     def op_cook(self, km, x, z, op: Op, st: dict, flow: DishFlow = None) -> bool:
         """把东西放上灶台, 盯到"刚熟"立刻取下(生和焦都不算)。
@@ -3705,15 +4061,28 @@ class Engine:
         return out
 
     def _ensure_plate(self, km: KitchenMap, x: float, z: float, spot: Station) -> bool:
-        """摆盘位上一个盘子都没有时, 才真去拿一个放上来(正常情况台面上本来就有)。"""
-        src = self._find_item_station(km, "Plate", x, z)
-        if src is None:
-            spots = km.of("plates")
-            if spots:
-                src = min(spots, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
-        if src is None:
-            self.log("[步骤] 全场找不到盘子")
+        """摆盘位上一个盘子都没有时, 才真去拿一个放上来(正常情况台面上本来就有)。
+
+        ⚠ **来源有三处, 别只数两处**(2026-09-15): 原来是"台面上放着的" + "干净盘子堆",
+           **漏了"地上的盘子"** —— 而**地上的盘子是我们自己造出来的**(腾手时把东西
+           丢在脚下、放置失败掉在台面/地上)。漏掉它 ⇒ 一盘躺在地上、却没有一个"台面上的",
+           就报"全场找不到盘子" ✗。
+          `_find_ground_item` 返回的本来就是个**可导航的取货目标**(它自己有 id/坐标),
+          所以三种来源可以直接按距离比 —— 不必分等级。
+        """
+        from collections import OrderedDict as _OD
+        cands = _OD()
+        for s in (self._find_item_station(km, "Plate", x, z),
+                  self._find_ground_item(km, "Plate", x, z,
+                                         tm=self.terrain(), reach=None),
+                  min(km.of("plates") or [], key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2,
+                      default=None)):
+            if s is not None:
+                cands[getattr(s, "id", id(s))] = s
+        if not cands:
+            self.log("[步骤] 全场找不到盘子(台面上/地上/盘子堆都没有)")
             return False
+        src = min(cands.values(), key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
         self.log(f"[步骤] 摆盘位 {spot.id} 没盘子, 去 {src.id} 拿一个")
         if not self.navigate_smart(km, src.x, src.z, tight=0.8):
             return False
@@ -3844,8 +4213,26 @@ class Engine:
         """
         _, _, held = self.pos(st)
         if not held:
-            self.log("[步骤] 组装: 手上空, 跳过")
-            return True
+            # ⚠ **手空不能无条件当成功**。手空有两种来路:
+            #   ① 这一步本来就没什么可做(极少);
+            #   ② **上一次放置失败了, 材料已经被游戏丢掉/放到了别处** —— 这时报"跳过"
+            #      等于假装成功, 后面会端着空盘去煮饭/送餐, 整条链子白跑一整局。
+            # 所以判据是: **台面上那个盘子里确实已经有这一步要放的东西** 才允许跳过。
+            # 判据用 `_plate_contents_on`(插件读的 `onhas`), 和"并盘成功没有"用的是同一个
+            # 来源 —— 不猜、不按名字猜阶段。
+            want = self._norm(op.target or "")
+            spot0 = self.assemble_spot or self.pick_assemble_spot(km, x, z)
+            contents = self._plate_contents_on(spot0) if spot0 is not None else set()
+            if want and spot0 is not None and self._has_plate(spot0) and want in contents:
+                self.log(f"[步骤] 组装: 手上空, 但 {spot0.id} 那盘里已有 {op.target!r} → 跳过")
+                return True
+            if want:
+                self.log(f"[步骤] 组装: 手上空, 且盘里没有 {op.target!r}"
+                         f"(摆盘位={getattr(spot0, 'id', None)!r}, 盘里={sorted(contents)})"
+                         f" —— 判失败, 不假装成功")
+            else:
+                self.log("[步骤] 组装: 手上空, 且这一步没报材料名 —— 无从核对, 判失败")
+            return False
         holding_plate = self._is_plate(held)
         spot = self.assemble_spot
         if spot is None:
@@ -3853,6 +4240,18 @@ class Engine:
             if spot is None:
                 self.log("[步骤] 找不到摆盘位")
                 return False
+            self.assemble_spot = spot
+        # ☠☠ **按 id 到新鲜的 km 里重取一次** —— `self.assemble_spot` 是
+        #   **整局粘住的那个快照对象**(见 `pick_assemble_spot` "整局内粘住"那段),
+        #   它的 `.on`/`.onhas` **永远不会自己更新**: 盘子被端走之后读它还是"上面有盘子"
+        #   ⇒ 对着**空台子**按放置 ⇒ 游戏 `CanHandlePlacement=False` ⇒ 东西放不下去
+        #   (实测 2026-09-15 用户: "**这个地方的盘子我已经用过了, 但是没有更新掉,
+        #    还是在对着空台子使用**")。
+        #   ⚠ 同一个坑 `_skip_already_on_spot` / `_top_up_plate` / `_align_for_place`
+        #     都已经各自绕过一次了 —— 这里是最该有却一直没有的那一处。
+        _fresh = km.stations.get(spot.id) if km is not None else None
+        if _fresh is not None:
+            spot = _fresh
             self.assemble_spot = spot
         if holding_plate:
             self.log(f"[步骤] 手上端着盘子 {held!r} —— 直接放到 {spot.id}(不再另取盘子)")
@@ -3897,12 +4296,27 @@ class Engine:
             return False
         if not holding_plate and self._has_plate(spot):
             # 生料/成品放到"已经有盘子"的台面时, 游戏应自动把它并进盘子
-            # (PlacementContainer + IngredientToContainerBehaviour)。只看"手空了"
-            # 会漏掉"海带其实没进盘"这种情况 —— 后面煮饭去拿这盘会变成空盘。
+            # (PlacementContainer + IngredientToContainerBehaviour)。
+            #
+            # ☠☠ **"进了没"要看两件事, 而且两次读必须是同一时刻的**(2026-09-15 实机打回来的):
+            #   这一段原来只判"盘子内容变了没", 而 `before` 是从**可能陈旧的 `self.assemble_spot`**
+            #   读的、`after` 是从**刚取的新快照**读的 —— 前后差着几百毫秒。于是只要期间有
+            #   **任何别的变化**(上一步放的料还没反映进旧快照), `after != before` 就成立。
+            #   实测 `s_sushi_1_3` 的日志:
+            #       `✓ SushiRice 进了 counter12 那盘([] → ['seaweed'])`   ← 变化的是**上一步的 seaweed**
+            #       `⚠ 手上还有 SushiRice, 腾不出手来取料`                 ← 我们手上**根本还拿着它**
+            #   ⇒ **假成功**, 然后 `fetch` 那步发现手没空 → 失败 → 重试 → 整局循环烧掉。
+            #   这正是本项目记过两次的那类: "假'能'的代价是执行一个错的物理动作"。
+            #   ⇒ 现在两条都要: ① 我这份**离手了**; ② 盘子里**也确实变了**。
+            #      · 只判①(手空) → 漏掉"东西丢在台面上、没进盘"(最早那个 bug);
+            #      · 只判②(盘变) → 漏掉"东西还在手上"(这次这个)。
             st0 = self.state(force=True)
             placeh = (self.chef(st0) or {}).get("placeh") or ""
             self.log(f"[步骤] 放置目标游戏报={placeh!r} (期望 {spot.name!r} 或它的盘子)")
-            before = self._plate_contents_on(spot)
+            km0 = self.map(st0) if st0 else None
+            spot0 = (km0.stations.get(spot.id) if km0 is not None else None) or spot
+            before = self._plate_contents_on(spot0)          # ← 和下面那次读同一时刻
+            _, _, held_before = self.pos(st0) if st0 else (None, None, held)
             if not self.interact("pickup", verify_hold_change=False):
                 return False
             time.sleep(0.4)
@@ -3911,12 +4325,32 @@ class Engine:
             if km2 is not None:
                 spot2 = km2.stations.get(spot.id) or spot
                 after = self._plate_contents_on(spot2)
-                if after != before:
+                _, _, held2 = self.pos(st2) if st2 else (None, None, held)
+                if held2 != held_before and after != before:
                     self.log(f"[步骤] ✓ {held} 进了 {spot.id} 那盘"
                              f"({sorted(before)} → {sorted(after)})")
                     return True
-                self.log(f"[步骤] ✗ {held} 没进盘({sorted(before)} 没变), "
-                         f"盘子里是 {sorted(after)}")
+                if held2 == held_before:
+                    # ⚠ **这条路上必须打 `_direct_hint()`**: 直调命中了(`hits` 在涨)却还在手上,
+                    #   那说明游戏收到了 Place 事件但自己判了 `CanHandlePlacement=false`
+                    #   (`PlaceHeldItem_Server` 的反分支 → `OnFailedToPlace`, 东西留在手上)。
+                    #   探针里的 `placeCanHandle` 就是那个判决 —— 不打出来只能靠猜。
+                    self.log(f"[步骤] ✗ {held} **还在手上** —— 没放下去"
+                             f"(游戏报的放置目标={placeh!r}, 盘子里是 {sorted(after)})"
+                             + self._direct_hint())
+                else:
+                    self.log(f"[步骤] ✗ {held} 离手了但没进盘"
+                             f"({sorted(before)} → {sorted(after)}) —— 多半丢在台面上了")
+                # ☠ **这是"这一块台面放不下", 不是"这一单完了"**(用户: "返回到其他路")。
+                #   实测代价: `placeCanHandle=false` 连试 3 次 → `✗ 放弃: assemble`
+                #   → **整单报废** —— 而它只需要换个台面。所以:
+                #     ① 记 `PLACE_SENTINEL`(和材料名无关, 见那边的注释) ⇒ `pick_assemble_spot`
+                #        会把这块筛掉; ② 把**整局粘住的** `assemble_spot` 松开, 否则下一轮
+                #        还是认回它(`pick_assemble_spot` 的守旧分支)。
+                self._last_fail_kind = KIND_BRANCH
+                self.mark_branch_dead(PLACE_SENTINEL, spot.id, "游戏 placeCanHandle=false")
+                self.assemble_spot = None
+                self._assemble_sid = ""
                 return False
         return self.interact("pickup", verify_hold_change=True)
 
@@ -4029,7 +4463,20 @@ class Engine:
         if spot is None or self._has_plate(spot):
             return
         self.log(f"[步骤] 摆盘位 {spot.id} 还缺盘子 —— 趁手空补一个")
-        self._ensure_plate(km, *self.pos(st)[:2], spot)
+        if not self._ensure_plate(km, *self.pos(st)[:2], spot):
+            # ☠ **补不上就换台面, 别在这儿反复补** —— 用户实测原话:
+            #   "**还有盘子, 这个盘子被我用了, 脚本就会卡住**"。
+            #   盘子被人类端走/正拿在手上时, `_ensure_plate` 的三个来源(台面上/地上/盘子堆)
+            #   一个都找不到, 于是下一轮又跑一遍 `去 plates0 拿一个`, **原地打转**。
+            #   ⇒ 把这个台面划掉 + 松开粘住的 `_assemble_sid`, 下一轮 `pick_assemble_spot`
+            #     会挑**另一个**台面 —— 而 `with_plate` 那一路优先挑"本来就摆着盘子的",
+            #     多半直接就找着了。
+            #   ⚠ **有限期**(`BRANCH_TTL`): 人类会把盘子还回来, 到点这个台面自动回池。
+            #   ⚠ 这正是"地图驱动"的做法(用户 2026-09-15: "**人类的影响已经作用在地图上了**")
+            #     —— 不建模队友, 只按"这一步办不成"记账换路。
+            self.mark_branch_dead(PLACE_SENTINEL, spot.id, "补不上盘子")
+            self.assemble_spot = None
+            self._assemble_sid = ""
 
     def _prepare_plate(self, flow: DishFlow) -> bool:
         """开局(手还空着)先把摆盘位那个盘子备好。
@@ -4040,15 +4487,31 @@ class Engine:
         而"去拿盘子"必须**手是空的**才做得了 —— 手上拿着材料去盘子堆按交互,
         只会把材料放到盘子堆上(实测踩过)。
         拿不到不算致命: 大多数关卡台面上本来就摆着盘子, 这里只是兜底。
+
+        ☠☠ **摆盘位必须无条件挑出来 —— 这一句是整局的命门**(2026-09-15 实机打回来的一条)。
+           `0d100ec` 把这里的条件**写反了**(原来 `if not flow.plate:`, 被翻成 `if flow.plate:`),
+           后果不是"少补一个盘子", 而是**整局卡死**:
+             · `_op_target_for_score("assemble")` **只读** `self.assemble_spot`, 没挑出来就报
+               `不可达(还没挑摆盘位)` ⇒ 评分表里 assemble 永远是 `-inf`;
+             · `op_assemble` 里那段惰性补挑**得先被选中**才轮得到它 —— **鸡生蛋**;
+             · `_top_up_plate()` 开头又是 `if self.assemble_spot is None: return`, **一样救不了**。
+           实测(`s_sushi_1_3`): 虾切好之后连续 5 轮评分全是"assemble 不可达 + deliver 不可达",
+           手里那盘切好的虾放不下去, 一路等到 `IDLE_WAIT` 20 秒 —— **一整局白烧**。
+           ⇒ 所以下面**先挑位、先记下**, 再谈要不要补盘子。
         """
-        if flow.plate:
-            return True
         st = self.state()
         km = self.map(st) if st else None
         if km is None:
             return False
         _, _, held = self.pos(st)
         if held:
+            # ⚠ 手上有东西就补不了盘子(见 docstring), 但**摆盘位还是得挑出来** ——
+            #   否则这一整轮 assemble 又是不可达(上面的命门)。`_top_up_plate` 会在
+            #   每个 op 边界趁手空时补上。
+            if self.assemble_spot is None:
+                sp = self.pick_assemble_spot(km, *self.pos(st)[:2])
+                if sp is not None:
+                    self.assemble_spot = sp
             return True
         spot = self.pick_assemble_spot(km, *self.pos(st)[:2])
         if spot is None:
@@ -4056,8 +4519,198 @@ class Engine:
         self.assemble_spot = spot
         if self._has_plate(spot):
             return True
+        if not flow.plate:
+            return True                 # 这道菜不要求盘子 ⇒ 不补(摆盘位**已经记下了**)
         self.log(f"[步骤] 开局: 摆盘位 {spot.id} 上没有盘子, 先补一个")
-        return self._ensure_plate(km, *self.pos(st)[:2], spot)
+        if not self._ensure_plate(km, *self.pos(st)[:2], spot):
+            # 同 `_top_up_plate`: 补不上盘子 ⇒ 这个台面现在对我们没用, 换一个。
+            # (两处判据**必须一致** —— 一处换一处不换会来回抖。)
+            self.mark_branch_dead(PLACE_SENTINEL, spot.id, "补不上盘子")
+            self.assemble_spot = None
+            self._assemble_sid = ""
+            return False
+        return True
+
+    def _prep_and_toss(self, km, st, flow, op) -> None:
+        """**取货那一趟里连备几份** —— 每份都"就地朝下一步丢", 然后才离开箱子。
+
+        用户 2026-09-15: "**他拿食材抛的时候不能多拿一点, 只抛一个那不如不抛。多拿几个抛**"。
+
+        为什么单份不值得丢: 丢一份 = 多一次"取+转身+丢" **再加回头单独跑一趟去捡**;
+          而抱着走本来就只有一趟 ⇒ 单份时丢是**净亏**。
+        收益全在批量: 取货点和丢的方向是**同一个点**(站在箱子旁取、就地朝下一步丢),
+          所以连备 N 份**几乎不额外走路**, 只是 N 次拾取 + N 次投掷; 之后**一趟**过去
+          并行处理(`s_sushi_1_3` 有 3 口锅并排, 并行吞吐是串行的 3 倍)。
+
+        ☠ **只在"确实丢了"的时候连备**: 下一步的处理站就在旁边时 `_toss_to_next` 不会丢
+          (抱着走更省) —— 那时"连备"没有意义(手只有一只, 抱不了两份)。
+        ⚠ 每一份都**重新探一次货源**(`op_fetch` 自己会解析"现在离我最近的") —— 箱子的
+          余量、传送带上的位置都会变, 不能拿第一次的坐标硬套。
+        ⚠ 上限 `TOSS_BATCH_MAX`; 每轮都查 `round_active()` —— 别为一局末尾的备料把时间烧光。
+        """
+        if TOSS_BATCH_MAX <= 1:
+            self._toss_to_next(km, st, flow, op.target)
+            return
+        tossed = 0
+        for k in range(TOSS_BATCH_MAX):
+            if not self.round_active():
+                break
+            if not self._toss_to_next(km, st, flow, op.target):
+                break                      # 没丢成(太近/游戏不收) → 不连备
+            tossed += 1
+            if k + 1 >= TOSS_BATCH_MAX:
+                break
+            st = self.state(force=True)
+            if not st or not st.get("inRound"):
+                break
+            km = self.map(st) or km
+            _, _, held = self.pos(st)
+            if held:
+                break                      # 手上还有东西(丢失败?) → 别再堆
+            # 回去再拿一份(就在同一个箱子旁, 不额外走路)
+            if not self.op_fetch(km, *self.pos(st)[:2], op, st, 0):
+                break
+        if tossed > 1:
+            self.log(f"[预置] 这一趟**连备了 {tossed} 份 {op.target}** —— "
+                     f"回头一趟过去一起处理")
+
+    def _item_spots(self, km, name: str) -> set:
+        """这个东西此刻都在哪些位置(地上 + 台面上) —— 只用来算"丢出去落在哪"。"""
+        n = self._norm(name)
+        out = set()
+        if not n:
+            return out
+        for it in (getattr(km, "items", None) or []):
+            if n in (self._norm(getattr(it, "ing", "")), self._norm(getattr(it, "name", ""))):
+                out.add((round(it.x, 2), round(it.z, 2)))
+        for s in (getattr(km, "stations", None) or {}).values():
+            for o in (s.on or []):
+                if self._norm(o) == n:
+                    out.add((round(s.x, 2), round(s.z, 2)))
+        return out
+
+    def _toss_to_next(self, km, st, flow, target: str) -> bool:
+        """把刚拿到的 `target` **朝它下一步的处理站丢过去**, 并把**真实落点**记下来。
+
+        用户 2026-09-15:
+        > "可以取货时, 拿出这个食材**往下一步处理的方向丢**... SushiRice 在左侧, 下一步处理是锅,
+        >  在右上侧... 我们就拿出 SushiRice 往右侧丢, 后续过去处理的时候**可以处理出很多份米备用**"
+
+        为什么值得: 一次只能拿一个 ⇒ 抱着走 12 格, 这一趟路上什么都干不了; 丢出去是一瞬间,
+        于是可以连着 `取→丢` 几轮, 先把料堆到加工区附近, 再**一趟过去并行处理**
+        (`s_sushi_1_3` 有 3 口锅并排, 并行吞吐是串行的 3 倍)。
+
+        ☠ **目的地在射程外时要认清: 这是"丢一段", 不是"送到位"**。
+          实测射程 = 平地约 6 格(`TOSS_RANGE_CELLS`, 用户自己数的), 而典型的目标
+          (米箱 (-1.2,7.2) → 锅 (10.8,10.8)) 是 **12 格** ⇒ **一次丢不到**。
+          所以这条路是 **"丢一段(6) → 走一段 → 再丢(6)"** 的两跳, 不是一次到位。
+        ☠ **落点不假设、靠读** —— `m_throwForce` 插件读不到, 且**有落差时射程会变**
+          (落点地面越低飞得越远, 用户提醒过)。所以丢完**读它真的落在哪**,
+          把**实测落点**记进预置表(而不是我们想要的落点)。
+        """
+        if not target:
+            return False
+        nxt = None
+        for o in (getattr(flow, "ops", None) or []):
+            if getattr(o, "target", "") == target and o.action in ("cook", "chop", "mix"):
+                nxt = o
+                break
+        if nxt is None:
+            return                                  # 它没有"下一步处理站"(比如直接摆盘的料)
+        try:
+            tgt, _why = self._op_target_for_score(km, st, nxt, *self.pos(st)[:2])
+        except Exception:                                            # noqa: BLE001
+            return False
+        if not tgt:
+            return False
+        cx, cz, _ = self.pos(st)
+        dist = ((tgt[0] - cx) ** 2 + (tgt[1] - cz) ** 2) ** 0.5
+        if dist < TOSS_MIN_CELLS:
+            return                                  # 就在旁边, 抱着走更省事(丢要两次交互)
+        before = self._item_spots(km, target)
+        _hop = "" if dist <= TOSS_RANGE_CELLS else \
+            f" (射程约 {TOSS_RANGE_CELLS:.0f} 格 ⇒ 这是**丢一段**, 不是送到位)"
+        self.log(f"[预置] {target} 的下一步在 {nxt.action}({tgt[0]:.1f},{tgt[1]:.1f}) "
+                 f"距 {dist:.1f} 格 —— 朝那边丢过去(腾出手, 回头一趟并行处理){_hop}")
+        self.face(tgt[0], tgt[1])
+        try:
+            r = self.bridge.direct("throw", player=self._my_player_index(st))
+        except Exception as e:                                       # noqa: BLE001
+            self.log(f"[预置] ✗ 丢失败: {e!r}")
+            return False
+        if not isinstance(r, dict) or not r.get("ok"):
+            self.log(f"[预置] ✗ 游戏没收下这个投掷: {r!r}")
+            return False
+        time.sleep(0.5)
+        st2 = self.state(force=True)
+        km2 = self.map(st2) if st2 else None
+        if km2 is None:
+            return False
+        new = self._item_spots(km2, target) - before
+        if not new:
+            self.log("[预置] ⚠ 没看到新落点(可能被传走/被吃了) —— 这条预置不记")
+            return False
+        bx, bz = min(new, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cz) ** 2)
+        flew = ((bx - cx) ** 2 + (bz - cz) ** 2) ** 0.5
+        self._preposed[self._norm(target)] = (bx, bz, time.time())
+        # ☠ **方向偏差也要打出来** —— 投掷是按**朝向**飞的, 而朝向只能靠"按哪个键"去控;
+        #   实测有一次该往左上(菜板)丢、飞出去却是另一个方向。只看"飞了几格"看不出这个错,
+        #   所以把**意图方向与实际位移的夹角**一起报 —— 偏差大就是瞄准/朝向的问题, 不是射程的问题。
+        import math as _m
+        ang = None
+        try:
+            a_i = _m.atan2(tgt[1] - cz, tgt[0] - cx)
+            a_a = _m.atan2(bz - cz, bx - cx)
+            ang = abs(_m.degrees(a_i - a_a))
+            ang = min(ang, 360.0 - ang)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.log(f"[预置] ✓ 落在 ({bx:.1f},{bz:.1f}) —— **实测射程 {flew:.1f} 格**"
+                 f"(意图点 {tgt[0]:.1f},{tgt[1]:.1f}"
+                 + (f", 方向偏差 {ang:.0f}°" if ang is not None else "")
+                 + "); 记进预置表, 回头去捡")
+        return True
+        if ang is not None and ang > 45.0:
+            self.log("[预置] ⚠ **方向偏了** —— 瞄的是意图点, 飞出去的却是别的方向; "
+                     "看 `face()` 有没有把朝向转到位(斜方向要两个轴一起按)")
+
+    def _preposed_ok(self, target: str) -> bool:
+        """这个材料**预置在附近**吗(还新鲜的话)。纯查询, 给可做性判据用。"""
+        ent = self._preposed.get(self._norm(target) or "\0")
+        return bool(ent) and (time.time() - ent[2]) < PREPOSE_TTL
+
+    def _pickup_preposed(self, km, st, target: str) -> bool:
+        """这一步要用的东西**不在手上、而是躺在预置点** → 先去捡回来。
+
+        用户 2026-09-15: "**鼓励丢食物**" —— 取货时把料朝下一步的方向丢过去,
+        之后再过去一趟并行处理好几份。丢出去手上就没它了, 所以 `cook/chop/mix/assemble`
+        这几步必须先"去捡回来", 否则会判成"手上没有可煮的"而白跑一趟。
+
+        没预置记录、或东西已经在手上 → 直接 `True`(什么都不做)。
+        """
+        key = self._norm(target)
+        if not key or key not in self._preposed:
+            return True
+        px, pz, _t = self._preposed[key]
+        _, _, held = self.pos(st)
+        if self._held_is(held, target):
+            self._preposed.pop(key, None)             # 已经在手上 → 这条预置作废
+            return True
+        if time.time() - _t > PREPOSE_TTL:
+            self._preposed.pop(key, None)
+            return True
+        self.log(f"[预置] 手上没有 {target}, 它预置在 ({px:.1f},{pz:.1f}) —— 先去捡回来")
+        if not self._approach(km, px, pz, tight=0.6, want=target):
+            self.log(f"[预置] ✗ 走不到预置点 ({px:.1f},{pz:.1f}) —— 这条预置作废")
+            self._preposed.pop(key, None)
+            return False
+        if not self.interact("pickup", verify_hold_change=True):
+            self.log("[预置] ✗ 没捡起来 —— 这条预置作废")
+            self._preposed.pop(key, None)
+            return False
+        self._preposed.pop(key, None)
+        self.log(f"[预置] ✓ 捡回来了 {target}")
+        return True
 
     def do_op(self, km: KitchenMap, st: dict, op: Op, flow: DishFlow,
               attempt: int = 0) -> bool:
@@ -4067,8 +4720,18 @@ class Engine:
         x, z, _ = self.pos(st)
         if x is None:
             return False
+        # **预置**: 这一步要用的料不在手上、而是躺在预置点 → 先捡回来(见 `_pickup_preposed`)。
+        #   放在派发**之前**、且四个动作共用一处 —— 否则"手上没有可煮的"会各自白跑一趟。
+        if op.action in ("chop", "cook", "mix", "assemble"):
+            if not self._pickup_preposed(km, st, op.target):
+                return False
         if op.action == "fetch":
-            return self.op_fetch(km, x, z, op, st, attempt)
+            ok = self.op_fetch(km, x, z, op, st, attempt)
+            if ok and flow is not None:
+                # 拿到了就**顺手朝它的下一步丢过去**(用户要求"鼓励丢食物", 见 `_toss_to_next`)。
+                # 放在"拿成功"之后: 失败了还丢什么。
+                self._prep_and_toss(km, st, flow, op)
+            return ok
         if op.action == "plate":
             # 容器这步"尽力而为": 拿不到不该把整条流程卡死 ——
             # 后面的取料/切/煮照样要跑, 不然连问题出在哪都看不出来。
@@ -4097,7 +4760,9 @@ class Engine:
             return self.op_serve_any(km, x, z, op, st)
         if op.action == "pass":
             return self.op_pass(km, x, z, op, st)
-        # tool / mix 暂不处理
+        if op.action == "rescue":
+            return self.op_rescue(km, x, z, op, st)
+        # tool 暂不处理(订单要求的器皿/成品物件, 由摆盘那条路自己管)
         return True
 
     def op_work(self, km, x, z, op: Op, st: dict) -> bool:
@@ -4157,6 +4822,24 @@ class Engine:
 
         分组依据: `derive()` 对每个材料按顺序产出
         `fetch(raw) → [chop] → [cook/mix] → assemble(name)`, **以 assemble 收尾**。
+
+        ☠ **已知的交错链路风险(2026-09-15 用户点名要求检查, 确认存在)**:
+          这段判据是**按材料名、跨订单**的, 而"归属"这件事根本没有被表达 ——
+            ① `assemble_spot` **整局粘住同一个台面**(见 `pick_assemble_spot`), 所有订单都用它;
+            ② 订单过期/失败后, 它留在台面上的**半成品没有任何人清**(全仓没有"丢弃/清台面"逻辑,
+               唯一的垃圾桶用法是捣蛋鬼的 SNACK 和"传送带送到垃圾桶");
+            ③ 于是下一张订单开跑时, `have` 里混着**上一张订单的残料**, 而判据只看名字。
+          两个方向的错都会发生, 且都**看不出来**:
+            · **误跳** —— 别的菜的残料让本单的 `fetch→assemble` 整组被跳 ⇒ 本单永远缺那份
+              自己的料; 极端情况下 A 的残料 + B 的料会**凑成第三道菜**(游戏按集合匹配,
+              多一样少一样都不认);
+            · **看不见** —— 料散在**别的**台面上时这里看不到(只看 `self.assemble_spot`)⇒
+              重复取料。memory 里那条"同一份海带取了 7 遍"就是这个方向。
+          而且这是**会累积**的: 垃圾不消失 ⇒ 之后每张订单只要材料名撞上那堆垃圾就被误跳,
+          失败面随时间扩大 —— 这正是"行为像黑盒"的成因(同一段代码, 行为取决于不可见的累积状态)。
+          ⇒ 真要修, 判据应从"**这个名字在不在台面上**"换成"**这一盘是否已经匹配本单**"
+            (`_ready_plates` 已经在算 `req <= have <= req|opt`, 那才是集合级、跨订单安全的)。
+            在那之前, 下面那行日志把"台面上到底有什么 / 本单要什么"打全, 让实机能分辨复用还是污染。
         """
         spot = self.assemble_spot
         if spot is None or not ops:
@@ -4176,14 +4859,24 @@ class Engine:
             return ops
 
         out, group = [], []
+        # 本单**要哪些**材料(必需/可选分开) —— 只用来打日志, 好让实机一眼看出
+        # "台面上那个东西到底是本单的、还是上一张订单的残料"(见函数注释的交错风险)。
+        want_req = sorted(set(self._norm(o.target) for o in ops
+                              if o.action == "assemble" and not getattr(o, "optional", False)))
+        want_opt = sorted(set(self._norm(o.target) for o in ops
+                              if o.action == "assemble" and getattr(o, "optional", False)))
         for op in ops:
             group.append(op)
             if op.action != "assemble":
                 continue
             mat = self._norm(op.target)
             if mat and mat in have:
+                _extra = sorted(have - set(want_req) - set(want_opt))
                 self.log(f"[步骤] 台面 {spot.id} 上已有 {op.target} —— "
-                         f"跳过这 {len(group)} 步({group[0].action} {group[0].target} 起)")
+                         f"跳过这 {len(group)} 步({group[0].action} {group[0].target} 起)"
+                         + (f" | ⚠ 台面上还有本单不要的: {_extra}(可能是别的订单的残料)"
+                            if _extra else "")
+                         + f" | 台面全部: {sorted(have)} | 本单要: {want_req}")
             else:
                 out.extend(group)
             group = []
@@ -4284,8 +4977,11 @@ class Engine:
                 return None, "无货源坐标(现场也没找到能出它的箱子/台面)"
             return tgt, (op.at_name or "?")
         if a == "chop":
-            b = km.nearest("board", x, z)              # 与 op_chop 同一行
-            return ((b.x, b.z), b.id) if b else (None, "没有切菜板")
+            # ⚠ **和 `op_chop` 用同一个 `_pick_board`** —— 不能一个挑"最近那块"、
+            #   另一个挑"收得下的那块": 判据一旦漂开, 就会出现"评分算的是这块板、
+            #   执行跑去了那块板"(这项目已经栽过好几次)。
+            b = self._pick_board(km, x, z, op.target)
+            return ((b.x, b.z), b.id) if b else (None, "没有能用的切菜板(都被占着?)")
         if a == "mix":
             # ⚠ **搅拌台不是切菜板**: 去的是 `MixingStation`(`sem == "mix"`)。
             #   原来这两类共用一行"最近的切菜板", 于是 mix 永远指着一个板子 ——
@@ -4394,15 +5090,52 @@ class Engine:
                 return True, ""
             return False, (f"手上是 {held!r} 不是 {op.target}" if held
                            else "手空(搅拌要先把料拿在手上)")
+        # ☠☠ **没加工完的料上不了盘 —— 游戏自己的判据, 不是我们的偏好。**
+        #   反编译链(规则 1):
+        #     台面上**有盘子** → `ClientPlacementContainer.CanHandlePlacement`
+        #                        (`ClientPlacementContainer.cs:19`)
+        #       → `PlacementContainer.CanCombine`(`PlacementContainer.cs:7`)
+        #       → 要求 `CanTransferToContainer` **且** `CanAddIngredient(composition)`
+        #     台面**是空的**   → `AttachStation.CouldAttachToSelfIfEmpty`
+        #                        (`AttachStation.cs:89`) 要求 carried item 有 `IAttachment`
+        #   生料两处都过不去 ⇒ 游戏回 `placeCanHandle=False`, **放置根本不会发生**。
+        #   用户原话(已记在 `_advance_bonus` 的 docstring 里, 只是从没变成判据):
+        #     "比如 SushiRice, 想要放在盘子上需要**先煮熟**"。
+        #   ⇒ 拿着生料去 `assemble` 不是"排序不好", 是**执行一个错的物理动作**:
+        #     实机日志里连试 3 次 `placeCanHandle=False` → `✗ 放弃: assemble`
+        #     → **整单报废**(`Sushi_PlainPrawn` 就是这么死的)。
+        #
+        #   ⚠⚠ **必须排在这一段(`_preposed_ok` 捷径)之前** —— 那条捷径会在
+        #     "料被预置在附近"时直接 `return True`。写在 `assemble` 分支里会被它绕过去。
+        #   ⚠ 与 `deliver` 那三处同理: **不受 `strict` 影响** —— 它不是"名字猜不准"的
+        #     兜底项, 而是**正确性前提**; 放宽档也不许绕过去, 否则恰好是
+        #     "链子越堵这道闸门越不设防"(那条注释里的老教训)。
+        #   ⚠ 判据用 `_needs_work`(知识表里还有 `next` = 还能变成别的东西),
+        #     **不是比名字** —— 生料和切好的料名字同源, 比名字认不出阶段。
+        #     对盘子/锅/成品料它自然为 False(知识表里查不到 / 没有 next)。
+        if a == "assemble" and held and self._needs_work(held):
+            return False, (f"手上的 {held!r} **还没加工完**, 上不了盘"
+                           f"(游戏 CanHandlePlacement=false)")
+
+        # **预置在附近也能做** —— 那就跟"手上拿着"一样成立: 执行时 `do_op` 会先去捡
+        # (`_pickup_preposed`)。不加这一条, 候选会被打成 `-inf`, 永远轮不到执行。
+        # 依据: 用户 2026-09-15 "鼓励丢食物" —— 丢出去手上就空了, 而流程还得能接着走。
+        if a in ("chop", "cook", "mix", "assemble") and self._preposed_ok(op.target) \
+                and not self._is_plate(op.target):
+            return True, "预置在附近(执行时先去捡)"
         if a == "chop":
             if self._held_is(held, op.target):
                 return True, ""                        # 手上就是它 → 上板切
-            b = km.nearest("board", x, z)
+            b = self._pick_board(km, x, z, op.target)
             # ☠ **板上有东西 ≠ 板上有"要切的这个"**。原来这里只判 `b.on` 非空, 于是
             #   `chop Chocolate` 在"板上躺着别人切剩的 ChoppedDriedFruit"时照样成立
             #   ⇒ 白走过去、白按十几刀、最后"板上物品没有变化"再失败 ——
             #   正是"假'能'的代价是**执行一个错的物理动作**"那一类(实机 2026-09-14)。
-            if b is not None and any(self._held_is(o, op.target) for o in (b.on or [])):
+            # ⚠ `_pick_board` 已经把"被占着的板"排除掉了, 所以这里 `b is None` 就是
+            #   **真的没有能用的板** ⇒ 直接判不可做, 别退放宽档(见 `_pick_board`)。
+            if b is None:
+                return False, "没有能用的切菜板(都不存在或被别人的东西占着)"
+            if any(self._held_is(o, op.target) for o in (b.on or [])):
                 return True, ""                        # 板上就是要切的它 → 直接切
             if not strict and held:
                 return True, ""
@@ -4423,12 +5156,14 @@ class Engine:
         if a == "assemble":
             # 手上端着盘子也算 —— "用锅煮"的菜取出来时手上已经端着那盘菜了,
             # 见 op_assemble 的 docstring。
+            # (⚠ 阶段闸门不在这儿 —— 它必须排在下面 `_preposed_ok` 那条捷径**之前**,
+            #  见那一段的注释。)
             if self._held_is(held, op.target) or self._is_plate(held):
                 return True, ""
             if not strict and held:
                 return True, ""
             return False, (f"手上是 {held!r}, 不是 {op.target}/盘子" if held
-                           else "手空(op_assemble 会直接返回成功)")
+                           else f"手空, 没东西可摆(料不在手上 —— 可能在台面/板上)")
         if a == "deliver":
             # ⚠⚠ **这一段不受 `strict` 影响** —— 它**不是**"名字猜不准"的兜底项,
             #    而是用户给的**正确性前提**, 放宽档**也不许**把它绕过去。
@@ -4568,7 +5303,11 @@ class Engine:
                 if others:
                     follow = float(min(abs(d - o) for o in others))
             r["dist"], r["follow"] = d, follow
-            raw.append(scoring.score(r["op"].action, d, follow))
+            # 紧迫度(目前只有"锅快糊了"非 0): `scoring.burn_urgency` 算好的加成分。
+            # 推进(手上这份先做完): 见 `_advance_bonus` —— 用**我手上**的那份算。
+            raw.append(scoring.score(r["op"].action, d, follow,
+                                     urgency=getattr(r["op"], "urgency", 0.0),
+                                     advance=self._advance_bonus(r["op"], held)))
             sigs.append(f"{r['op'].action} {r['op'].target}")
 
         # 3) 队友的原始分: 只换位置相关的项 —— 步骤价对两个人都一样。
@@ -4584,7 +5323,12 @@ class Engine:
                     oc = self._stand_cell_of(tm, target[0], target[1], mate[0], mate[1],
                                              ortho_only=True, reach=mate_reach)
                     od = mate_reach.get(oc) if oc is not None else None
-                    o = scoring.score(r["op"].action, od, r["follow"])
+                    # 紧迫度是**位置无关**的(锅不会因为谁去看它而少烧一秒) ⇒ 两边都加,
+                    # 否则"我 vs 队友"就不是在比同一件事, 让位判定会失真。
+                    # ⚠ 但"推进"要按**队友自己手上**的那份算 —— 谁拿着才算谁的。
+                    o = scoring.score(r["op"].action, od, r["follow"],
+                                      urgency=getattr(r["op"], "urgency", 0.0),
+                                      advance=self._advance_bonus(r["op"], mate[2] if mate else ""))
             other_raw.append(o)
 
         # 4) 状态 = 对评分向量的变换(coop 原样 / clumsy 加噪声 / sabotage 取负+重复)
@@ -4693,6 +5437,59 @@ class Engine:
             return False
         return True
 
+    # ---------------- 分支: "这一支不行" → 返回到其他路 ----------------
+
+    def mark_branch_dead(self, target: str, sid: str, why: str = "") -> None:
+        """把「`target` 在这块台面上办不成」记下来, `BRANCH_TTL` 秒内不再挑它。
+
+        用户 2026-09-15 的原话: "**按一次没有得到对应的结果这条路就失败了, 可以返回到
+        其他路**"。所以下次挑台面时换一块, 而不是原地重试、更不是把整单废掉。
+
+        ⚠ 粒度是**台面**, 不是动作 —— 见 `BRANCH_TTL` 的注释: 记在动作上会让一块板
+        走不到就把所有板封掉(实测日志里 board1/board3 走不到, 而 board0/board2 好用)。
+        """
+        if not sid or BRANCH_TTL <= 0:
+            return
+        self._branch_dead[(self._norm(target), sid)] = time.time() + BRANCH_TTL
+        self.log(f"[分支] {target} @ {sid} 这一支先划掉 {BRANCH_TTL:.0f} 秒"
+                 f"{('(' + why + ')') if why else ''} —— 改走别的")
+
+    #: 判定"队友正在用某个台面"的距离(格)。交互半径是 1.0、量的是到**碰撞体表面**,
+    #: 所以站得够近才用得了它 —— 取 1.6 是留一点余量(队友位置读出来有抖动、
+    #: 他可能正在微调站位)。**别调大**: 太大会把"他只是路过"也当成"他在用"。
+    MATE_OCCUPY_CELLS = 1.6
+
+    def _mate_near(self, s, mate) -> bool:
+        """队友是不是**正站在这个台面旁边** —— 那就是"他正在用它"。
+
+        用户 2026-09-15 指出的真问题(实机):
+          > "**他不会计算人类玩家的占用**，比如切菜板，这个位置已经被人类用了，
+          >   脚本会**排队**，而不是用其他菜板。"
+        而队友的坐标**本来就在地图上**(`state.layout.chefs` —— 日志里那行
+        `队友@20.6,-6.2 持'SushiPrawn' 静止0.0s(人)`), `_mate()` 每次决策都取了,
+        **只是从来只喂给评分让位, 没喂给选台面** ⇒ 挑中人家正在用的那块, 走过去挤。
+        用户的总结: "**人类的影响已经作用在地图上了**" —— 对, 位置就在那张图里。
+
+        ⚠ **这是"他在用", 不是"他会来用"** —— 意图读不出来, 也不该猜。
+        ⚠ 调用方**必须留兜底**: 全被排除时退回不过滤的那份, 否则会出现
+          "唯一一块板被队友占着 ⇒ chop 不可达 ⇒ 卡死"。见 `_pick_board`。
+        """
+        if mate is None or s is None:
+            return False
+        dx, dz = s.x - mate[0], s.z - mate[1]
+        return dx * dx + dz * dz <= self.MATE_OCCUPY_CELLS ** 2
+
+    def _branch_ok(self, target: str, sid: str) -> bool:
+        """这一支还在划掉期里吗。到期自动回池 —— 世界会变(板被腾空/东西被拿走)。"""
+        k = (self._norm(target), sid)
+        exp = self._branch_dead.get(k)
+        if exp is None:
+            return True
+        if time.time() >= exp:
+            self._branch_dead.pop(k, None)
+            return True
+        return False
+
     def bench_step(self, key: str, why: str = "") -> None:
         """把一步放冷板凳 `STEP_COOLDOWN` 秒 —— 用户要求: 持续失败就去**做其他事**, 不是退出。"""
         if not key or STEP_COOLDOWN <= 0:
@@ -4739,7 +5536,8 @@ class Engine:
             rows.append(scoring.row(n + 1, f"{r['op'].action} {r['op'].target}",
                                     d is not None, d if d is not None else 0.0,
                                     scoring.step_value(r["op"].action), r["follow"],
-                                    raw[n], final[n], v))
+                                    raw[n], final[n], v,
+                                    urg=getattr(r["op"], "urgency", 0.0)))
         if chosen is not None:
             # ⚠ **不要在这里重写判定** —— `choose` 已经把选中那项标成"选"/"让位收回"了。
             #   这里再盖一次"选"会把"让位收回"吃掉, 而那正是排查协作问题时最该看见的一行。
@@ -4783,6 +5581,7 @@ class Engine:
         n_recipe = len(ops)                 # 分界线: < n_recipe 是菜谱, >= 是杂活
         used = {}                           # {(action,target): 本轮做过几次}
         _idle_since = None                  # "连续一个动作都做不了"从什么时候开始(见 IDLE_WAIT)
+        _branch_n = 0                       # 本单里"换一支再试"已经用掉几回(见 BRANCH_RETRY_MAX)
         while pending:
             st = self.state()
             if not st or not st.get("inRound"):
@@ -4816,6 +5615,13 @@ class Engine:
                                                 tm=_tm, reach=_reach)
             except Exception as e:
                 self.log(f"[传球] 探测出错: {e!r}")
+            # **救锅**: 和杂活/传球一样进同一张评分表(用户要求"报警了评分就该上涨")。
+            # ⚠ 它在 `CHORE_MODE` 那个总开关**外**面 —— 一口快糊的锅不是"顺便做的杂活",
+            #   调试期关杂活不该顺手把救火也关了(要关它用 `NEKO_RESCUE=0`)。
+            try:
+                chores += self._rescues(km, st)
+            except Exception as e:
+                self.log(f"[救锅] 探测出错: {e!r}")
             pool = ops + chores
             # **冷板凳上的菜谱步骤不进候选**(用户要求: 持续失败就去做其他事)。
             # 它们全在冷板凳上时也不硬试 —— 那样只会把时间烧在"重试 3 次 + 导航超时"上;
@@ -4847,6 +5653,43 @@ class Engine:
                     self.log(f"[引擎] 订单 {flow.name} 已经不在订单栏上了 "
                              f"(多半被别人交了/超时) —— 这一单不用做了")
                     return True
+                # ☠☠ **链子断了 ⇒ 立刻判死, 别等 20 秒**(2026-09-15 实机打回来的)。
+                #   实测那一局的账: `fetch`/`chop`/`assemble` 各自报过 `✓`(其中 `fetch`
+                #   是**假 ✓** —— 报成功时手是空的), 于是 `pending` 里**只剩 `deliver`**;
+                #   而 `deliver` 的手空闸门永远不放行(`_op_actionable` 那条**不能删** ——
+                #   删了 `deliver` 的 100 分就会一直压过所有步骤, 见那边的注释),
+                #   于是 `picked is None` 反复发生, 一等等 20 秒, 而且**每一秒都重打一张
+                #   评分表**(日志里那串重复的 `deliver 不可达` 就是这么来的)。
+                #   ⚠ 那 20 秒在这里**买不到任何东西**: 等的是"世界变了没有", 可缺的是一个
+                #     **盘子** —— 而盘子要么在手、要么在台面上, **不在任何人手里**。
+                #     提示语写的"该人类队友拿"是**说错了原因**(那条对应的是另一种情形)。
+                #   判据: **手空 + 这一单剩下的步骤里没有 `fetch`** ⇒ 这条链**再也填不满手**
+                #     (`fetch` 是菜谱里**唯一**能把东西拿到手上的动作; `chop`/`cook`/`mix`
+                #      都要先有料, `assemble`/`deliver`/`pass` 都不产料)。
+                #     这时等多久都不会变 ⇒ 立刻作废, 让外层拿去重新规划。
+                #   ⚠ **范围刻意收窄**: 只看**这一单自己的 `pending`**。杂活(`serve_any` 等)
+                #     不在 `pending` 里 —— 所以理论上"队友把一盘菜填好、`serve_any` 变成可用"
+                #     能救回来。但拿 20 秒(一局 150 秒的 13%)去赌这个, 不划算; 而且实测
+                #     那局等满也没等到。真发生了, 外层重新规划会再走进来。
+                #   ⚠ **判据刻意收窄到"终结步"**(`deliver`/`pass`): 这两种**只能**用
+                #     已经在手上的东西, 这条链填不满手就永远做不了。而 `chop`/`cook`/
+                #     `assemble` 卡住时**别人把料放到板上/台面上**是能救回来的 ⇒ 那种情况
+                #     该照旧等(`_can_refill` 那一条已经把它们排除了)。
+                _TERMINAL = ("deliver", "pass")
+                _recipe_left = [pool[j] for j in pending if j < n_recipe]
+                _can_refill = any(getattr(o, "action", "") == "fetch" for o in _recipe_left)
+                _all_terminal = bool(_recipe_left) and all(
+                    getattr(o, "action", "") in _TERMINAL for o in _recipe_left)
+                _, _, _held_now = self.pos(st)
+                if not _held_now and not _can_refill and _all_terminal:
+                    self.log(f"[引擎] ⛔ **链子断了**: 手上是空的, 而这一单剩下的 "
+                             f"{len(_recipe_left)} 步里**没有 `fetch`**"
+                             f"({', '.join(sorted({o.action for o in _recipe_left}))}) "
+                             f"—— 这条链再也填不满手, **等也不会变**")
+                    self.log(f"[引擎]    多半是前面有一步报了假 `✓`(做成了才销号, 销了号就回不去)。"
+                             f"立刻作废这一单, 让外层重新规划, 不烧那 {IDLE_WAIT:.0f} 秒")
+                    self._last_fail_step = f"score:链子断了(手空且剩下的步骤没有 fetch)"
+                    return False
                 # ★ **一个动作都做不了 —— 先别当失败, 等一会儿再看。**
                 #   两种情形在这里长得一模一样, 但处置相反:
                 #     · **该人类队友出马**(食材在他那半边 / 他在用唯一的锅) —— 等;
@@ -4931,25 +5774,170 @@ class Engine:
                 if self._last_fail_kind == "death":
                     self.log(f"[引擎] ⚠ 第 {i+1} 步是**摔死**失败 —— 不再原路重试")
                     break
+                # ☠ **这一支不行 ⇒ 换支, 不原地重试** —— 用户 2026-09-15:
+                #   "**按一次没有得到对应的结果这条路就失败了, 可以返回到其他路**"。
+                #   重试同一个动作只会撞同一面墙(板还是空的、那格还是过不去);
+                #   台面已经在 op_* 里用 `mark_branch_dead` 划掉了 ⇒ 重选时会换一块。
+                if self._last_fail_kind == KIND_BRANCH:
+                    self.log(f"[引擎] ⚠ 第 {i+1} 步是**这一支不行**({op.action} {op.target})"
+                             f" —— 不原地重试, 换支重选")
+                    break
                 self.log(f"[引擎] 第 {i+1} 步失败, 重试 {attempt+1}/{retries}")
             if not done:
                 if is_chore:
                     # ☠ **杂活没做成 ≠ 整单失败**: 一个按钮没按对不值得停机(规则 5 的反面)。
                     #   记进黑板(本轮不再选它)后继续 —— 菜谱该干嘛干嘛。
+                    # ⚠ **`rescue` 额外上冷板凳**: "本轮不再选它"只在本轮有效, 而 `pending`
+                    #   每轮重建 ⇒ 走不到的那口锅下一轮又被选中。实测那口卡在 14/12 秒的锅
+                    #   把半局烧在"走不到旁边(差 1.00 格)"上。
+                    if op.action == "rescue":
+                        self.bench_step(f"rescue {op.target}", "走不到那口锅旁边")
                     self.log(f"[引擎] ⚠ 杂活没做成: {op.action} {op.target} —— 本轮不再选它")
                     continue
                 # ⚠ **指纹里不带下标**: 一旦顺序是动态的, 同一个 bug 两次可能选中不同的槽位,
                 #   带下标就没法重复 ⇒ "连续 3 次一样就停机"永远不触发 ⇒ 整局白烧(规则 5)。
                 #   去掉下标后, 只要**同一个动作**反复失败就会停 —— 比原来更稳。
+                # ☠ **分支不行 ≠ 这一单完了**(用户: "可以返回到其他路")。
+                #   选中那一刻已经**销了号**(上面 `pending = [p for p in pending if p != i]`)
+                #   ⇒ 这里必须**把它放回去**, 否则重选时这一步根本不在池子里,
+                #   只能一路走到"整单报废" —— 实测日志里 `placeCanHandle=false`
+                #   连试 3 次就 `✗ 放弃: assemble` 废掉一整单, 而它只需要换个台面。
+                #   放回去之后重选: 台面已被 `mark_branch_dead` 划掉 ⇒ 会挑**别的**台面。
+                if self._last_fail_kind == KIND_BRANCH and _branch_n < BRANCH_RETRY_MAX:
+                    _branch_n += 1
+                    if i not in pending:
+                        pending.append(i)
+                        pending.sort()
+                    self.log(f"[引擎] ↺ {op.action} {op.target} 放回候选 "
+                             f"({_branch_n}/{BRANCH_RETRY_MAX}) —— 这一支不行, 换一支再选")
+                    continue
                 self._last_fail_step = f"{op.action} {op.target}"
                 self.log(f"[引擎] ✗ 放弃: {op.action} {op.target} (评分 {scoring.fmt(fin)})")
                 return False
             self.log(f"[引擎] ✓ {op.action} {op.target} (评分 {scoring.fmt(fin)})")
+            # ☠ **加工做完了 ⇒ 同名的 `fetch` 立刻销号**(见 `_subsumes_fetch` 的注释:
+            #   评分会把 `chop`(30) 排在 `fetch`(20) 前面, 而板上那块现成的生料让
+            #   `chop` 成立 ⇒ 切完再 `fetch` 就多取了一块新的生的 ⇒ `assemble` 拿到它
+            #   ⇒ 游戏 `placeCanHandle=false` ⇒ 整单报废)。
+            # ⚠ 只销**同名**的 `fetch`; 另一份材料的 `fetch` 不动 —— 那正是要的并行。
+            if not is_chore:
+                _new = self._drop_subsumed_fetches(pool, pending, op)
+                if _new != pending:
+                    self.log(f"[引擎] {op.action} {op.target} 做完了 —— "
+                             f"同名的 fetch 已经多余, 销号"
+                             f"(去掉 {len(pending) - len(_new)} 步)")
+                    pending = _new
+            # ☠ **交掉了这一单 → 整条流程就此结束**(2026-09-15 实机打回来的一条)。
+            #   `deliver`/`serve_any` 的成败判据都是"**这一单从订单栏上消失**"
+            #   (`_deliver_plate`: `remaining < before` + 盘子离手) —— 也就是这一单**已经完成**。
+            #   可 `pending` 里往往还留着菜谱那一步 `deliver`(交菜是**杂活** `serve_any` 干的,
+            #   而它不算菜谱的销号), 此刻它**永远做不了**: 手是空的
+            #   (`不可达(手空, 没东西可送)`) ⇒ 一路等到 `IDLE_WAIT` 20 秒。
+            #   偏偏那个"订单没了就收工"的出口按**名字**判(`_order_live`), 而这关的菜谱池里
+            #   就有同名菜 —— 交掉一单后游戏**立刻又会发一张同名的**, 出口于是永不成立。
+            #   (实测 `s_sushi_1_3`: 交完 `Sushi_PlainPrawn` 之后连着十几轮只有那一个
+            #    不可达的 `deliver`, 白白烧掉 20 秒 ≈ 一局 150 秒的 13%。)
+            #   ⇒ 交完就收工, 让主循环干净地重新规划(新订单会走一条全新的 flow)。
+            if self._flow_completed_by(op, flow):
+                self.log(f"[引擎] ★ {flow.name} 已经交掉了 —— 这一单收工")
+                return True
             # 杂活不 `remember`: 捣蛋鬼的"重复奖励"会让它反复做同一件杂活,
             # 而洗一次盘子能烧 20 秒 —— 哲学上正确, 计时上很贵(见 modes 的注释)。
             if self.mode_state is not None and not is_chore:
                 self.mode_state.remember(f"{op.action} {op.target}")
         return True
+
+    @staticmethod
+    def _advance_bonus(op, held: str) -> float:
+        """**"这一步用的正是手上拿着的那份"** → 给加成分。
+
+        用户 2026-09-15 讲的机制: "比如 SushiRice, 想要放在盘子上需要**先煮熟**" ——
+        生米**上不了盘**(游戏 `CanHandlePlacement=false`), 腾手又只能"进盘"或"丢地上",
+        所以拿着生料时**唯一有价值的事就是把它的下一步做完**。
+        实测那次评分选了 `fetch Cucumber`(-12) 而不是 `cook SushiRice`(-19) —— 纯按距离,
+        于是生米晾在手上, 逼出 `op_fetch` 的腾手 → 游戏拒收 → 整局绕死。
+
+        只认**会用到手上这份**的四个动作(`chop`/`cook`/`mix`/`assemble`)。
+        `fetch` 不算 —— 它的语义正是"去拿**别的**东西", 而手上这份的归宿不该是等。
+        纯函数(只看动作名和两个字符串), 方便离线核对。
+        """
+        if not held:
+            return 0.0
+        act = getattr(op, "action", "")
+        if act not in ("chop", "cook", "mix", "assemble"):
+            return 0.0
+        return (scoring.HAND_ADVANCE_BONUS
+                if Engine._held_is_norm(held, getattr(op, "target", "")) else 0.0)
+
+    @staticmethod
+    def _held_is_norm(held: str, want: str) -> bool:
+        """`_held_is` 的纯函数版(同名/前缀式改名那套判据)。"""
+        if not want:
+            return False
+        h, w = Engine._norm(held), Engine._norm(want)
+        if not h:
+            return False
+        return h == w or h.startswith(w)
+
+    #: 做完之后**会取代**同名 `fetch` 的那几个动作。
+    #: 依据 `cookbook.derive()`: 给**一份**材料产出的是
+    #: `fetch → [chop] → [cook/mix] → assemble` 这条链, 链上每一步作用的是
+    #: **同一个物理个体** —— 所以后面那几步一旦做成了, "去把生的那份取回来"就没意义了。
+    SUBSUMES_FETCH = ("chop", "cook", "mix")
+
+    @staticmethod
+    def _subsumes_fetch(op) -> str:
+        """这一步做完之后, **同名的 `fetch` 是不是就多余了** —— 是的话返回它的 target。
+
+        为什么要这条(实机 2026-09-15 `s_sushi_1_1` 打回来的整局):
+          评分层是**按分重排**的, 而 `chop`(30) > `fetch`(20) —— 于是一块**已经在板上**
+          的生料会让 `chop X` 抢在 `fetch X` 前面跑(`_op_actionable` 的 chop 分支:
+          "板上就是要切的它 → 直接切")。切完之后 `fetch X` 又去取了**一块新的生料**,
+          而 `assemble X` 拿到的正是那块新的(生的) ⇒ 游戏 `CanHandlePlacement=false`
+          ⇒ 连试 3 次 ⇒ **整单报废**。
+          `OP_PREREQ` 拦不住它: 那张表只管 `assemble`/`cook`/`mix`, **`chop` 没有前置**
+          (那里的注释讲的是"取**另一份**材料要并行", 同名的不在此列)。
+
+        ⇒ 规则: **前一步的产品已经被这一步取代了, 就把那一步销号**。
+          这样保留了"顺手把板上的料切了"这个**有用**的机会主义, 只去掉那次白跑。
+
+        纯函数(只看动作名), 方便离线核对。
+        """
+        return (getattr(op, "target", "")
+                if getattr(op, "action", "") in Engine.SUBSUMES_FETCH else "")
+
+    @classmethod
+    def _drop_subsumed_fetches(cls, pool, pending: list, op) -> list:
+        """`op` 做成了 ⇒ 把 `pending` 里**同名**的 `fetch` 去掉。返回新的 `pending`。
+
+        ⚠ 只销同名的(`_norm` 比): 另一份材料的 `fetch` **必须留着** —— 那正是
+          `OP_PREREQ` 注释里说的"取另一份材料就是我们要的并行"。
+        纯函数(只依赖 pool/pending 的形状), 方便离线核对。
+        """
+        tgt = cls._subsumes_fetch(op)
+        if not tgt:
+            return pending
+        tn = cls._norm(tgt)
+        drop = [p for p in pending
+                if p < len(pool) and getattr(pool[p], "action", "") == "fetch"
+                and cls._norm(getattr(pool[p], "target", "")) == tn]
+        if not drop:
+            return pending
+        return [p for p in pending if p not in drop]
+
+    @staticmethod
+    def _flow_completed_by(op, flow) -> bool:
+        """这一步做完之后, **这一整单是不是就算交掉了**。
+
+        只认两件事: 动作是 `deliver`/`serve_any`, 且它交的**就是本单**(按名字比)。
+          · `deliver` —— 菜谱自己的最后一步, 交给送餐口。
+          · `serve_any` —— **杂活**, 把台面上现成的一盘端去送(阶段二)。它不销菜谱的号,
+            所以做完之后 `pending` 里那个 `deliver` 还在 —— 而手已经空了, 那一步**永远**做不了。
+        两者共同的成败判据都是"这一单从订单栏上消失"(`_deliver_plate`), 所以命中即完成。
+        纯函数, 方便离线核对。
+        """
+        return (getattr(op, "action", "") in ("deliver", "serve_any")
+                and getattr(op, "target", "") == getattr(flow, "name", ""))
 
     def execute(self, flow: DishFlow, retries: int = 2) -> bool:
         # ⚠ 这里**不能**清空 assemble_spot —— 见 pick_assemble_spot() 里那段注释。
@@ -5187,6 +6175,75 @@ class Engine:
                           at_name=(mate[2] or "队友"), at_x=mate[0], at_z=mate[1]))
         return out
 
+    def _rescues(self, km, st) -> list:
+        """**锅快糊了** → 去把它从灶上端下来(候选; 分随紧迫度上涨)。
+
+        数据来源: `layout.cooking[]`, 每条 = 一个烹饪句柄(`SceneScanner.ScanCooking`):
+          `prog`(已煮秒) / `need`(需煮秒) / `state`(Raw|Cooked|Burnt) / `burning` / `in`(锅里是什么)
+
+        ⚠ **`state == "Cooked"` 就是游戏的"报警"**: 那边 `CookingUIController` 的
+          `OverDoing` 状态(警告图标脉冲 + `GameOneShotAudioTag.CookingWarning` 音效)正对应
+          `need < prog <= 2*need`。我们**不用听声音也不用看图标** —— `prog/need` 是连续量,
+          能直接算出"还差几秒糊"(`2*need - prog`)。
+        ⚠ 用户 2026-09-15 定的规矩: **"如果报警, 对应的评分应该上涨"** —— 所以这里
+          **不设硬阈值闸门**, 只把 `ratio` 交给 `scoring.burn_urgency` 换算成加成分:
+          刚报警时 0 分(低于 `YIELD_MIN_SCORE` ⇒ 让位给站在旁边的人),
+          越接近糊涨得越猛(130 上限 ⇒ 压过 `deliver` 的 100 ⇒ 必须我去)。
+        ⚠ **不排除"自己的锅"**: 我正在煮的那口由 `op_cook` 盯着(那里根本不进评分),
+          而"上一轮失败/被顶开后留在灶上的我的锅"和队友的锅一样需要救。
+        ⚠ 已经糊了(`ratio >= 2`)的不生成 —— 那道菜已经废了, 端下来也没用;
+          真烧起来了(`burning`)是**另一条路**(主循环的灭火), 这里也不管。
+        """
+        if (os.environ.get("NEKO_RESCUE") or "1").strip().lower() in ("0", "off", "no", "false"):
+            return []
+        out = []
+        for c in km.cooking or []:
+            need = float(getattr(c, "need", 0) or 0)
+            prog = float(getattr(c, "prog", 0) or 0)
+            if need <= 0 or prog <= need:
+                continue                      # 还没到点(或数据不全)
+            ratio = prog / need
+            if ratio >= 2.0:
+                continue                      # 已经糊了
+            if str(getattr(c, "burning", "")).lower() in ("true", "1"):
+                continue                      # 烧起来了 → 走灭火那条路
+            x, z = getattr(c, "x", None), getattr(c, "z", None)
+            if x is None or z is None:
+                continue
+            what = getattr(c, "inside", "") or getattr(c, "name", "") or "锅"
+            # ☠ **走不到的那口锅要上冷板凳** —— 实测(`s_sushi_1_3`)一口**卡在 14/12 秒
+            #   不再变化**的锅让 `rescue` 每轮都被选中(40 分)、每轮都"走不到旁边(差 1.00 格)",
+            #   把半局烧在同一个不可能的动作上。杂活那条"本轮不再选它"只在本轮有效,
+            #   而 `pending` 每轮重建 ⇒ 下一轮它又回来了。这里用冷板凳跨轮压住。
+            if self.step_benched(f"rescue {what}"):
+                continue
+            out.append(Op(
+                "rescue", what,
+                "%s 已经过火(%.0f/%.0f 秒, 剩 %.0f 秒糊) —— 端下来" % (
+                    what, prog, need, max(0.0, 2 * need - prog)),
+                at_name=getattr(c, "name", "") or what, at_x=x, at_z=z,
+                urgency=scoring.burn_urgency(ratio)))
+        return out
+
+    def op_rescue(self, km, x, z, op: Op, st: dict) -> bool:
+        """把一口**已经在报警窗口里**的锅从灶上端下来, 放到旁边的空台面。
+
+        为什么是"端锅"而不是"取菜": 报警窗口里锅里的东西**已经熟了**(`state == Cooked`),
+        再放下去就是糊(`> 2*need` → Ruined)。端下来 = 停火, 料还在锅里, 之后照常处理。
+        这也是唯一一个"不需要先想清楚这锅是谁的"的动作 —— 糊了对谁都没好处。
+        """
+        self.log(f"[救锅] {op.note or op.target}")
+        if not self._approach(km, op.at_x, op.at_z, tight=0.8, want=op.at_name):
+            self.log(f"[救锅] 走不到 {op.at_name or op.target} 旁边")
+            return False
+        if not self.interact("pickup", verify_hold_change=True):
+            self.log("[救锅] ✗ 没端起来(锅还在灶上继续烧)")
+            return False
+        # 端起来就已经**停火**了(游戏里锅离开灶台就不再加温), 所以下面这步是"收拾干净"。
+        # 放不下也不当失败 —— 端着锅比让它继续烧强。
+        self._put_down_plate(km, x, z)
+        return True
+
     def _chore_admitted(self, chore, d, flow_ds, used: dict) -> tuple:
         """这件杂活**现在能不能进候选池** —— 返回 `(能不能, 原因)`。**纯函数, 可离线核对。**
 
@@ -5210,6 +6267,16 @@ class Engine:
             # **传球不受杂活闸门管** —— 它不是"顺路顺手做的杂活", 而是
             #   "链条上有一环我这边做不了"时的**唯一出路**(用户要求"先行动在那一步")。
             #   它由 `_pass_candidates` 在生成时就卡过条件了(够不着 + 料拿得到)。
+            return True, ""
+        if a == "rescue":
+            # **救锅同样不吃顺路闸门**(同 `pass` 的理由) —— 但和 `pass` 不同:
+            #   它**也不吃 `NEKO_CHORES=0` 那个总开关**。一口快糊的锅不是"顺便做的杂活",
+            #   是"再不动这道菜就废了 + 那个台面着火后不能拿放/不能切"。调试期想关它,
+            #   用 `NEKO_RESCUE=0`(见 `_rescues`), 别让"关杂活"顺手把救火也关了。
+            #   什么时候该让位、什么时候必须我上, 全由**紧迫度打分**表达(见 `scoring.burn_urgency`),
+            #   所以这里不设任何阈值。
+            # ⚠ **`--mode sabotage` 下救援会垫底**(`scoring.transform` 取负 ⇒ 分越高越低):
+            #   那是**故意的**, 不是 bug —— 捣蛋鬼的 `Mischief.BURN` 本来就是"放任灶台烧糊"。
             return True, ""
         # ⚠ **总开关排在最前面** —— 包括 `serve_any`。调试期要靠 `NEKO_CHORES=0`
         #   把整条杂活链路一次性拔掉做二分定位; 留一个"关不掉的动作"会让它没用。
@@ -5309,6 +6376,52 @@ class Engine:
         return None
 
     # ---------------- 主循环 ----------------
+    def _persona_name(self) -> str:
+        """当前人格名(coop/clumsy/sabotage), 没有就空串 —— 给猫娘认"现在谁在玩"。"""
+        try:
+            return self.mode_state.mode.value if self.mode_state is not None else ""
+        except Exception:                                        # noqa: BLE001
+            return ""
+
+    def _publish_status(self, st: dict = None, paused: bool = False) -> None:
+        """把"这局什么情况"写到 `runtime/status.json`(契约见 `neko/status.py`)。
+
+        这是给**猫娘/宿主**的反方向通道: `neko/control.py` 是"外面下命令给引擎"
+        (方案文档 D10 说的"猫娘 = 调 set_mode 的开关"), 而这条是"引擎报状态给外面" ——
+        猫娘光能下命令、不知道结果, 就永远说不出"赢啦"。
+
+        节流 1 秒(文件很小, 但没必要每轮 0.5 秒都刷盘)。
+        ⚠ 写失败**只记一行日志**, 绝不影响主循环 —— 这是给别人看的旁路,
+          它坏了不该让脚本停摆。
+        """
+        now = time.time()
+        if now - self._status_at < 1.0:
+            return
+        self._status_at = now
+        try:
+            import status as _status
+            self._status_prev = _status.publish(
+                st or {}, prev=self._status_prev,
+                persona=self._persona_name(), paused=bool(paused))
+        except Exception as e:                                   # noqa: BLE001
+            self.log(f"[状态] 写 status.json 失败: {e}")
+
+    def _status_beat_loop(self) -> None:
+        """心跳线程: 每秒把"进程还活着"刷一下(数据不动)。
+
+        ☠ 为什么需要它: 主循环**一次迭代可能跑十几秒**(导航到厨房另一头), 这期间
+          一次状态都不写 —— 如果"没写"就等于"引擎挂了", 猫娘会在局中被反复告知
+          "引擎没在跑", 而它明明正在跑。所以"进程活着"和"数据多旧"分开报:
+          这个线程只推 `heartbeat_ts`, `ts`(数据时刻)只有 `_publish_status` 会动。
+        """
+        while True:
+            time.sleep(1.0)
+            try:
+                import status as _status
+                _status.beat()
+            except Exception:                                    # noqa: BLE001
+                pass
+
     def run(self, dry: bool = False):
         self.log("[引擎] 启动, 等对局...")
         self.log(f"[引擎] 杂活模式: {CHORE_MODE}"
@@ -5316,6 +6429,14 @@ class Engine:
         self.log("[引擎] 焦点策略: 不抢你的焦点 —— 切出去干活时脚本会自动暂停并松开所有键;")
         self.log("[引擎]           按 " + (os.environ.get("NEKO_PANIC_KEY") or "F12") +
                  " 可以急停(只读按键状态, 不影响你在游戏里的操作)")
+        # 状态出口的心跳线程(见 `_status_beat_loop` 与 `neko/status.py`)。
+        #   daemon: 主线程退它就跟着没, 不需要 join。
+        try:
+            import threading as _th
+            _th.Thread(target=self._status_beat_loop, daemon=True,
+                       name="neko-status-beat").start()
+        except Exception as e:                                   # noqa: BLE001
+            self.log(f"[状态] 心跳线程起不来(不影响主循环): {e}")
         _warned_unfocused = False
         _warned_tr = False
         _fail_sig, _fail_n = None, 0
@@ -5326,6 +6447,7 @@ class Engine:
             if panic_pressed():
                 self.kb.release_all()
                 self.log("[引擎] 急停键被按住 —— 松手即继续 (停止请按 Ctrl+C)")
+                self._publish_status(paused=True)
                 time.sleep(0.3)
                 continue
             if not game_focused():
@@ -5333,6 +6455,9 @@ class Engine:
                 if not _warned_unfocused:
                     self.log("[引擎] 游戏不在前台 —— 已暂停并松开所有键, 切回游戏自动继续")
                     _warned_unfocused = True
+                # **暂停时也要报状态**(心跳不能断): 否则外面会把"你切走了"读成
+                # "引擎挂了" —— 那两件事该让猫娘说得不一样。
+                self._publish_status(paused=True)
                 time.sleep(0.4)
                 continue
             if _warned_unfocused:
@@ -5354,6 +6479,10 @@ class Engine:
             if not st:
                 time.sleep(1)
                 continue
+            # **状态出口**: 拿一次状态就报一次(幂等, 内部按 1 秒节流)。
+            #   放在 `inRound` 判断**之前** —— 局中和"不在局里"两种都要报,
+            #   否则对局结束后文件会永远停在"进行中"的假象上。
+            self._publish_status(st)
             if not st.get("inRound"):
                 if self.scene:
                     self.log("[引擎] 对局结束, 清空缓存")

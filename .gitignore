@@ -28,6 +28,10 @@ overcooked_decomp.7z
 overcooked_decomp*.7z
 overcooked_decomp*.zip
 
+# 运行期产物 —— 引擎和外部通道交换的文件(见 neko/control.py / neko/status.py)。
+# 每局都在变, 不该进仓库。
+runtime/
+
 # 本机工具产物 / 调试快照 —— 不进仓库
 .codegraph/
 tools/_last_map.txt

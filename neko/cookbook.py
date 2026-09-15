@@ -204,11 +204,102 @@ def steps_text(node) -> str:
         p = node.get("p") or "Cooked"
         return f"煮{p}{{{inner}}}" if p != "Cooked" else f"煮{{{inner}}}"
     if k == "mix":
-        return f"搅{{{inner}}}"
+        # 和 cook 一样**带进度档**: 游戏匹配时 `m_progress` 要**精确相等**
+        # (`MixedCompositeAssembledNode.cs:38`), Unmixed/Mixed/OverMixed 是三种
+        # 不同的要求 —— 只画个 `搅{}` 会把它们抹成一样。
+        p = node.get("p") or "Mixed"
+        return f"搅{p}{{{inner}}}" if p != "Mixed" else f"搅{{{inner}}}"
     opt = node.get("o") or []
     if opt:
         inner += "  [可选:" + "+".join(steps_text(c) for c in opt) + "]"
     return inner
+
+
+# ---------------------------------------------------------------- 叶子 → 货源
+
+def _same_family(a: str, b: str) -> bool:
+    """两个名字看着是不是**同一样食材** —— DLC 前缀/下划线/大小写都不算区别。
+
+    只用来**报可疑**, 不做判据(判据是 `next == 叶子名`, 那是游戏自己的数据)。
+    例: `DLC10_Grapes` vs `Grapes` → 同类; `SushiFish` vs `SushiFish` → 同类。
+    """
+    import re as _re
+
+    def n(s: str) -> str:
+        s = _re.sub(r"^dlc\d+[_]?", "", (s or "").lower())
+        return "".join(ch for ch in s if ch.isalnum())
+
+    x, y = n(a), n(b)
+    return bool(x) and bool(y) and (x in y or y in x)
+
+
+def resolve_leaf(kb: "Knowledge", name: str) -> dict:
+    """菜谱叶子 → **取哪个东西、切不切、依据是什么**。
+
+    ☠ **这是唯一的判据**: `derive()` 和 `audit_leaves()` 都走这里。
+      为什么必须只有一份 —— 本项目已经踩过两次"同一件事两处各写一份":
+        · `OP_PREREQ` 和 `derive()` 对"先煮还是先搅"给了**相反**的顺序
+        · `brief.py` 按猜的键名找游戏那条链, 键名根本不存在 ⇒ 它一直在骗人
+      所以自检**不允许**自己再写一遍解析逻辑, 只能调这个函数。
+    """
+    raw = kb.raw_for(name)
+    ready = kb.ready_for(name)
+    crate = kb.crate_for(name)
+    from_crate_raw = crate is not None and crate.spawnNext == name
+    warn = []
+
+    # **撞名**: 多个东西切开都叫这个名字 → `raw_for` 只回第一个, 可能取错。
+    same = [i for i in kb.items if not i.prefab and i.next == name]
+    if len(same) > 1:
+        warn.append("有 %d 个东西切开都叫 %s, 只取了第一个(%s)"
+                    % (len(same), name, (same[0].ing or same[0].name)))
+    crates_hit = [c for c in kb.crates if c.spawnNext == name]
+    if len(crates_hit) > 1:
+        warn.append("有 %d 个箱子都出这种生料, 只取了第一个" % len(crates_hit))
+    # **多来源**: 既有要切的、又有现成的 → derive 会优先切(多花几刀)
+    if (raw is not None or from_crate_raw) and ready is not None:
+        warn.append("既有要切的又有现成的 —— derive 会**优先切**")
+
+    if raw is not None or from_crate_raw:
+        if raw is not None:
+            src = crate or raw
+            fetch = raw.ing or raw.name
+            stages = raw.stages
+            basis = "场上有东西 next==%s" % name
+        else:
+            src, fetch, stages = crate, (crate.spawnIng or crate.spawn or name), crate.spawnStages
+            basis = "箱子 spawnNext==%s" % name
+        if not _same_family(fetch, name):
+            warn.append("来源 %r 与叶子 %r 名字看着不是一类 —— 可能接错了货源" % (fetch, name))
+        return {"leaf": name, "kind": "chop", "fetch": fetch, "src": src,
+                "stages": stages, "basis": basis, "warnings": warn}
+
+    if ready is not None:
+        return {"leaf": name, "kind": "ready", "fetch": name, "src": crate or ready,
+                "stages": 0, "basis": "场上有现成的(没有 next)", "warnings": warn}
+    if crate is not None:
+        return {"leaf": name, "kind": "crate", "fetch": name, "src": crate,
+                "stages": 0, "basis": "箱子直接出这个", "warnings": warn}
+
+    warn.append("这道菜做不了: 场上/箱子里都没有 %s 的货源" % name)
+    return {"leaf": name, "kind": "none", "fetch": "", "src": None,
+            "stages": 0, "basis": "**没找到货源**", "warnings": warn}
+
+
+def audit_leaves(kb: "Knowledge", leaves: list) -> list:
+    """一批菜谱叶子的**来源自检** —— 逐条摊开解析结果 + 可疑之处。
+
+    为什么要有: `derive()` 是按**名字**把叶子接到货源上的(`next == 叶子名`),
+    这条匹配在几种情形下会悄悄选错, 而症状(卡在摆盘/多做一步/取错东西)隔得很远。
+    这个函数把那几种情形**当场点出来**, 让新关卡/DLC 一进来就能被看见。
+    """
+    seen, out = set(), []
+    for name in leaves:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(resolve_leaf(kb, name))
+    return out
 
 
 # ---------------------------------------------------------------- 流程推导
@@ -229,6 +320,11 @@ class Op:
     #: 就只能是容器在煮 —— 典型例子是米饭 SushiRice。
     #: 这种菜"取出来"的方式也不同: **手拿空盘对着锅按交互**, 锅留在灶上不动。
     in_pot: bool = False
+    #: **紧迫度加成分**(分)。目前只有一种东西用它: `rescue`(锅快糊了) ——
+    #: 分随"离糊还有多远"线性上涨, 见 `scoring.burn_urgency`。
+    #: 放在 `Op` 上而不是另开一张表: 候选的紧迫度是**这一轮探测时算出来的瞬时值**,
+    #: 跟着候选走最不容易失真(另存一张表就得在候选增删时同步维护)。
+    urgency: float = 0.0
 
     def __str__(self) -> str:
         extra = f"  ({self.note})" if self.note else ""
@@ -269,37 +365,26 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
             ops.append(Op("tool", name, "订单要求的器皿/成品物件", optional=optional))
             continue
 
-        raw = kb.raw_for(name)          # 场上现成的生料(Pre-Ingredient.next == name)
-        ready = kb.ready_for(name)      # 场上现成的成品
-        crate = kb.crate_for(name)      # 能提供它的箱子
-
-        # 需不需要切: 场上生料匹配, 或"箱子出的就是需切生料"(spawnNext == name)。
-        # 后者很关键 —— 生料还在箱子里没拿出来时, 场上根本没有 Pre-Ingredient 可查。
-        from_crate_raw = crate is not None and crate.spawnNext == name
-        if raw is not None or from_crate_raw:
-            if raw is not None:
-                src = crate or raw
-                raw_name = raw.ing or raw.name
-                stages = raw.stages
-            else:
-                src = crate
-                raw_name = crate.spawnIng or crate.spawn or name
-                stages = crate.spawnStages
-            ops.append(Op("fetch", raw_name, f"生料, 来自 {src.name}",
+        # 「这个叶子取什么、切不切」**只有一份判据**(`resolve_leaf`), 见那里的注释 ——
+        # 自检 (`audit_leaves`) 走的是同一个函数, 不允许另写一遍。
+        res = resolve_leaf(kb, name)
+        src = res["src"]
+        if res["kind"] == "chop":
+            ops.append(Op("fetch", res["fetch"], f"生料, 来自 {src.name}",
                           optional=optional,
                           at_name=src.name, at_x=src.x, at_z=src.z))
+            stages = res["stages"]
             ops.append(Op("chop", name,
                           f"切到变成 {name}" + (f" ({stages} 片)" if stages else ""),
                           optional=optional, chop_stages=stages))
-        elif ready is not None:
-            src = crate or ready
+        elif res["kind"] == "ready":
             ops.append(Op("fetch", name, f"直接取成品, 来自 {src.name}",
                           optional=optional,
                           at_name=src.name, at_x=src.x, at_z=src.z))
-        elif crate is not None:
-            ops.append(Op("fetch", name, f"从箱子 {crate.name} 取",
+        elif res["kind"] == "crate":
+            ops.append(Op("fetch", name, f"从箱子 {src.name} 取",
                           optional=optional,
-                          at_name=crate.name, at_x=crate.x, at_z=crate.z))
+                          at_name=src.name, at_x=src.x, at_z=src.z))
         else:
             ops.append(Op("fetch", name, "⚠ 找不到货源(箱子/生料/成品都没匹配上)",
                           optional=optional))

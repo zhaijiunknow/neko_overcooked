@@ -72,7 +72,7 @@ def chains(b, st, km) -> None:
     这一节是给"行为解析"那块的诊断用(交接包 §0.5 B):
     两条链**逐行对得上**才算 `derive()` 忠实; 对不上的地方就是下一批 bug 的产地。
     """
-    from cookbook import Knowledge, derive
+    from cookbook import Knowledge, derive, steps_text, audit_leaves, walk
     details = st.get("details") or []
     if not details:
         print("  (游戏没报菜谱明细 —— 不在对局里?)")
@@ -82,13 +82,22 @@ def chains(b, st, km) -> None:
     except Exception as e:                                        # noqa: BLE001
         print("  知识表读不到(%r) —— 只打游戏侧" % e)
         know = None
+    leaves = []
     for d in details:
         name = d.get("name") or "?"
         print("\n  【%s】" % name)
-        raw = d.get("chain") or d.get("steps") or d.get("nodes")
-        print("    游戏认的: %s" % (raw if raw else
-                                   "(这条 key 没解析出来, 原样: %s)"
-                                   % str({k: v for k, v in d.items() if k != "name"})[:300]))
+        # ⚠ **游戏认的那条链就是 `tree`** —— `StateCollector` 报的是
+        #   `RecipeReader.Describe()` 的 `{name, plate, tree}`, tree 是
+        #   `OrderDefinitionNode.Convert()` 出来的**嵌套树**(键 k/p/i/o/n):
+        #     k = cook/mix/comp/ing/item/null; p = 该结点的加工进度(Raw/Cooked/Burnt、Mixed…)
+        #     i = 必需材料; o = 可选材料
+        #   这里原来找的是 `chain`/`steps`/`nodes` 三个**根本不存在**的键, 于是永远
+        #   走"没解析出来"那条路 —— 这个对比工具等于一直是坏的, 也就没人发现
+        #   `derive()` 和它不一致(见 `cookbook.derive` 那几处近似)。
+        #   ⚠ 树的**嵌套形状就是加工分组**: `cook{Flour,Prawn}`(一起进一个锅) 和
+        #     `comp{cook{Flour},cook{Prawn}}`(两口锅) 在游戏里**互不等价**。
+        tree = d.get("tree")
+        print("    游戏认的: %s" % (steps_text(tree) if tree else "(游戏没给 tree)"))
         if know is None:
             continue
         try:
@@ -98,6 +107,28 @@ def chains(b, st, km) -> None:
             continue
         print("    derive(): %s" % " → ".join(
             "%s %s" % (o.action, o.target) for o in flow.ops))
+        for kind, nm, _ch in walk(tree):          # 收集叶子, 给末尾那节自检用
+            if kind != "item" and nm:
+                leaves.append(nm)
+
+    # ------------------------------------------------ 叶子来源自检
+    # 把"每个菜叶子会被解析成取什么/切不切"当场摊开并**报可疑**。
+    # 为什么放在这里: `derive()` 是按**名字**(`next == 叶子名`)把叶子接到货源上的,
+    # 这条匹配在撞名 / 多来源 / 接错货源时会**悄悄选错**, 而症状(卡在摆盘、多做一步、
+    # 取错东西)离得很远。新关卡/DLC 一进来跑一下这里, 就能当场看见。
+    if know is not None and leaves:
+        print("\n  ---- 叶子来源自检 ----")
+        rows = audit_leaves(know, leaves)
+        n_warn = 0
+        for r in rows:
+            if r["warnings"]:
+                n_warn += 1
+            print("    %-18s → %-18s [%s]%s"
+                  % (r["leaf"], r["fetch"] or "-", r["basis"],
+                     ("  ⚠ " + "; ".join(r["warnings"])) if r["warnings"] else ""))
+        print("    共 %d 个叶子, %d 条可疑%s"
+              % (len(rows), n_warn,
+                 " —— 可疑是**给人看**的, 未必是错(比如撞名里两个名字其实同类)" if n_warn else " ✓"))
 
 
 def main() -> int:

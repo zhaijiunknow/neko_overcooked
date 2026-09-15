@@ -158,6 +158,16 @@ def height_ok(fy, at_y, tol: float = None) -> bool:
     return abs(float(fy) - float(at_y)) <= (DEFAULT_HEIGHT_TOLERANCE if tol is None else tol)
 
 
+def adjacent8(a, b) -> bool:
+    """两格是不是 8 邻接(切比雪夫距离 ≤ 1)。
+
+    用来在拉直路径时认出"这一跳不是走过去的, 是**传送门跳变**" —— 见
+    `TerrainMap._smooth`。放成模块函数是为了和 `find_path` 里生成邻接的那段
+    用同一个判据(那边也是 4 + 4 个方向)。
+    """
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1])) <= 1
+
+
 class TerrainMap:
     """一张关卡网格。由 `bridge.get_map()` 的返回构造。"""
 
@@ -634,7 +644,8 @@ class TerrainMap:
                   allow_platform: bool = True, allow_travelator: bool = True,
                   max_nodes: int = 8000, use_reach: bool = True,
                   blocked: set = None, at_y: float = None,
-                  extra_edges: dict = None) -> list:
+                  extra_edges: dict = None,
+                  diagonal: bool = True, smooth: bool = True) -> list:
         """在**安全格**上跑 A*, 返回途经点世界坐标列表(不含起点)。
 
         目标本身通常是台子(障碍格), 所以终点取它周围最近的可走格。
@@ -652,6 +663,18 @@ class TerrainMap:
           为什么必须单独传: 地形是**整局一次的静态快照**, 而车会开、路人会走 ——
           快照把它们冻在第一次扫到的位置, 于是"地图说安全的地方"可能是车的位置。
           把它当静态障碍画进地里, 比不知道更危险。
+
+        diagonal / smooth: **8 邻接 + 视线拉直**(2026-09-15 加)。
+          为什么要: 4 邻接的 A* 只能给出一串**格子折线** —— 每拐一次弯, 执行层就要
+          "到位→转身→再走"一轮(见 `Engine.navigate` 的死区/翻转判据), 路点一多就
+          表现为"目标在 1 格外却卡住/超时"。而执行层本来就是**模拟量驱动**
+          (`Engine.navigate` 的 `analog` 分支直接喂归一化方向, 游戏自己平滑对角前进),
+          所以只要两格心之间**整段安全**, 就该直接走直线。
+          · `diagonal=False` → 退回原来的 4 邻接(启发式也退回 Manhattan,
+            否则 octile 会**高估**对角步的真实代价 √2, 启发式不再可采纳, 路径变次优)
+          · `smooth=False`   → 只加对角, 不拉直(调试/对比用)
+          · **拉直的每一跳都按和 A* 完全一样的判据重验**(`_line_clear`),
+            不是"看得见就走" —— 否则会拉出一条 A* 自己都不认的边。
         """
         if not self.ok:
             return []
@@ -696,7 +719,14 @@ class TerrainMap:
             return [self.world_of(*start)]
 
         def h(c):
-            return min(abs(c[0] - g[0]) + abs(c[1] - g[1]) for g in goals)
+            if not diagonal:
+                return min(abs(c[0] - g[0]) + abs(c[1] - g[1]) for g in goals)
+            # octile 启发: `max + (√2−1)·min` —— 8 邻接下比 Manhattan 紧得多
+            # (Manhattan 可采纳但太松, 会白扩展一大堆格子)。
+            # ⚠ 只有在对角步代价真的是 √2 时才可采纳, 所以它和 `diagonal` 绑在一起。
+            return min(max(abs(c[0] - g[0]), abs(c[1] - g[1]))
+                       + 0.41421356 * min(abs(c[0] - g[0]), abs(c[1] - g[1]))
+                       for g in goals)
 
         openq = [(h(start), 0, start)]
         came = {start: None}
@@ -709,14 +739,29 @@ class TerrainMap:
                 break
             if len(best) > max_nodes:
                 break
-            nbs = [(cur[0] + dx, cur[1] + dz) for dx, dz in
-                   ((1, 0), (-1, 0), (0, 1), (0, -1))]
-            # 额外边(传送门): 从这一格可以直接"到"对端那一格。
-            nbs += [t for t in (extra_edges or {}).get(cur, ())]
-            for nb in nbs:
-                if not ok(nb, cur) and nb not in (extra_edges or {}).get(cur, ()):
+            dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+            if diagonal:
+                dirs = dirs + ((1, 1), (1, -1), (-1, 1), (-1, -1))
+            _ee = (extra_edges or {}).get(cur, ())
+            nbs = []
+            for dx, dz in dirs:
+                diag = (dx != 0 and dz != 0)
+                # ☠ **对角不许"切角"**: 两个正交邻格都得走得通, 否则会从两个障碍的
+                #   夹缝里斜着穿过去(画面上就是蹭墙角/卡边框)。
+                #   ⚠ 判据和下面的 `ok(nb, cur)` 是**同一套边模型**(含 `step_ok` 的高度差),
+                #     不是"那两格是不是 '.'" —— 否则对角能过、正交不能过, 自相矛盾。
+                if diag:
+                    if (not ok((cur[0] + dx, cur[1]), cur)
+                            or not ok((cur[0], cur[1] + dz), cur)):
+                        continue
+                nbs.append(((cur[0] + dx, cur[1] + dz),
+                            1.41421356 if diag else 1.0))
+            # 额外边(传送门 + 地面传送带): 从这一格可以直接"到"对端那一格。
+            nbs += [(t, 1.0) for t in _ee]
+            for nb, cost in nbs:
+                if not ok(nb, cur) and nb not in _ee:
                     continue
-                ng = gc + 1
+                ng = gc + cost
                 if nb in best and best[nb] <= ng:
                     continue
                 best[nb] = ng
@@ -731,9 +776,91 @@ class TerrainMap:
             cells.append(cur)
             cur = came[cur]
         cells.reverse()
+        if smooth:
+            cells = self._smooth(cells, ok, diagonal)
         return [self.world_of(i, j) for i, j in cells[1:]]
 
+    def _smooth(self, cells: list, ok, diagonal: bool = True) -> list:
+        """把格子折线**拉直**(视线裁剪): 直线看得见的下一个路点, 中间的点全删掉。
+
+        这是"走直线而不是走格子"的关键 —— 执行层是模拟量驱动(见 `Engine.navigate`
+        的 `analog` 分支), 中间那些格心本来就不必一个个踩过去。
+
+        ☠ **不许跨过"传送门跳变"**: 传送门两端之间**没有可走的边**, 硬拉直会把它
+          抹掉, 变成"直接走过去"(而那片多半是水/墙)。所以只在**连续相邻**的几跳
+          之内拉直, 遇到跳变就把那一跳原样留着。
+        """
+        n = len(cells)
+        if n <= 2:
+            return cells
+        out = [cells[0]]
+        anchor = 0
+        while anchor < n - 1:
+            # 从 anchor 出发最远能连续走到哪(一路都是相邻格) —— 遇到跳变就停。
+            limit = anchor
+            while limit < n - 1 and adjacent8(cells[limit], cells[limit + 1]):
+                limit += 1
+            if limit == anchor:
+                out.append(cells[anchor + 1])     # 下一跳就是传送门: 原样保留
+                anchor += 1
+                continue
+            # 兜底 `anchor + 1`: 至少保留"A* 走过的那一跳"(它必然是合法的),
+            # 否则万一没有可拉直的 j, `last` 停在 anchor 上会让循环原地打转。
+            last = anchor + 1
+            for j in range(limit, anchor + 1, -1):
+                if self._line_clear(cells[anchor], cells[j], ok, diagonal):
+                    last = j
+                    break
+            out.append(cells[last])
+            anchor = last
+        return out
+
+    def _line_clear(self, a: tuple, b: tuple, ok, diagonal: bool = True) -> bool:
+        """格 a 到格 b 的**整条直线**是不是每一跳都合法(Bresenham 逐格采样)。
+
+        ⚠ 判据必须和 A* 的邻接**逐条一致**(`ok(nb, 前格)` 的边模型 + 对角不切角),
+          否则拉直会拉出一条 A* 自己都不认的边 —— 那就成了"规划出来的路走不了",
+          而且症状会伪装成"寻路又坏了"。
+        """
+        x0, z0 = a
+        x1, z1 = b
+        dx = abs(x1 - x0)
+        dz = abs(z1 - z0)
+        sx = 1 if x0 < x1 else (-1 if x0 > x1 else 0)
+        sz = 1 if z0 < z1 else (-1 if z0 > z1 else 0)
+        err = dx - dz
+        x, z = x0, z0
+        prev = a
+        while (x, z) != (x1, z1):
+            e2 = 2 * err
+            step_x = step_z = 0
+            if e2 > -dz:
+                err -= dz
+                x += sx
+                step_x = sx
+            if e2 < dx:
+                err += dx
+                z += sz
+                step_z = sz
+            cur = (x, z)
+            if not ok(cur, prev):
+                return False
+            if step_x and step_z:
+                if not diagonal:
+                    return False          # 关了对角, 就不许拉出对角段
+                if (not ok((prev[0] + step_x, prev[1]), prev)
+                        or not ok((prev[0], prev[1] + step_z), prev)):
+                    return False          # 和 A* 一样: 不切角
+            prev = cur
+        return True
+
     # ---------------------------------------------------------------- 连通性
+    #: ☠ **返回值类型别搞混**: `distances_from` 返回 **dict**(格 -> 几步),
+    #:   `reachable_from` 返回 **set**(到得了的格)。
+    #:   两者在 `c in reach` 那类判据里**通用**, 所以历史上调用方各传各的、一直没出事 ——
+    #:   直到有人要**按步数排序**(用了 `.get`) ⇒ `'set' object has no attribute 'get'`
+    #:   ⇒ **每次 fetch 都抛异常, 一整局报废**(2026-09-15 实机)。
+    #:   要排序就传 **dict**; 只用 `in` 则两者都行。
     def distances_from(self, x: float, z: float,
                        allow_platform: bool = True,
                        allow_travelator: bool = True,

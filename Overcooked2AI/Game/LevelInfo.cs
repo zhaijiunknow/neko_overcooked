@@ -250,6 +250,10 @@ namespace Overcooked2AI.Game
         {
             bool force = !string.IsNullOrEmpty(arg) &&
                          arg.IndexOf("force", StringComparison.OrdinalIgnoreCase) >= 0;
+            // **交互足迹**(见 `Footprint` 的注释): 加 `foot` 才算 —— 它比建图本身还贵
+            // (每个台面 × 每个能站的格子 × 每个碰撞体一次纯几何判定), 平时零成本。
+            bool wantFoot = !string.IsNullOrEmpty(arg) &&
+                            arg.IndexOf("foot", StringComparison.OrdinalIgnoreCase) >= 0;
             // 缓存最多能有多旧 —— 调用方可以用 `maxage=N` 覆盖默认的 5 秒。
             // 为什么必须能覆盖: 5 秒对人看地图够用, 但**寻路前**太旧了 ——
             //   限时平台升降、荷叶沉浮这类变化, 5 秒足够厨师走出 20 格,
@@ -272,16 +276,23 @@ namespace Overcooked2AI.Game
             catch (Exception) { }
 
             float now = Time.realtimeSinceStartup;
-            if (!force && _cache.Length > 0 && _cacheScene == scene && now - _cacheTime < maxAge)
+            // ☠ **`foot` 这一支不走缓存, 也不写缓存** —— 缓存里没有 `arg` 这个维度,
+            //   一次 `map foot` 会把"带足迹的那份"盖到 `_cache` 上, 后面普通的 `map`
+            //   就会收到一大堆它没要的足迹数据(而且**看起来完全正常**, 只是变大了)。
+            if (!force && !wantFoot && _cache.Length > 0 && _cacheScene == scene
+                && now - _cacheTime < maxAge)
                 return _cache;
 
             string json;
-            try { json = Build(); }
+            try { json = Build(wantFoot); }
             catch (Exception ex) { return "{\"error\":\"" + Safe(ex.Message) + "\"}"; }
 
-            _cache = json;
-            _cacheScene = scene;
-            _cacheTime = now;
+            if (!wantFoot)
+            {
+                _cache = json;
+                _cacheScene = scene;
+                _cacheTime = now;
+            }
             return json;
         }
 
@@ -299,7 +310,134 @@ namespace Overcooked2AI.Game
             return false;
         }
 
-        private static string Build()
+        /// <summary>**交互足迹** —— 每个台面"站在哪些格子上、面朝它, 游戏说能作用到"。
+        ///
+        /// ☠☠ **已知定位(2026-09-15, 用户实测对照过的结论): 它量的是「几何上够不够得着」,
+        ///   不是「实际能不能用」。** 别拿它下结论、**更别把它的输出接进评分**。
+        ///   差在哪 —— 它只调了**内层**的 `InteractWithItemHelper.IsColliderInArc`,
+        ///   把真正的入口 `GetCollidersInArc(1f, PI, m_Transform, m_colliders,
+        ///   m_interactMask, m_bGridSelection)` **外面两层整个跳过了**:
+        ///     · `_gridSelection` → `GetFacingGridOccupant()` → `ScoreFacingGridCollider`:
+        ///       **把附近格子上的碰撞体按"和厨师朝向有多对齐"打分, 取最对齐的那个**。
+        ///       于是站在斜角上时游戏锁到的是**旁边那块**柜台, 不是角上这块
+        ///       (用户原话: "自动选择的台面会被更靠近的左和上吸掉, 锁不到最角落的那个");
+        ///     · `m_interactMask` 层掩码 —— 根本没传;
+        ///     · `m_bGridSelection` 来自 `m_levelConfigBase.m_gridSelection`, **每关配置**。
+        ///   实测: 岛屿四角的 `countertop_01_standard_gold`, 这个足迹说"够得着"(斜角 1.7 格),
+        ///   而**厨师和台面的碰撞体根本挤不进去、游戏也锁不到它** ⇒ 实际拿不到。
+        ///   ⇒ **`Engine._stand_cell_of(ortho_only=True)` 才是和实机一致的模型**
+        ///     (它编码的正是"厨师站得进去 + 游戏能锁到它"), 那个判据**不要动**。
+        ///
+        ///   要让它变得忠实也能做(补上那两层), 但补完就是**重新推导一遍
+        ///   `_stand_cell_of(ortho_only=True)` 已经做完的事** —— 所以**不值得**。
+        ///   留着它是当**诊断工具**用的: 问"几何上到底够不够得着"。
+        ///
+        /// 为什么当初要做它(用户 2026-09-15): "**做交互之前先决定可行性**……如果不能和下一步
+        /// 交互直接拉低评分, 去做其他的东西"。原本的设想是 **fork 一份游戏状态**去模拟,
+        /// 因为要模拟移动 —— 但那条路**走不通**, 三条都是结构性的:
+        ///   · Unity 没有场景快照/还原, 场景是活的 MonoBehaviour 对象图 + 物理状态 + 协程;
+        ///   · 这游戏还有 client/server 同步层(`ServerXxx`/`ClientXxx` 成对), 克隆体
+        ///     立刻和网络脱节, 模拟出来的"可用"是另一个世界的答案;
+        ///   · 克隆体也推不动 —— 逻辑在 `Update()` 里由主循环和 `Time.deltaTime` 驱动。
+        ///   (顺带排除"瞬移厨师→问→还原": 厨师 transform 是网络同步的, 服务端会看见并校正。)
+        /// 判据本身**是**纯几何 —— `IsColliderInArc`(`InteractWithItemHelper.cs:153`)
+        /// 只依赖 (厨师位置, 朝向, 碰撞体几何), 所以确实"可以对还没站上去的格子问"。
+        /// 只是**几何成立 ≠ 实际用得成** —— 这就是上面那条定位的全部含义。
+        ///
+        /// ⚠⚠ **必须调游戏那个函数本身**, 不许在 Python 里重推 —— 交互半径量的是
+        ///   "到**碰撞体表面**"的距离(1.0), 台面有体积, 格心距离没有可比性
+        ///   (开发约定 规则 2)。`arc = PI` ⇒ `cos(PI/2) = 0` ⇒ 朝向前 180°。
+        /// ⚠ `IsColliderInArc` 内部先把 Y 清零再比距离和点积 ⇒ **纯 2D**, 厨师高度不影响,
+        ///   所以格子中心可以直接用 `(x, 0, z)`。
+        /// ⚠ 只在**能站的格**上算(`.`/`P`/`T`/`C`) —— 站不住的格子算了也没用,
+        ///   而且这是把这个数组压小的主要手段。
+        /// ⚠ 朝向取"格子中心 → 台面中心"。执行时是 `face(台面)` 定的, 和这一致。
+        /// ⚠ 取的是 `GetComponentsInChildren<Collider>()` ⇒ 台面上**放着的东西**(盘子等)
+        ///   的碰撞体也在内 ⇒ 语义是"能作用到这个台面**或它上面的东西**"。这正是我们要的
+        ///   (站在柜台边既可能要放、也可能要拿), 但它**不是**"这个台面本身"。
+        ///
+        /// 输出 `[{"iid":N,"n":"<名字>","cells":[n0,n1,…]}]`, `n = j*w + i`, 和 `grid` 同索引。
+        /// 用 `iid`(Unity instanceID)当键 —— 和 `map_model._station_sort_key` 同一个约定。
+        /// </summary>
+        private static string Footprint(int w, int h, float[] xs, float[] zs, string grid)
+        {
+            var gos = new List<GameObject>();
+            var iids = new List<int>();
+            var names = new List<string>();
+            try { SceneScanner.EachStation(gos, iids, names); }
+            catch (Exception) { }
+
+            var o = new StringBuilder();
+            o.Append("[");
+            int emitted = 0, total = w * h;
+            for (int s = 0; s < gos.Count; s++)
+            {
+                var go = gos[s];
+                if (go == null)
+                    continue;
+                Collider[] cols = null;
+                Vector3 centre;
+                try
+                {
+                    cols = go.GetComponentsInChildren<Collider>();
+                    centre = go.transform.position;
+                }
+                catch (Exception) { continue; }
+                if (cols == null || cols.Length == 0)
+                    continue;
+
+                var cells = new List<int>();
+                for (int n = 0; n < total; n++)
+                {
+                    char ch = n < grid.Length ? grid[n] : '?';
+                    if (ch != '.' && ch != 'P' && ch != 'T' && ch != 'C')
+                        continue;                       // 站不住的格子不算
+                    var pos = new Vector3(xs[n], 0f, zs[n]);
+                    var dir = new Vector3(centre.x - pos.x, 0f, centre.z - pos.z);
+                    if (dir.sqrMagnitude < 0.0001f)
+                        continue;                       // 就站在台面中心 ⇒ 朝向没有意义
+                    dir = dir.normalized;
+                    bool hit = false;
+                    for (int c = 0; c < cols.Length && !hit; c++)
+                    {
+                        if (cols[c] == null)
+                            continue;
+                        try
+                        {
+                            hit = InteractWithItemHelper.IsColliderInArc(
+                                cols[c], pos, dir, 1f, Mathf.PI);
+                        }
+                        catch (Exception) { }
+                    }
+                    if (hit)
+                        cells.Add(n);
+                }
+                if (cells.Count == 0)
+                    continue;
+                if (emitted > 0)
+                    o.Append(",");
+                o.Append("{\"iid\":").Append(iids[s])
+                 .Append(",\"n\":\"").Append(Safe(names[s])).Append("\"");
+                // ⚠ **台面自己的坐标也要报** —— 足迹格只覆盖"能站的格子", 它们围成的
+                //   重心**不等于**台面中心。对照实验要拿台面坐标去喂引擎的
+                //   `_stand_cell_of`, 用重心当近似会让差值失真(量出来的差异里混进
+                //   "我喂错了坐标"这一项)。
+                o.Append(Inv(",\"x\":", centre.x)).Append(Inv(",\"z\":", centre.z))
+                 .Append(",\"cells\":[");
+                for (int k = 0; k < cells.Count; k++)
+                {
+                    if (k > 0)
+                        o.Append(",");
+                    o.Append(cells[k]);
+                }
+                o.Append("]}");
+                emitted++;
+            }
+            o.Append("]");
+            return o.ToString();
+        }
+
+        private static string Build(bool wantFoot)
         {
             var gm = ResolveGridManager();
             if (gm == null)
@@ -667,6 +805,14 @@ namespace Overcooked2AI.Game
             o.Append(",\"regular\":").Append(regular ? "true" : "false");
             o.Append(",\"grids\":").Append(GridManager.GetActiveCount());
             o.Append(",\"grid\":\"").Append(sb.ToString()).Append("\"");
+            // ---- 交互足迹(只有 `map foot` 才算, 见 `Footprint`) ----
+            // 放在 grid 之后: 它要用同一份格子和同一套 `xs[]/zs[]`, 而且**必须**和
+            // grid 同索引(`n = j*w + i`)才对得上。
+            if (wantFoot)
+            {
+                string gridStr = sb.ToString();
+                o.Append(",\"foot\":").Append(Footprint(w, h, xs, zs, gridStr));
+            }
             // 地形版本号(见上面算它的那段注释) —— 变了就说明"可走性"变了。
             o.Append(",\"ver\":\"").Append(ver.ToString("x8")).Append("\"");
             o.Append(",\"hazards\":[");

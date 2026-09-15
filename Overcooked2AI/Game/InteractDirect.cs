@@ -78,15 +78,28 @@ namespace Overcooked2AI.Game
                 if (impl == null)
                     return Err("这个厨师身上没有 ServerPlayerControlsImpl_Default");
 
-                // 游戏自己算好的交互目标。先强制刷新一次 —— 否则读到的可能是
-                // 上一帧的旧值(手持物刚变化后, m_iHandlePlacement 会短暂指向
-                // 刚拿起来的东西, 导致"手拿盘子去取菜却作用到自己身上")。
+                // 游戏自己算好的交互目标。
+                //
+                // ☠ **下面那行"强制刷新"本身是个悬案**(2026-09-15):
+                //   它当初被加进来, 是为了修"手拿盘子去取菜却作用到自己身上";
+                //   而另一条并行线把它**删掉了**, 理由正好相反 —— "直调再刷一次会脱离
+                //   **按下这一帧**的朝向/站位, 把 m_iHandlePlacement 刷成手里的东西或
+                //   别的格子, 反而投错目标"。**光读代码定不了谁对**(两边都有实机症状)。
+                //   ⇒ 顺手把"刷新前 / 刷新后"两个放置判决都报回 Python, 实机跑一次就有数据:
+                //       两个值不同 ⇒ 这行确实在改判决(改好还是改坏, 对着日志看)
+                //       一直相同   ⇒ 它是空转, 可以按对面那样删掉
+                string placeCanBefore = PlaceCanHandle(controls, ReadPlacement(controls),
+                                                       Held(controls) != null,
+                                                       "placeCanHandleBefore");
                 try { controls.UpdateNearbyObjects(); } catch (Exception) { }
                 GameObject pick = ReadGo(controls, "m_TheOriginalHandlePickup");
                 GameObject use = ReadComp(controls, "m_interactable");
                 GameObject place = ReadPlacement(controls);   // m_iHandlePlacement 所在物体
                 bool useIsPlaceBtn = UsePlacementButton(controls);
                 bool holding = Held(controls) != null;
+                // 运行时判决: 目标台面此刻到底收不收手里的东西(**只读**, 不动世界状态)。
+                // 拿不到答案就报 null, 绝不影响下面真正的动作。
+                string placeCan = PlaceCanHandle(controls, place, holding);
                 GameObject target = pick;
                 string method = "ReceivePickUpEvent";
                 string extra = "";
@@ -187,10 +200,11 @@ namespace Overcooked2AI.Game
 
                 return string.Format(
                     "{{\"ok\":true,\"player\":{0},\"action\":\"{1}\",\"method\":\"{2}\",\"target\":\"{3}\"" +
-                    ",\"held\":\"{4}\",\"pick\":\"{5}\",\"place\":\"{6}\"{7}}}",
+                    ",\"held\":\"{4}\",\"pick\":\"{5}\",\"place\":\"{6}\"{7}{8}{9}}}",
                     player, Safe(action), method, Safe(target != null ? target.name : "(null)"),
                     Safe(holding ? "yes" : "no"), Safe(pick != null ? pick.name : ""),
-                    Safe(place != null ? place.name : ""), extra);
+                    Safe(place != null ? place.name : ""), extra, placeCan,
+                    placeCanBefore);
             }
             catch (Exception ex)
             {
@@ -298,6 +312,122 @@ namespace Overcooked2AI.Game
                 return comp.gameObject;
             }
             catch (Exception) { return null; }
+        }
+
+        /// <summary>**运行时判决**(只读): 目标台面此刻到底允不允许放下手里的东西。
+        ///
+        /// 为什么要有: 引擎那边判断"放得进去"只能比 `m_iHandlePlacement` 那个**宿主的名字**
+        /// (`Engine._align_for_place`), 它答不了"名字对了、站位朝向对了, 但游戏这会儿就是不收"
+        /// (锅在煮/盘子满了/台面类型不对)。这个探针把**游戏自己的答案**原样报回 Python,
+        /// 让"放不进去"这类 bug 有一句权威结论, 而不是靠名字比对推测。
+        ///
+        /// 反编译依据 —— `PlayerControlsHelper.PlaceHeldItem_Server:126-147` 就是完整的放置流程:
+        ///   `GetControllingPlacementHandler_Server(_target)` 拿 `IHandlePlacement`
+        ///   → `CanHandlePlacement(carrier, forward.XZ().normalized, new PlacementContext(Source.Player))`
+        ///   → **真** ⇒ `HandlePlacement`; **假** ⇒ `OnFailedToPlace`;
+        ///   **拿不到句柄** ⇒ `carrier.TakeItem()`(**东西直接丢在脚下**)。
+        /// 这里复现的正是中间那一步, 一分世界状态都不改。
+        ///   · `GetControllingPlacementHandler_Server` 是 `public static`
+        ///     (`PlayerControlsHelper.cs:164`)
+        ///   · `CanHandlePlacement` 声明在 `IBaseHandlePlacement`, 具体台面类里是 public 实现
+        ///     (`ClientAttachStation.cs:241`) ⇒ 先按**具体类型**找, 找不到再回**接口**上找
+        ///   · `carrier` 取 `ICarrier`: 优先 `ServerPlayerAttachmentCarrier`(权威), 退回客户端的
+        ///   · `PlacementContext` 是 struct, 构造函数带默认参 `Source = Game`
+        ///     ⇒ `Activator.CreateInstance(type, Source.Player)` 走的就是它
+        /// </summary>
+        private static string PlaceCanHandle(PlayerControls controls, GameObject place, bool holding,
+                                             string key = "placeCanHandle")
+        {
+            if (!holding || place == null)
+                return ",\"" + key + "\":null";
+            try
+            {
+                var phType = SceneScanner.FindType("PlayerControlsHelper");
+                if (phType == null)
+                    return ",\"" + key + "\":null";
+                var getHandler = phType.GetMethod("GetControllingPlacementHandler_Server",
+                    BindingFlags.Public | BindingFlags.Static);
+                if (getHandler == null)
+                    return ",\"" + key + "\":null";
+                object handler = getHandler.Invoke(null, new object[] { place });
+                if (handler == null)
+                    return ",\"" + key + "\":null";     // 游戏自己会走 TakeItem(丢脚下)
+
+                var carrier = FindCarrier(controls);
+                if (carrier == null)
+                    return ",\"" + key + "\":null";
+
+                var m = handler.GetType().GetMethod("CanHandlePlacement",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (m == null)
+                {
+                    // 具体类里可能是显式实现 → 回到接口上找(声明在 IBaseHandlePlacement)
+                    var it = handler.GetType().GetInterface("IBaseHandlePlacement")
+                             ?? handler.GetType().GetInterface("IHandlePlacement");
+                    if (it != null)
+                        m = it.GetMethod("CanHandlePlacement");
+                }
+                if (m == null)
+                    return ",\"" + key + "\":null";
+
+                var fwd = controls.transform.forward;
+                var dir = new Vector2(fwd.x, fwd.z);
+                if (dir.sqrMagnitude > 0.0001f)
+                    dir = dir.normalized;
+
+                object ctx = MakePlacementContext();
+                if (ctx == null)
+                    return ",\"" + key + "\":null";
+
+                object ok = m.Invoke(handler, new object[] { carrier, dir, ctx });
+                // ⚠ **必须自带前导逗号**: 这一串是直接粘在 `\"place\":\"…\"` 后面的
+                //   (见结果那段 `{7}{8}{9}`), 和 `extra` 一样 —— 少一个逗号就是
+                //   整条 JSON 报废(实测: 每一次"手上有东西"的直调都解析失败,
+                //   表现成"东西放不进盘", 而日志只报 `Expecting ',' delimiter`)。
+                return ",\"" + key + "\":" + ((ok is bool && (bool)ok) ? "true" : "false");
+            }
+            catch (Exception)
+            {
+                // 探针**只报事实, 出错就当"不知道"** —— 绝不能因为它让放置本身失败。
+                return ",\"" + key + "\":null";
+            }
+        }
+
+        /// <summary>`new PlacementContext(PlacementContext.Source.Player)` —— 和
+        /// `PlaceHeldItem_Server` 里那个是同一个(`PlayerControlsHelper.cs:135`)。</summary>
+        private static object MakePlacementContext()
+        {
+            var pcType = SceneScanner.FindType("PlacementContext");
+            if (pcType == null)
+                return null;
+            var srcType = SceneScanner.FindType("PlacementContext+Source");
+            object src = null;
+            if (srcType != null)
+            {
+                try { src = Enum.Parse(srcType, "Player"); } catch (Exception) { }
+            }
+            try
+            {
+                return src != null ? Activator.CreateInstance(pcType, new object[] { src })
+                                   : Activator.CreateInstance(pcType);
+            }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>这只厨师的 `ICarrier` —— 手上那个东西的载体, 放置判定的第一个参数。</summary>
+        private static object FindCarrier(PlayerControls controls)
+        {
+            foreach (var tn in new string[] {
+                "ServerPlayerAttachmentCarrier", "ClientPlayerAttachmentCarrier" })
+            {
+                var t = SceneScanner.FindType(tn);
+                if (t == null)
+                    continue;
+                var c = controls.GetComponentInChildren(t);
+                if (c != null)
+                    return c;
+            }
+            return null;
         }
 
         /// <summary>当前可交互物是不是把"拾取键"当触发键用(`ClientInteractable.UsePlacementButton`)。

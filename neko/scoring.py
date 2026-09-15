@@ -54,8 +54,38 @@ STEP_VALUE = {
     "work": 11.0,         # 加工台面上没加工完的料(切/搅/烘同一条路)
     "wash": 10.0,         # 洗盘子
     "press": 8.0,         # 按机关
+    # 救快糊的锅。**基础分故意低**(低于 `YIELD_MIN_SCORE`): 刚进报警时它该让位给
+    # 队友/让位给主流程; 真正让它涨起来的是**紧迫度加成分**(见 `burn_urgency`)。
+    "rescue": 15.0,
 }
 STEP_VALUE_DEFAULT = 10.0   # 没见过的动作
+
+#: 锅从"刚报警"到"糊掉"之间, 紧迫度最多能加多少分。
+#:
+#: **两个交叉点决定了这个数该多大**(算给下一个调参的人看, 别凭手感):
+#:   · 压过 `deliver`(100, 表里最高的菜谱动作) 的位置 —— 那之前脚本会"先把手上这盘送完"。
+#:     解 `15 + M·(ratio−1) > 100` ⇒ `ratio > 1 + 85/M`。M=200 ⇒ **ratio ≈ 1.43**。
+#:   · 高于 `YIELD_MIN_SCORE`(不再让位给队友)的位置: `ratio > 1 + (12−15)/M` ⇒ M=200 ⇒ **1.0**(立刻)。
+#:
+#: 为什么交叉点要落在 **1.4 左右**(而不是更晚): 剩下的时间 `(2−ratio)·need`, 对 10 秒的菜
+#:   · ratio 1.43 ⇒ **还剩约 5.7 秒** —— 够走过去(一格 0.3 秒 + 站位的开销);
+#:   · ratio 1.65 ⇒ 只剩 3.5 秒 —— 多半**走到了也来不及**(我第一版取 130 就是这里错)。
+#: 而 1.0~1.2 之间(刚熟、还有 8 秒以上)不该抢别人的活 —— 那时让位给站在旁边的人更合理。
+BURN_URGENCY_MAX = 200.0
+
+#: **"手上这份先做完"的加成分**。用户 2026-09-15 讲的机制:
+#:   > "比如 SushiRice, 想要放在盘子上需要**先煮熟**" —— 生米**永远**上不了盘,
+#:   > 它唯一的出路就是进锅; 而腾出手又只能靠"放进盘子"或"丢地上"。
+#:
+#: 为什么必须有这一项(实测 `s_sushi_1_3`): 手里拿着**生** SushiRice 时, 评分选了
+#:   `fetch Cucumber`(4 格, -12.0) 而不是 `cook SushiRice`(20 格, -19.0) —— **纯按距离**,
+#:   于是生米一直晾在手上 → `op_fetch` 想把它搁到摆盘位 → **游戏拒收**(生料上不了盘)
+#:   → 一整局绕死。加 20 分之后: `cook`(45+20=65) 压过 `fetch`(12) ⇒ 先把手上这份推进。
+#:
+#: ⚠ 它同时也修好了"材料散落"那一类: 拿着切好的料时, `assemble`(60+20=80) 会压过
+#:   "再去取下一份"(≈19) ⇒ 走的是 `derive` 注释里写的节奏——"每个材料处理完就立刻
+#:   放到组装台面, 把手腾出来给下一个材料"。
+HAND_ADVANCE_BONUS = 20.0
 
 #: 杂活"**明显顺路**"的两个阈值(格)。菜谱还有能做的动作时, 只有同时满足这两条
 #: 的杂活才允许插进候选池(用户选的"混合: 能插就插") ——
@@ -99,15 +129,38 @@ def step_value(action: str) -> float:
     return STEP_VALUE.get(action, STEP_VALUE_DEFAULT)
 
 
-def score(action: str, dist: float | None, follow: float = 0.0) -> float:
+def burn_urgency(ratio: float) -> float:
+    """**锅快糊了该加多少分**。`ratio = prog / need`(已煮秒 / 需煮秒):
+
+      1.0 = 刚进报警窗口 —— 游戏那边就是这一刻开始 `OverDoing`
+            (警告图标脉冲 + `GameOneShotAudioTag.CookingWarning` 音效)
+      2.0 = 糊了(`Ruined`)
+
+    线性上涨: 刚报警时 **0 分**, 越接近糊涨得越猛(`BURN_URGENCY_MAX`)。
+    为什么不设硬阈值闸门(用户 2026-09-15 定的规矩: "如果报警, 对应的评分应该上涨"):
+      **涨分自动穿过 `YIELD_MIN_SCORE`** ⇒ 不再让位给队友 ⇒ 我去救;
+      而刚报警时它还是低分(低于阈值) ⇒ 让位给正在旁边的人。
+      一条连续规则同时表达了"什么时候该让位"和"什么时候必须我上", 不用两个阈值。
+    """
+    if ratio is None or ratio <= 1.0:
+        return 0.0
+    return BURN_URGENCY_MAX * min(1.0, float(ratio) - 1.0)
+
+
+def score(action: str, dist: float | None, follow: float = 0.0,
+          urgency: float = 0.0, advance: float = 0.0) -> float:
     """给一个候选动作打分。`dist is None` = 到不了 ⇒ 直接出局(`-inf`)。
 
-    dist   —— 厨师到"台面旁可站格子"的**格距**(不是欧氏距离: 要绕墙走)
-    follow —— 到"下一个还要做的目标"的格距; 没有下一个就传 0(不扣分)
+    dist    —— 厨师到"台面旁可站格子"的**格距**(不是欧氏距离: 要绕墙走)
+    follow  —— 到"下一个还要做的目标"的格距; 没有下一个就传 0(不扣分)
+    urgency —— **紧迫度加成分**(见 `burn_urgency`)。位置无关 ⇒ 队友那份也加同样的值,
+               否则"我 vs 队友"就不是在比同一件事了。
+    advance —— **"这一步用的是我手上正拿着的那份东西"** 的加成分
+               (`HAND_ADVANCE_BONUS`)。**谁拿着算谁的** ⇒ 队友那份要按**队友手上**的算。
     """
     if dist is None:
         return NEG_INF
-    return step_value(action) - W_DIST * dist - W_FOLLOW * follow
+    return step_value(action) - W_DIST * dist - W_FOLLOW * follow + urgency + advance
 
 
 # ---------------------------------------------------------------- 状态变换
@@ -213,25 +266,31 @@ def fmt(v: float) -> str:
 
 
 def row(i: int, sig: str, reach: bool, dist: float, step: float,
-        follow: float, raw: float, final: float, verdict: str) -> dict:
+        follow: float, raw: float, final: float, verdict: str,
+        urg: float = 0.0, adv: float = 0.0) -> dict:
     """造一行日志记录(键用 ASCII, 只有显示用的表头是中文)。"""
     return {"i": i, "sig": sig, "reach": reach, "dist": dist, "step": step,
-            "follow": follow, "raw": raw, "final": final, "verdict": verdict}
+            "follow": follow, "raw": raw, "final": final, "verdict": verdict,
+            "urg": urg, "adv": adv}
 
 
 def table(rows: list) -> str:
     """把候选表排成等宽文本。
 
     这是**省掉离线测试的替代品** —— 没有单测, 就得让一局(150 秒)的日志把
-    "每个候选的四项原始值 → 变换后分数 → 为什么选它"全摊开, 见交接包 §8。
-    列和评分算的四项**一一对应**: 可达 / 格距 / 步骤价 / 顺路。
+    "每个候选的每一项原始值 → 变换后分数 → 为什么选它"全摊开, 见交接包 §8。
+    列和评分的每一项**一一对应**: 可达 / 格距 / 步骤价 / 顺路 / 紧急 / 推进。
+      · `紧急` 平时恒为 0, 只有"锅快糊了"那种候选才非 0(用户 2026-09-15: 报警了评分就该涨);
+      · `推进` 只有"这一步用的正是手上拿着的那份"才非 0(用户 2026-09-15: 手上这份先做完)。
     """
     out = [f"  {'#':>2} {'动作':<24} {'可达':<4} {'格距':>5} {'步骤价':>6} "
-           f"{'顺路':>5} {'原始':>7} {'变换':>7}  判定"]
+           f"{'顺路':>5} {'紧急':>6} {'推进':>6} {'原始':>7} {'变换':>7}  判定"]
     for r in rows:
         d = f"{r['dist']:.1f}" if r["reach"] else "-"
+        u = f"{r.get('urg', 0.0):.0f}" if r.get("urg") else "-"
+        a = f"{r.get('adv', 0.0):.0f}" if r.get("adv") else "-"
         out.append(
             f"  {r['i']:>2} {r['sig']:<24} {'✓' if r['reach'] else '✗':<4} "
-            f"{d:>5} {r['step']:>6.0f} {r['follow']:>5.1f} "
+            f"{d:>5} {r['step']:>6.0f} {r['follow']:>5.1f} {u:>6} {a:>6} "
             f"{fmt(r['raw']):>7} {fmt(r['final']):>7}  {r['verdict']}")
     return "\n".join(out)

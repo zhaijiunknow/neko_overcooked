@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 
@@ -262,11 +264,38 @@ namespace Overcooked2AI.Game
             var comp = go.GetComponent(ct);
             if (comp == null)
                 return null;
-            var m = ct.GetMethod("GetContents", Type.EmptyTypes);
+            var m = ContentsMethod(ct);
             if (m == null)
                 return null;
             return m.Invoke(comp, null) as Array;
         }
+
+        /// <summary>`GetContents` 的 MethodInfo, **按类型缓存**。
+        ///
+        /// ⚠ 原来这里每次调用都 `ct.GetMethod(...)` —— 而 `ContentsNames` 是
+        ///   **每个台面的每个子物体每帧**都要跑的(`SceneScanner.DescribeDynamic`),
+        ///   50 个台面 × 1~2 个子物体 × 60fps ⇒ 每秒几千次**没必要的**反射查找。
+        ///   `Type` 一旦解析出来, 它的方法表就是固定的 ⇒ 可以安全地缓存(连 null 一起,
+        ///   因为"这个类没有 GetContents"也是固定事实 —— 和 `FindType` 那条
+        ///   "程序集可能还没加载完"不一样)。
+        ///
+        /// 为什么非做不可: 用户 2026-09-15 定的规矩是"**每次都使用最新的地图**,
+        /// 本身地图就小, 占用无关紧要" —— 于是 `onhas` 不再节流、每帧都算。
+        /// 不先把这次查找缓存掉, 那条规矩就是在拿帧率换新鲜度。
+        /// </summary>
+        private static MethodInfo ContentsMethod(Type ct)
+        {
+            MethodInfo m;
+            if (_contentsMethods.TryGetValue(ct, out m))
+                return m;
+            try { m = ct.GetMethod("GetContents", Type.EmptyTypes); }
+            catch (Exception) { m = null; }
+            _contentsMethods[ct] = m;
+            return m;
+        }
+
+        private static readonly Dictionary<Type, MethodInfo> _contentsMethods =
+            new Dictionary<Type, MethodInfo>();
 
         /// <summary>把一个订单节点还原成人类可读的名字(递归, 只读数组字段)。</summary>
         private static void AppendNodeName(StringBuilder sb, object node)

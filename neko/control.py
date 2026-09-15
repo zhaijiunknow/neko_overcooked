@@ -19,6 +19,10 @@ stop                           收工(引擎干净退出)
 **只有引擎读、外部写**, 不存在两边同时写的竞态。
 
 ⚠ 路径可用 `NEKO_CMD_FILE` 覆盖(默认 `<仓库>/runtime/cmd.txt`)。
+
+> **外部要用, 走 `tools/ctl.py`** —— 那是"下命令 + 读状态"的**统一入口**
+> (同一个进程级脚本、同一套 `--json` 外壳)。本模块是它的底层实现,
+> 直接 import 用也可以(宿主是 Python 时更省一次进程启动)。
 """
 from __future__ import annotations
 

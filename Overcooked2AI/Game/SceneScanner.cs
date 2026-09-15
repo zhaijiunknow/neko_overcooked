@@ -92,8 +92,20 @@ namespace Overcooked2AI.Game
             /// <summary>静态部分已经拼好的 JSON 片段(tag/sub/spawn/plate)。**只有这些是缓存的** ——
             /// 坐标不缓存(锅会被端走、可推物体会动), 每帧从 `go.transform.position` 现读。</summary>
             public string staticJson = "";
-            /// <summary>上一次算出来的 onhas(反射贵, 所以节流)。</summary>
-            public string lastHas = "";
+            /// <summary>上一次算出来的 onhas —— **按子物体下标各存各的**。
+            ///
+            /// ☠ 原来这里是**一个** `string`。台面上放了两件以上东西时, 节流帧里
+            ///   每个子物体读到的都是"上一帧**最后一个**子物体"的内容:
+            ///   循环里 `r.lastHas = has` 被反复覆盖, 而 `heavy` 是**循环外**算的
+            ///   ⇒ 循环内一次都不写, 只反复读同一个值。
+            ///   形状全对(三个数组仍然等长、下标仍然一一对应)、**内容全错** ——
+            ///   所以从来没有任何一处断言能发现它。
+            ///   下游后果(`engine._plate_contents_on` 就是按下标配对的):
+            ///     · `op_assemble` 手空时判"盘里已有 X ⇒ 跳过" ⇒ 跳过没做过的事
+            ///     · 并盘的 before/after 比较 ⇒ 把别人的差值当成自己并成了
+            ///     · `_find_ready_dish` 判"这盘拼好了没有" ⇒ 真拼好的那盘看着不对
+            /// </summary>
+            public List<string> lastHas = new List<string>();
             public float lastHasAt = -99f;
         }
 
@@ -116,9 +128,17 @@ namespace Overcooked2AI.Game
 
         /// <summary>固定台面的重扫间隔(秒) —— 只为"发现新建的固定台面"和变形关卡兜底。</summary>
         public static float StaticRescanInterval = 5f;
-        /// <summary>`onhas`(容器里装了什么, 走反射)的刷新间隔(秒)。0 = 每帧。
-        /// 其余动态字段(n/on/ontags)一律每帧 —— 它们只是走一遍 Transform。</summary>
-        public static float OnhasInterval = 0.1f;
+        /// <summary>`onhas`(容器里装了什么, 走反射)的刷新间隔(秒)。**0 = 每帧**。
+        /// 其余动态字段(n/on/ontags)一律每帧 —— 它们只是走一遍 Transform。
+        ///
+        /// ☠ **2026-09-15 从 0.1 改成 0**(用户定的规矩: "我们的地图更新是和雷达一样的
+        ///   机制, 使用要求脚本**每次都使用最新的地图**, 本身地图就小, 占用无关紧要")。
+        ///   原来那 0.1 秒是"省一次反射"的考虑 —— 但它买来的陈旧读数会变成
+        ///   "对着空台子按放置"、"盘里明明有却说没有"这类**动作级**的错。
+        ///   ⚠ 代价必须有人付: `ItemKnowledge.ContentsMethod` 已经把
+        ///     `GetContents` 的 `MethodInfo` 按类型缓存掉了, 否则这里每帧
+        ///     几千次 `Type.GetMethod` 是拿帧率换新鲜度。想调回去用这个字段。</summary>
+        public static float OnhasInterval = 0f;
 
         /// <summary>每次都由 StateCollector **每帧**调 —— 静态身份走缓存, 动态内容/位置每帧读。
         ///
@@ -593,8 +613,21 @@ namespace Overcooked2AI.Game
         ///   任何不在我们扫的那 25 个台面类型下的。
         ///   而"场上有哪些食材"的权威定义就是游戏那两个 tag。
         ///
-        /// 成本: 2 次 `FindGameObjectsWithTag`(比 `FindObjectsOfType` 便宜, 走 tag 索引),
+        /// 成本: 3 次 `FindGameObjectsWithTag`(比 `FindObjectsOfType` 便宜, 走 tag 索引),
         ///       所以挂在 0.1 秒档, 不跟台面一起每帧跑。
+        ///
+        /// ☠☠ **2026-09-15 补上 `"Plate"`** —— 原来只照抄了游戏的
+        ///   `GetAllIngredients()`, 于是这份清单里**只有食材、没有盘子**。
+        ///   而 Python 侧 `km.items` 有**两个**消费者:
+        ///     · `_fetch_source_live` 的第 ② 个货源"掉在地上/台面外的料" —— 那一半是好的;
+        ///     · `_ensure_plate` 的**第三个盘子来源**"地上的盘子"
+        ///       (`engine._find_ground_item(km, "Plate", ...)`) —— **永远是空的**,
+        ///       因为地上根本没有盘子被报上来。⇒ 那段"补上了漏掉的『地上的盘子』"
+        ///       的修补是**死代码**, 而地上的盘子恰恰是**我们自己造的**
+        ///       (腾手时丢在脚下、放置失败掉在地上)。
+        ///   代价(用户已明说无所谓): "本身地图就小, 占用无关紧要"。
+        ///   ⚠ `Plate` 是自定义 tag(不是内置的), 由游戏的 TagManager 定义 ——
+        ///     `FindGameObjectsWithTag` 对它有效; tag 不存在时下面那圈 try/catch 会跳过。
         /// </summary>
         public static string ScanItems()
         {
@@ -602,7 +635,7 @@ namespace Overcooked2AI.Game
             sb.Append("[");
             int n = 0;
             var seen = new Dictionary<int, int>();
-            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient" })
+            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient", "Plate" })
             {
                 GameObject[] objs = null;
                 try { objs = GameObject.FindGameObjectsWithTag(tag); }
@@ -985,6 +1018,37 @@ namespace Overcooked2AI.Game
         }
 
         /// <summary>作废静态缓存(换关卡/下一局时调)。下一次 ScanStations 会重建。</summary>
+        /// <summary>把**缓存里**的台面物体交出来(给"交互足迹"用) —— 只读, 不触发重扫。
+        ///
+        /// 为什么要有这个口子: `StationRef` / `_cache` 都是 `private`, 而
+        /// `LevelInfo` 要拿台面的 `GameObject` 才能取到 `Collider`, 进而调
+        /// `InteractWithItemHelper.IsColliderInArc` 算足迹。
+        ///
+        /// ⚠ 调用方自己保证缓存是新的 —— 这一支**不重扫**, 拿到的可能是 5 秒前的
+        ///   那一份(和 `ScanStations()` 的兜底节奏一致)。足迹是**按需**算的, 调用方
+        ///   在同一个 `get_map` 里通常会先让 `Scan()` 跑一遍。
+        /// ☠ 用三个平行 list 而不是返回 `StationRef` —— 那个类是 private,
+        ///   而且 `iid`/`name` 才是足迹要的键, `go` 只是手段。
+        /// </summary>
+        public static void EachStation(List<GameObject> gos, List<int> iids, List<string> names)
+        {
+            gos.Clear();
+            iids.Clear();
+            names.Clear();
+            var c = _cache;
+            if (c == null)
+                return;
+            for (int i = 0; i < c.Count; i++)
+            {
+                var r = c[i];
+                if (r == null || r.go == null)
+                    continue;
+                gos.Add(r.go);
+                iids.Add(r.iid);
+                names.Add(r.name);
+            }
+        }
+
         public static void InvalidateStationCache()
         {
             _cache = null;
@@ -1176,14 +1240,18 @@ namespace Overcooked2AI.Game
                             try { tg = ch.tag; }
                             catch (Exception) { }
                             tags.Append("\"").Append(SafeName(tg)).Append("\"");
+                            // ⚠ 按**子物体下标**存取 —— 见 `StationRef.lastHas` 那段:
+                            //   存的取的是同一个下标, 节流(OnhasInterval>0)时也不会串号。
+                            while (r.lastHas.Count <= i)
+                                r.lastHas.Add("");
                             if (heavy)
                             {
                                 string has = "";
                                 try { has = ItemKnowledge.ContentsNames(ch.gameObject); }
                                 catch (Exception) { }
-                                r.lastHas = has;
+                                r.lastHas[i] = has;
                             }
-                            hases.Append("\"").Append(SafeName(r.lastHas)).Append("\"");
+                            hases.Append("\"").Append(SafeName(r.lastHas[i])).Append("\"");
                             shown++;
                         }
                         sb.Append("],\"ontags\":[").Append(tags)
