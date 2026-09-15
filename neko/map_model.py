@@ -270,6 +270,18 @@ class Item:
     #:     (见 `Engine._needs_work` 的注释)。
     #:   ⇒ 只有**实例自己**说得准。`workable=True` = 还是生料。
     workable: bool = False
+    #: **这件东西现在挂在哪** —— 用户 2026-09-15:
+    #:   "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+    #:    这样交给**可行性检查**会更可信。"
+    #: `on` = 挂在哪个台面上(物体名; 空 = 没挂在台面上); `carrier` = 谁拿着(空 = 没人拿)。
+    #: 两个都空 ⇒ **自由对象**(在地上/在台面外的空间里)。
+    #: ⚠ 这是**问游戏**要的挂载关系(规则 2), 不是我们按坐标猜的 ——
+    #:   原来"在灶上 / 在地上 / 在手上"三态分不开(`cooking_on` 靠 0.6 格距离猜,
+    #:   锅放在灶台边上或端在手上都会被猜成"在灶上")。
+    #: ⚠ 老 dll 没这两个键 ⇒ 空串 ⇒ 调用方退回"按距离猜"。
+    on: str = ""
+    carrier: str = ""
+    y: float = 0.0            # 高度 —— 多层关卡里同 (x,z) 不同层要靠它分
 
 
 @dataclass
@@ -567,7 +579,10 @@ class KitchenMap:
             km.items.append(Item(
                 name=it.get("name", ""), tag=it.get("tag", ""),
                 x=float(it.get("x", 0) or 0), z=float(it.get("z", 0) or 0),
-                workable=bool(it.get("work"))))
+                workable=bool(it.get("work")),
+                # 挂载关系(问游戏要的) —— 老 dll 没有 ⇒ 空串/0 ⇒ 退回按距离猜
+                on=it.get("on", "") or "", carrier=it.get("carrier", "") or "",
+                y=float(it.get("y", 0) or 0)))
         for c in layout.get("cooking") or []:
             km.cooking.append(Cooking(
                 name=c.get("name", ""), ing=c.get("ing", ""),
@@ -638,8 +653,41 @@ class KitchenMap:
         best.sort(key=lambda t: t[0])
         return best[0][1]
 
+    def pot_on(self, station: Station) -> Optional[Item]:
+        """**这个灶台上架着哪口锅** —— 按**游戏的挂载关系**找, 不按坐标猜。
+
+        用户 2026-09-15: "台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+        这样交给**可行性检查**会更可信"。
+
+        怎么找: `ScanItems` 现在把 `CookingUtensil` 也扫进来了, 每件都带
+        `on`(挂在哪个台面上)。所以"这口锅在这个灶上"是**游戏说的事实**,
+        而不是"它离这个坐标 0.6 格以内"的**推断** ——
+        原来那套推断分不开三种情况: 锅在灶上 / 锅被端在手上 / 锅放在灶台边上。
+        ⚠ 老 dll(没有 `on`)⇒ 返回 None, 调用方退回按距离猜。
+        """
+        if station is None or not station.name:
+            return None
+        for it in self.items:
+            if it.on and it.on == station.name:
+                return it
+        return None
+
     def cooking_on(self, station: Station) -> Optional[Cooking]:
-        """某个灶台上正在煮的东西。"""
+        """某个灶台上正在煮的东西。
+
+        ☠☠ **先按挂载关系找锅, 找不到才退回按距离猜**(用户 2026-09-15 的要求):
+          原来的判据只有 `abs(c.x - station.x) < 0.6 and abs(c.z - station.z) < 0.6` ——
+          那是**推断**, 而且分不开"锅在灶上 / 锅端在手上(就在厨师身边) / 锅放在灶台边上"。
+          有了 `ScanItems` 报的 `on`(见 `pot_on`)之后, "这口锅挂在哪个台面上"是**事实**:
+          先由事实定位到**那口锅**, 再用**锅的名字**去 `cooking` 里找它的烹饪状态。
+        ⚠ 两条都必须留着: 老 dll 没有 `on`,`pot_on` 返回 None ⇒ 走距离那条;
+          而有些关卡锅里还没有 `CookingHandler` 对应条目 ⇒ 也别把距离那条删掉。
+        """
+        pot = self.pot_on(station)
+        if pot is not None:
+            for c in self.cooking:
+                if c.name == pot.name:
+                    return c
         for c in self.cooking:
             if abs(c.x - station.x) < 0.6 and abs(c.z - station.z) < 0.6:
                 return c

@@ -862,13 +862,81 @@ namespace Overcooked2AI.Game
         ///   ⚠ `Plate` 是自定义 tag(不是内置的), 由游戏的 TagManager 定义 ——
         ///     `FindGameObjectsWithTag` 对它有效; tag 不存在时下面那圈 try/catch 会跳过。
         /// </summary>
+        /// <summary>**这件东西现在挂在哪** —— 往上走父链, 报出"在哪个台面上"和"谁拿着"。
+        ///
+        /// 用户 2026-09-15:
+        ///   > "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+        ///   >  这样交给**可行性检查**会更可信。"
+        ///
+        /// 为什么必须问游戏(规则 2): "在灶上 / 在地上 / 在谁手上"是**游戏自己的挂载关系** ——
+        ///   我们原来靠"离某个台面 0.6 格以内"猜(`KitchenMap.cooking_on`, `map_model.py:641`),
+        ///   三种情况**在数据上分不开**; 锅放在灶台边上、或者被端在手上, 都会被猜成"在灶上"。
+        ///   而"这一步要用的容器在不在这关/在哪/够不够得着"正是可行性检查要回答的。
+        ///
+        /// 判据(自底向上, 最多 `MaxMountDepth` 层, 不猜几何):
+        ///   · 祖先里出现**台面那套组件**(`StationTypes` 里任意一个) ⇒ `mount` = 那个物体的名字;
+        ///   · 祖先里出现 `PlayerControls` ⇒ `carrier` = 那个厨师的名字;
+        ///   · 都没有 ⇒ 两个都空 = **自由对象**(在地上/在台面外的空间里)。
+        /// ⚠ 只报**名字**, 不报坐标 —— 坐标由调用方自己读(`ScanItems` 报的是**物品自己**的位置)。
+        /// ⚠ 台面自己不该被当成"挂在自己身上": 所以从**父节点**开始走。
+        /// </summary>
+        private const int MaxMountDepth = 6;
+
+        private static void MountOf(GameObject go, out string mount, out string carrier)
+        {
+            mount = "";
+            carrier = "";
+            if (go == null)
+                return;
+            try
+            {
+                var t = go.transform.parent;
+                for (int d = 0; t != null && d < MaxMountDepth; d++, t = t.parent)
+                {
+                    var p = t.gameObject;
+                    if (p == null)
+                        break;
+                    if (carrier.Length == 0 && FindType("PlayerControls") != null
+                        && p.GetComponent(FindType("PlayerControls")) != null)
+                        carrier = SafeName(p.name);
+                    if (mount.Length == 0)
+                    {
+                        for (int i = 0; i < StationTypes.Length; i++)
+                        {
+                            if (IsVolatile(StationTypes[i]))
+                                continue;
+                            var st = FindType(StationTypes[i]);
+                            if (st == null)
+                                continue;
+                            try
+                            {
+                                if (p.GetComponent(st) != null) { mount = SafeName(p.name); break; }
+                            }
+                            catch (Exception) { }
+                        }
+                    }
+                    if (mount.Length > 0 && carrier.Length > 0)
+                        break;
+                }
+            }
+            catch (Exception) { }
+        }
+
         public static string ScanItems()
         {
             var sb = new StringBuilder();
             sb.Append("[");
             int n = 0;
             var seen = new Dictionary<int, int>();
-            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient", "Plate" })
+            // ☠☠ **`CookingUtensil` 也在列** —— 用户 2026-09-15:
+            //   "地图上预制体的位置、台面和台面上内容物**都需要包括灶台上的锅和地上的**,
+            //    这样交给可行性检查会更可信。"
+            //   锅/平底锅原来**只以名字**出现在灶台的 `on` 列表里(没有位置、没有挂载点),
+            //   而 `ScanItems` 又只扫这三个"食材"tag ⇒ **地上的锅完全不可见**,
+            //   灶上的锅也没有坐标。于是"这一步要用的容器在不在这关/在哪/够不够得着"
+            //   全都判不了(`cooking_on` 是靠 0.6 格距离**猜**的)。
+            foreach (var tag in new string[] { "Pre-Ingredient", "Ingredient", "Plate",
+                                               "CookingUtensil" })
             {
                 GameObject[] objs = null;
                 try { objs = GameObject.FindGameObjectsWithTag(tag); }
@@ -883,11 +951,11 @@ namespace Overcooked2AI.Game
                     if (seen.ContainsKey(iid))
                         continue;
                     seen[iid] = 1;
-                    float x, z;
+                    float x, z, y = 0f;
                     try
                     {
                         var pos = go.transform.position;
-                        x = pos.x; z = pos.z;
+                        x = pos.x; z = pos.z; y = pos.y;
                     }
                     catch (Exception) { continue; }
                     // **这件东西还能不能被加工**(= 生料还是成品)。用途: "交出去的那份料
@@ -898,6 +966,13 @@ namespace Overcooked2AI.Game
                     // ☠ 也不能靠**名字查知识表** —— "生料和成品同名"那一族
                     //   (`SushiFish --切8次--> SushiFish`) 表里是两条同名记录, 分不出是哪个。
                     // 反射整段照抄 ItemKnowledge.One 里那段(同一套 FindType/GetComponent + try/catch)。
+                    // ★ **这件东西现在挂在哪** —— 用户 2026-09-15:
+                    //   "台面和台面上内容物**都需要包括灶台上的锅和地上的**"。
+                    //   有了这两个字段, "在灶上 / 在地上 / 在谁手上"三态才分得开 ——
+                    //   原来全靠"离某个台面 0.6 格以内"猜(`KitchenMap.cooking_on`)。
+                    string mount = "", carrier = "";
+                    try { MountOf(go, out mount, out carrier); }
+                    catch (Exception) { }
                     bool work = false;
                     try
                     {
@@ -918,8 +993,9 @@ namespace Overcooked2AI.Game
                         sb.Append(",");
                     sb.Append(string.Format(
                         System.Globalization.CultureInfo.InvariantCulture,
-                        "{{\"name\":\"{0}\",\"tag\":\"{1}\",\"x\":{2:F2},\"z\":{3:F2},\"work\":{4}}}",
-                        SafeName(go.name), SafeName(tag), x, z, work ? "true" : "false"));
+                        "{{\"name\":\"{0}\",\"tag\":\"{1}\",\"x\":{2:F2},\"z\":{3:F2},\"work\":{4},\"on\":\"{5}\",\"carrier\":\"{6}\",\"y\":{7:F2}}}",
+                        SafeName(go.name), SafeName(tag), x, z, work ? "true" : "false",
+                        SafeName(mount), SafeName(carrier), y));
                     n++;
                 }
             }
