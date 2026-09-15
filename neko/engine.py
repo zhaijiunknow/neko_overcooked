@@ -8164,6 +8164,23 @@ class Engine:
                 carryable = True
                 break
         if vessel and not carryable:
+            # ☠☠ **"端不走"还不够 —— 还得看"内容物能不能进盘"**。用户 2026-09-15:
+            #   > "搅完之后碗里是一个成品, **碗的内容物无法和盘子交互**"
+            #   ⇒ `_rescue_in_place`(拿盘取菜) **对搅拌碗根本不成立**: 盘子接不住它。
+            #     硬走那条路只会"拿盘过去按交互 → 什么都没发生" ⇒ 反复失败/空转。
+            #   ⇒ 判据: 这个容器是**搅**的(`kind == "mix"`)⇒ **不救**, 只记日志。
+            #     (真正该做的是把**碗端走** —— 但那要求它的 tag 是 `CookingUtensil`;
+            #      现在 tag 报的不是, 所以只能等/等人。**别硬编一条路出来**。)
+            _ck = None
+            for _c in (getattr(km, "cooking", None) or []):
+                if _c.name == vessel:
+                    _ck = _c
+                    break
+            if _ck is not None and (getattr(_ck, "kind", "") or "cook") == "mix":
+                self.log(f"[救锅] ⚠ {vessel!r} 是**搅拌碗**: 内容物**进不了盘**"
+                         f"(用户实测) ⇒ 拿盘取不出来。**这一步救不了** —— "
+                         f"正解是把碗**端走**, 但它的 tag 不是 `CookingUtensil`。")
+                return False
             return self._rescue_in_place(km, x, z, op)
         # 手上有东西时先腾 —— 拿/放是**同一个键**(规则 4), 端着东西按拾取 = 把那件放下。
         _, _, held0 = self.pos(self.state(force=True) or {})
