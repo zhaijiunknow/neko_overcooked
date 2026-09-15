@@ -4174,6 +4174,16 @@ class Engine:
             ok = bool(t) and self._norm(s.plate) == t
             cand.append((0 if ok else 2, (s.x - x) ** 2 + (s.z - z) ** 2, s))
         for s in km.stations.values():
+            # ☠☠ **脏盘子堆不是"空盘来源"**(2026-09-15 `s_sushi_1_3` 实机):
+            #   原来这里只判 `empty_plate_names()` 非空, 而脏盘堆那条 `on` 里的
+            #   整叠脏盘既"看着像盘子"又"内容是空的" ⇒ 被选成空盘来源。
+            #   日志: 组装台面那盘已经有米 ⇒ "改找空盘" ⇒ **去了 `dirty_plates0`**
+            #   ⇒ 手上攥着 `DirtyPlateStack` ⇒ 进不了盘 ⇒ 丢脚下 ⇒ `盘里=空`
+            #   ⇒ `assemble`/`deliver` 全灭 ⇒ 锅里那份米**烧糊**。
+            #   用户原话: "**脏盘不会识别并拿去洗**"。
+            #   ⇒ 脏盘归**洗盘子**那条路(`_chore_candidates` ② 认 `dirty_plates`), 不归这条。
+            if (s.id or "").startswith("dirty_plates"):
+                continue
             if s.empty_plate_names():
                 cand.append((1, (s.x - x) ** 2 + (s.z - z) ** 2, s))
         if not cand:

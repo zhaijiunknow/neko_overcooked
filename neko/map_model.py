@@ -224,9 +224,23 @@ class Station:
         return ""
 
     def empty_plate_names(self) -> list:
-        """台面上**空**的盘子(装了菜的盘子不能拿去锅里取菜 —— 会反过来倒进锅)。"""
+        """台面上**空**的盘子(装了菜的盘子不能拿去锅里取菜 —— 会反过来倒进锅)。
+
+        ☠☠ **整叠盘子不算"一个空盘"**(2026-09-15 `s_sushi_1_3` 实机打回来的)。
+          `is_plate` 只判名字里有没有 "plate", 而 `dirtyplatestack` / `cleanplatestack`
+          都含 "plate" ⇒ 整叠**被当成一只盘子**报出去。后果是引擎过去"拿盘子",
+          结果把手伸进**整叠脏盘**里 —— 日志原话:
+            `[引擎] ▶ [杂活] fetch Cucumber   厨师(11.0,9.8) 手持'DirtyPlateStack'`
+            `[步骤] DirtyPlateStack 进不了盘 → 直接丢脚下`
+          然后 `盘里=空` ⇒ `assemble`/`deliver` **全灭**, 最后锅里那份米**烧糊**
+          (用户原话: "**脏盘不会识别并拿去洗**")。
+          ⇒ 判据: 名字里带 **stack** 的是"**盘子的来源**", 不是盘子本身 —— 排除掉。
+          (真正该拿的那只盘, 由 `dirty_plates`/`plates` 这两类台面的**取盘动作**给出。)
+        """
         out = []
         for i, o in enumerate(self.on):
+            if "stack" in (o or "").lower():
+                continue                      # 整叠 ≠ 一只
             if is_plate(o, self.tag_of(i)) and not self.has_of(i):
                 out.append(o)
         return out
