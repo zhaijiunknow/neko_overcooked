@@ -38,6 +38,7 @@ BELT_STAND_PENALTY = 1e6
 WIND_STAND_PENALTY = 1e5
 from pathing import dir_for_step
 from cookbook import Knowledge, derive, Op, DishFlow
+import lookahead                       # 提前备料: 由订单算"该备多少"(纯函数, 可离线钉死)
 import scoring
 
 # 灶台语义(按食材要求的 CookingStationType 映射)
@@ -5921,6 +5922,14 @@ class Engine:
                 chores += self._redos(km, st, ops, pending, n_recipe)
             except Exception as e:
                 self.log(f"[回溯] 探测出错: {e!r}")
+            # **提前备料**(延迟收益): 订单栏要 N 份而现有 M 份 ⇒ 把缺的提出来。
+            #   份数由 `lookahead.demand` **从订单算**(不是常数); 入池时机不开豁免,
+            #   靠 `enroute` 闸门里"菜谱没得做就全放行"那条 —— 见 `_preps`。
+            #   ⚠ 库存**这里只算一次**传进去, 别让每个候选各扫一遍台面。
+            try:
+                chores += self._preps(km, st, self._all_flows(st), self._inventory(km, st))
+            except Exception as e:
+                self.log(f"[备料] 探测出错: {e!r}")
             pool = ops + chores
             # **冷板凳上的菜谱步骤不进候选**(用户要求: 持续失败就去做其他事)。
             # 它们全在冷板凳上时也不硬试 —— 那样只会把时间烧在"重试 3 次 + 导航超时"上;
@@ -6658,6 +6667,139 @@ class Engine:
                               note=f"回溯: {op.action} {op.target} 的料没了"
                                    f" → 补 {ops[k].action}"))
                 break
+        return out
+
+    def _all_flows(self, st) -> list:
+        """订单栏上**每一张**单的 `DishFlow` → `[(flow, t)]`, 按 `t` 升序。
+
+        为什么能拿到"不是当前那单"的菜谱: `state.details` 报的是**整关菜谱池**
+        (`StateCollector.cs:364-385`), 不是只有当前单 ⇒ 任意一张挂单都推得出来。
+        (`Engine.plan()` 早就在做同一条链, 只是它只挑最紧急那一单。)
+
+        ⚠ `derive` 不便宜, 而这是每 0.5 秒的循环 ⇒ **按"订单名集合"缓存**
+          (`t` 每帧都在变、不进 key; 它只影响排序)。
+        """
+        try:
+            orders = self.live_orders()
+        except Exception:                                          # noqa: BLE001
+            return []
+        key = tuple((o.get("name") or "") for o in orders)
+        if getattr(self, "_flows_key", None) == key:
+            return getattr(self, "_flows_val", [])
+        out = []
+        for o in orders:
+            name = o.get("name") or ""
+            if not name:
+                continue
+            try:
+                detail = self.find_detail(st, name)
+                if detail:
+                    out.append((derive(detail, self.know), float(o.get("t", 1.0))))
+            except Exception:                                      # noqa: BLE001
+                continue
+        out.sort(key=lambda ft: ft[1])
+        self._flows_key, self._flows_val = key, out
+        return out
+
+    def _inventory(self, km, st) -> dict:
+        """**场上现在每种材料有几份** `{归一化名: 份数}` —— 只读聚合, 一次算好。
+
+        为什么需要它: 提前备料的判据是"订单要 N 份, **现在有几份** ⇒ 缺几份",
+        而全仓现有的查询(`_find_item_station` / `_find_ground_item` /
+        `_fetch_source_live` / `_plate_contents_on` / `km.of()`) **全是单点查询** ——
+        问的是"最近那一件在哪", 没有"总共有几份"。
+        来源: **手上**(含手上容器的内容) + **台面/板上**(含盘里) + **锅里** + **地上/未认领**。
+
+        ⚠ 这是每 0.5 秒的循环里跑的 ⇒ **一次算好传下去**, 别让每个候选各扫一遍
+          `km.stations`(那是"候选数 × 台面数"的线性增长)。
+        ⚠ **按名字数, 不区分加工阶段** —— 同一关里"生料和切好的同名"时
+          (`SushiFish --切8次--> SushiFish`)名字分不出阶段 ⇒ 这里只能按份数算。
+          "提前切好"那半需要扫描报出加工阶段, 记在 `_preps` 的遗留里。
+        """
+        inv = {}
+
+        def add(name):
+            k = self._norm(name or "")
+            if k:
+                inv[k] = inv.get(k, 0) + 1
+
+        try:
+            _, _, held = self.pos(st)
+            add(held)
+            for c in self._held_contents(st):        # 手上那件容器里装了什么
+                add(c)
+        except Exception:                                          # noqa: BLE001
+            pass
+        for s in (getattr(km, "stations", None) or {}).values():
+            for o in (getattr(s, "on", None) or []):
+                add(o)
+            try:
+                for c in self._plate_contents_on(s):            # 盘里装的
+                    add(c)
+            except Exception:                                      # noqa: BLE001
+                pass
+        for ck in (getattr(km, "cooking", None) or []):          # 锅里
+            add(getattr(ck, "inside", "") or getattr(ck, "ing", ""))
+        try:
+            for it in (km.unseen_items() or []):                 # 地上/台面外的
+                add(getattr(it, "name", ""))
+        except Exception:                                          # noqa: BLE001
+            pass
+        return inv
+
+    @staticmethod
+    def _first_chain_op(flows, mat: str):
+        """在订单栏的菜谱里找 `mat` 那条链的**第一环**(`fetch`/`chop`/`cook`/`mix`)。
+
+        链在 `DishFlow.ops` 里本来就是按序的(`fetch → [chop] → [cook|mix] → assemble`),
+        所以"第一个同名且是加工类的 op"就是第一环。
+        找不到返回 `None`(这个材料没人要 ⇒ 不提议)。
+        """
+        for fl, _t in flows or []:
+            for op in (getattr(fl, "ops", None) or []):
+                if Engine._norm(getattr(op, "target", "")) != mat:
+                    continue
+                if getattr(op, "action", "") in ("fetch", "chop", "cook", "mix"):
+                    return op
+        return None
+
+    def _preps(self, km, st, flows, inv) -> list:
+        """**提前备料** —— 订单栏要 N 份、现有 M 份 ⇒ 把缺的那份提出来当候选。
+
+        用户 2026-09-15:
+          > "…可以做一些**延迟收益**, **提前去切三条鱼**。"
+          > "它得从'**当前场上有几张单、每张要几条**'**推**出来。"
+          > "**'切三条'是举例, 不是常数。** … **别把 3 写进代码。**"
+
+        判据只有一条: `lookahead.demand(flows, inv)` 的缺口 —— **份数全部来自订单**,
+        这里**没有任何常数**(`lookahead.PREP_MAX` 只是"订单要得太多"时的刹车)。
+
+        ⚠ **入池时机不开任何豁免**: 让它走现有的 `enroute` 闸门就够了 ——
+          `_chore_admitted` 里"`flow_ds` 为空(菜谱一个可做的都没有) ⇒ 全部放行"
+          那条**正好就是**"主链受阻时才做延迟收益"的语义; 而菜谱做得动时它会被
+          "顺路"挡在外面。**所以 `scoring.py` 一行都不用改, 阶段一排序不动。**
+
+        ☠ **遗留(明确不做, 别当它已经支持)**:
+          现在只能做到"**把份数凑够**"(提前去把料拿到手), **做不到"提前切好/煮好"** ——
+          因为同一关里生料和切好的料**同名**(`SushiFish --切8次--> SushiFish`),
+          `_inventory` 按名字数、分不出阶段 ⇒ "还缺 1 份"在"手里有一条生鱼"时就已经算满足了。
+          要真正做到"提前切三条鱼", 得先让扫描**报出加工阶段**(那是 C# 侧的事)。
+        """
+        if not flows:
+            return []
+        try:
+            gap = lookahead.demand(flows, inv)
+        except Exception as e:                                     # noqa: BLE001
+            self.log(f"[备料] 算缺口出错: {e!r}")
+            return []
+        out = []
+        for mat, n in sorted(gap.items()):
+            src = self._first_chain_op(flows, mat)
+            if src is None:
+                continue
+            out.append(Op(src.action, src.target, wait=src.wait,
+                          chop_stages=src.chop_stages, in_pot=src.in_pot,
+                          prep=True, note=f"提前备料(订单要 {n} 份)"))
         return out
 
     def _rescues(self, km, st) -> list:
