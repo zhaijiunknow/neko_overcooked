@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -398,6 +399,12 @@ def chef_of_player(bridge, player: str = "Two", log=print):
 #:  轮询器**自己**, 它先判 `ClientUserSystem.m_Users.Count < 4` 才放行)。
 USERS_KEY = "users"
 
+#: 按完 A 之后**等大厅人数涨上来**的时间上限(秒) —— `NEKO_JOIN_VERIFY` 可调。
+#: ⚠ 别调太小: `m_Users` 要经过 `ServerUserSystem.AddUser` → `UsersChanged()` →
+#:   `ClientUserSystem.OnUsersChanged` 才更新(**游戏自己那条链**, 不是我们算的),
+#:   而且大厅里还没装虚拟手柄 ⇒ 游戏失焦时主循环是停的, 会更慢。
+VERIFY_TIMEOUT = float(os.environ.get("NEKO_JOIN_VERIFY") or 5.0)
+
 
 def lobby_users(bridge, st=None, log=None):
     """大厅里已加入的玩家 → `[{'slot':…, 'local':…, 'name':…}, …]`。
@@ -467,9 +474,13 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
             return True
 
     ok_any = False
+    # ☠☠ **每按一次都要**数人数, 够了立刻停** —— 用户 2026-09-15:
+    #   > "按一次之后检查一下玩家数量, 如果是 2 人就可以不需要尝试多按了"
+    #   为什么非做不可: A 是"加入**下一个**玩家", 而 `tries` 默认 3 ——
+    #   原来的循环是"按满 3 遍再说", 于是**第一次就成功**时, 第 2、3 次
+    #   正好把大厅里的人加成为 3 个(游戏自己的守卫只挡到 4 人, 挡不住这个)。
+    #   ⇒ 一次成功 = 后面一次都不许再按。
     for k in range(tries):
-        # ⚠ 整份覆盖: 这个接口是**状态写**不是增量, 少写一个字段就等于把它清零。
-        #   所以 `connected=1` 每次都要带上, 否则设备会被"拔掉"。
         r1 = bridge.vpad(pad, connected=1, A=1)
         time.sleep(hold)
         r2 = bridge.vpad(pad, connected=1, A=0)
@@ -477,10 +488,38 @@ def join_player(bridge, pad: int = 1, hold: float = 0.6, tries: int = 3,
         ok_any = ok_any or ok
         log(f"[加入] 第 {k + 1}/{tries} 次按 A (pad={pad}, 按住 {hold}s) -> "
             f"{'命令已接受' if ok else '失败: ' + str(r1.get('error') or r2.get('error'))}")
-        if ok:
-            time.sleep(0.4)
-    if ok_any:
-        log(f"[加入] pad={pad} 的 A 已按过 {tries} 次 —— "
-            f"**去看一眼大厅里出没出第二个玩家**"
-            f"(这个接口只报'命令被接受'; 想确知就读 state 的 `users`)")
-    return ok_any
+        if not ok:
+            continue
+        n = _wait_users(bridge, at_least=2, log=log)
+        if n is None:
+            log("[加入] ⚠ 按完**读不到玩家名单** —— 不再多按(无法确认, 宁可少按; "
+                "真没加上就下一趟大厅再来)")
+            return True
+        if n >= 2:
+            log(f"[加入] ✓ 大厅现在 {n} 人 —— **够了, 不再多按**")
+            return True
+        log(f"[加入] 按完还是 {n} 人 —— 再试一次")
+    # ⚠ **走到底就是没加成**, 返回 False —— 不能因为"命令被接受过"就报成功:
+    #   调用方(看护)拿 `ok` 决定"这一趟大厅结束没有", 报 True 会让它以为补上了。
+    log(f"[加入] pad={pad} 按过 {tries} 次, 人数始终没到 2 —— "
+        f"**去看一眼大厅**(可能这个设备号不对, 换 `--pad 0` 试试)")
+    return False
+
+
+def _wait_users(bridge, at_least: int = 2, step: float = 0.4, log=None):
+    """按完 A 之后**轮询人数**, 直到 `>= at_least` 或超时。
+
+    返回最后读到的人数(`int`); **读不到返回 `None`** —— 调用方必须把这两者分开:
+    "读到 1 人"可以再试一次, "读不到"**不行**(再按就是赌, 赌输引进 P3)。
+    超时时间 `VERIFY_TIMEOUT`(`NEKO_JOIN_VERIFY` 可调)。
+    """
+    t0 = time.time()
+    n = None
+    while True:
+        u = lobby_users(bridge, log=log)
+        if u is None:
+            return None
+        n = len(u)
+        if n >= at_least or (time.time() - t0) >= VERIFY_TIMEOUT:
+            return n
+        time.sleep(step)

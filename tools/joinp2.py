@@ -55,6 +55,8 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="越过「已经双人就跳过」的检查, 强行按 A"
                          "(⚠ 已经在双人局里按下去会引进第三个人)")
+    ap.add_argument("--no-focus", action="store_true",
+                    help="不要把游戏切到前台(默认会切 —— 见下)")
     args = ap.parse_args()
 
     b = BridgeClient()
@@ -67,6 +69,21 @@ def main() -> int:
         if st.get("inRound"):
             print("⚠ 已经在对局里了(%d 只厨师)—— 加入是在**主界面**做的。" % n, flush=True)
             return 0
+        # ☠ **按 A 之前必须把游戏切到前台** —— 大厅里还没装虚拟手柄,
+        #   `Application.runInBackground` 没打开, **游戏一失焦 Unity 主循环就停**:
+        #   按 A 不生效, 而且"按完数人数"也永远数不到(`m_Users` 不会更新)。
+        #   而这个工具是**从终端**跑的 —— 终端正占着前台。`--no-focus` 可关。
+        if not args.no_focus:
+            try:
+                from bridge import keyboard_input as _ki
+                if not _ki.game_focused():
+                    got = _ki.activate_game()
+                    print("[加入] " + ("✓ 已把游戏切到前台(否则按 A 不生效)"
+                                       if got else
+                                       "⚠ 没能把游戏切到前台 —— 按 A 可能没反应"),
+                          flush=True)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[加入] ⚠ 切前台失败: {e!r}", flush=True)
         ok = join_player(b, pad=args.pad, hold=args.hold, tries=args.tries,
                          force=args.force)
         print()
