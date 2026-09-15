@@ -259,9 +259,10 @@ namespace Overcooked2AI.Game
                         if (go == null)
                             continue;
                         var pos = go.transform.position;
-                        // 手上拿着什么 —— 优先服务端权威值, 客户端那份会晚一帧(见 ReadHeldItems)
-                        string held, heldC;
-                        ReadHeldItems(go, out held, out heldC);
+                        // 手上拿着什么(+ 那件容器里装了什么) —— 优先服务端权威值,
+                        // 客户端那份会晚一帧(见 ReadHeldItems)
+                        string held, heldC, heldHas;
+                        ReadHeldItems(go, out held, out heldC, out heldHas);
                         // **厨师归属哪个玩家** —— 这是决定用哪套键盘的唯一权威依据。
                         // 依据 ClientInputTransmitter.Setup(): iD = GetComponent<PlayerIDProvider>().GetID()
                         // Player.One → 键盘左半(SplitPadHost) → WASD
@@ -283,9 +284,9 @@ namespace Overcooked2AI.Game
                         if (chefCount > 0)
                             chefs.Append(",");
                         chefs.Append(string.Format(
-                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",{8}{9}{10}}}",
+                            "{{\"id\":{0},\"seq\":{0},\"player\":\"{1}\",\"name\":\"{2}\",\"x\":{3:F2},\"y\":{4:F2},\"z\":{5:F2},\"held\":\"{6}\",\"heldc\":\"{7}\",\"heldhas\":\"{8}\"{9}{10}{11}}}",
                             chefCount, player, SafeName(go.name), pos.x, pos.y, pos.z,
-                            held, heldC, control, inter, local));
+                            held, heldC, heldHas, control, inter, local));
                         chefCount++;
                     }
                 }
@@ -464,9 +465,18 @@ namespace Overcooked2AI.Game
                 }
                 catch (Exception) { }
 
+                // ⚠ **前导逗号必须在这里**(2026-09-15 补): 它是"插在别人 JSON 里的一段",
+                //   调用方(`ScanChefs` 的 `{9}`)因此**不能**再给它加字面逗号。
+                //   原来这里是 `"\"respawning\"…`, 而父格式串写的是 `,\"heldhas\":\"{8}\",{9}{10}{11}`
+                //   —— 两者**只有一边**提供逗号, 于是这个函数一旦走 `return ""`
+                //   (找不到 `PlayerControls` / 组件不在), 拼出来就是 `…,"heldhas":"X",,}`
+                //   ⇒ **整条厨师 JSON 报废**。这正是那条老教训的形状
+                //   (片段必须自带前导逗号; 漏了就编译干净、运行必炸), 只是换了个位置。
+                //   `inter`(`ReadInteraction`) / `local`(`ReadLocallyControlled`)
+                //   本来就是自带的, 只有这一个不是。
                 return string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},"
+                    ",\"respawning\":{0},\"suppressed\":{1},\"scale\":{2:F2},\"canmove\":{3},"
                     + "\"canpress\":{4},\"impacted\":{5},\"wind\":{{\"ok\":{6},\"vx\":{7:F2},\"vz\":{8:F2}}},"
                     + "\"run\":{9:F2},\"alignx\":\"{10}\",\"aligny\":\"{11}\"",
                     respawning ? "true" : "false",
@@ -1489,25 +1499,56 @@ namespace Overcooked2AI.Game
         ///
         /// 两份都返回, 便于发现"客户端滞后"这类问题。
         /// </summary>
+        /// <summary>厨师手上拿着什么, 以及**手上那件容器里装了什么**。
+        ///
+        /// ☠☠ `heldHas` 是 2026-09-15 加的(用户实机描述的现象):
+        ///   > "脚本拿着食材去盘子那, 放上盘子**被我拿着并且重新放一个空盘子**,
+        ///   >  脚本会拿着**空盘子**去提交。"
+        ///
+        ///   根因: 插件原来只报 `held`(`equipment_plate_01 (3)`)—— **只有名字, 没有内容**
+        ///   ⇒ Python 侧唯一能做的核对是 `_is_plate(held)`, 而**空盘和装好的菜
+        ///   在它眼里一模一样**。于是"端起来之后"这一段完全没有判据可用:
+        ///     · `_deliver_plate` 送出前只知道"手上是个盘子";
+        ///     · 台面的 `onhas` 只覆盖**还在台面上**的那盘, 一端起来就看不见了。
+        ///
+        ///   复用**现成的** `ItemKnowledge.ContentsNames(go)` —— 台面 `onhas`
+        ///   就是它算的(见 `CollectChildren`), 同一个盘子对象, 不另写一份。
+        ///   判据(反编译)也是同一条: `ServerIngredientContainer.GetContents()`
+        ///   → `m_composition` 递归(见 `ContentsNames` 的注释)。
+        ///
+        ///   ⚠ 取值口径与 `held` **一致**: 服务端权威优先, 客户端那份晚一帧。
+        /// </summary>
         private static void ReadHeldItems(GameObject chefGo, out string serverHeld,
-                                          out string clientHeld)
+                                          out string clientHeld, out string heldHas)
         {
             serverHeld = "";
             clientHeld = "";
+            heldHas = "";
             try
             {
-                clientHeld = ReadFromCarrier(chefGo, "ClientPlayerAttachmentCarrier");
-                serverHeld = ReadFromCarrier(chefGo, "ServerPlayerAttachmentCarrier");
+                string ch, sh;
+                clientHeld = ReadFromCarrier(chefGo, "ClientPlayerAttachmentCarrier", out ch);
+                serverHeld = ReadFromCarrier(chefGo, "ServerPlayerAttachmentCarrier", out sh);
+                heldHas = sh.Length > 0 ? sh : ch;      // 和 `held` 同一个取舍: 服务端优先
                 if (serverHeld.Length == 0 && clientHeld.Length == 0)
-                    serverHeld = ReadFromCarrier(chefGo, "PlayerAttachmentCarrier");
+                {
+                    serverHeld = ReadFromCarrier(chefGo, "PlayerAttachmentCarrier", out sh);
+                    heldHas = sh;
+                }
             }
             catch (Exception) { }
         }
 
         private static volatile string _lastReflectErr = "";
 
-        private static string ReadFromCarrier(GameObject chefGo, string typeName)
+        /// <summary>读厨师某个 carrier 上的东西 —— 返回**物体名**; `contents` 顺带给出
+        /// **这件容器里装了什么**(如盘子上的菜)。
+        ///
+        /// `contents` 见 `ReadHeldItems` 的注释: 光盘子名分不出"空盘"和"装好的菜"。</summary>
+        private static string ReadFromCarrier(GameObject chefGo, string typeName,
+                                              out string contents)
         {
+            contents = "";
             try
             {
                 var ct = FindType(typeName);
@@ -1533,7 +1574,20 @@ namespace Overcooked2AI.Game
                     return "";
                 }
                 var item = m.Invoke(carrier, null) as UnityEngine.Object;
-                return item == null ? "" : SafeName(item.name);
+                if (item == null)
+                    return "";
+                // **容器内容** —— 复用台面 `onhas` 用的同一个原语(见 `CollectChildren`)。
+                //   ⚠ 单独 try: 读内容失败不该把"手上拿着什么"一起弄丢 ——
+                //     `held` 是很多判据的命根子(`_is_plate`/`verify_hold_change`)。
+                try
+                {
+                    var igo = item as GameObject
+                              ?? (item as Component != null ? (item as Component).gameObject : null);
+                    if (igo != null)
+                        contents = SafeName(ItemKnowledge.ContentsNames(igo));
+                }
+                catch (Exception) { }
+                return SafeName(item.name);
             }
             catch (Exception ex)
             {
@@ -1551,8 +1605,8 @@ namespace Overcooked2AI.Game
 
         private static string ReadHeldItem(GameObject chefGo)
         {
-            string s, c;
-            ReadHeldItems(chefGo, out s, out c);
+            string s, c, h;
+            ReadHeldItems(chefGo, out s, out c, out h);
             return s.Length > 0 ? s : c;
         }
 
