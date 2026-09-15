@@ -1240,14 +1240,31 @@ class Engine:
         if not tgt:
             return True, "(空)"        # 游戏没给目标 —— 判断不了, 交给交互本身去失败
         t = self._norm(tgt)
-        if want_pot:
-            # ☠ 要锅就**只能**是锅。`pot` 读不到(灶上没锅)时退回灶台 —— 那条路
-            #   本来就是"没有『灶上放着锅』的灶台"的降级分支(`_cook` 会先
-            #   `want_pot = False` 再叫我们), 别把它也拦死。
-            if not pot:
-                return (t == self._norm(stove.name)), tgt
-            return (t == self._norm(pot)), tgt
-        return (t == self._norm(stove.name)), tgt
+        # ☠☠ **台面名和锅名都要认** —— 不能再收窄成"只认锅"。
+        #
+        # 依据(反编译, 规则 1): `ServerAttachStation.cs:107-119`
+        #     public bool CanHandlePickup(ICarrier _carrier) {
+        #         if (m_item != null) {
+        #             IHandlePickup h = m_item.AccessGameObject().RequireInterface<IHandlePickup>();
+        #             return h.CanHandlePickup(_carrier);      // ← 转发给 m_item(锅)
+        #         } ... }
+        #   台面把拾取/放置**转发**给上面架着的那件东西 ⇒
+        #   **"游戏说会放到台面"是正确表达**(= 放进这台面上的那口锅), 不是"指错了目标"。
+        #
+        # ☠ 我 2026-09-15 一度把它收窄成"要锅就**只**认锅"(理由写的是"灶台自己接不住食材")
+        #   —— **那是错的, 而且当场把整单打死了**: `s_sushi_1_3` 实机
+        #     `⚠ 站位不对: 游戏说会放到 'workstation_cooker_01 (1)', 而不是
+        #       'workstation_cooker_01 (1)' / 锅 'utensil_pot_01' —— 不按`
+        #   **游戏报的名字和"而不是"里列的一模一样** —— 自己跟自己比还判"不对" ⇒
+        #   三次重试 ⇒ `✗ 放弃: cook SushiRice` ⇒ **整单报废**。
+        #
+        # ⇒ **"该用哪口锅"不归这条判据管** —— 它归 `_pick_stove` 的
+        #   `cook_id ∈ cook_steps`(那条才是游戏拒收的权威判据, 见那边的注释)。
+        #   这条只回答"游戏此刻的放置目标是不是**我们选中的那个灶台/那口锅**"。
+        cand = [self._norm(stove.name)]
+        if want_pot and pot:
+            cand.append(self._norm(pot))
+        return (t in cand), tgt
 
     def interact(self, kind: str = "pickup", verify_hold_change=True) -> bool:
         # force=True: 这一段的全部意义就是"按键之后世界变了没有", 绝不能用缓存旧帧
