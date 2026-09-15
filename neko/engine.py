@@ -4760,6 +4760,19 @@ class Engine:
             return False
         return True
 
+    def _toss_budget(self, km, st, target: str):
+        """这个材料**还缺几份**(由订单栏算) —— 连备的额度。
+
+        返回 `int`(可能是 0 = 够了, 一份都不多拿);
+        **`None` = 算不出来**(订单栏读不到/出错) ⇒ 调用方**退回老行为**,
+        别把"读不到"静默当成"不需要备" —— 那会把用户当初要的"多拿几个抛"悄悄关掉。
+        """
+        try:
+            gap = lookahead.demand(self._all_flows(st), self._inventory(km, st))
+            return int(gap.get(self._norm(target), 0))
+        except Exception:                                          # noqa: BLE001
+            return None
+
     def _prep_and_toss(self, km, st, flow, op) -> None:
         """**取货那一趟里连备几份** —— 每份都"就地朝下一步丢", 然后才离开箱子。
 
@@ -4775,19 +4788,33 @@ class Engine:
           (抱着走更省) —— 那时"连备"没有意义(手只有一只, 抱不了两份)。
         ⚠ 每一份都**重新探一次货源**(`op_fetch` 自己会解析"现在离我最近的") —— 箱子的
           余量、传送带上的位置都会变, 不能拿第一次的坐标硬套。
-        ⚠ 上限 `TOSS_BATCH_MAX`; 每轮都查 `round_active()` —— 别为一局末尾的备料把时间烧光。
+        ☠☠ **连备几份现在由订单算**(2026-09-15 用户):
+          原来这里是 `for k in range(TOSS_BATCH_MAX)` —— 一个**和订单、配方都无关的
+          写死值**(默认 3)。而用户对备料的要求是"份数得从'当前场上有几张单、
+          每张要几条'推出来"、"**别把 3 写进代码**"。
+          ⇒ 先拿 `lookahead.demand(订单栏, 现有)` 算这个材料**还缺几份**, 连备到那个数;
+            `TOSS_BATCH_MAX` **退成刹车**(上限), 不再是份数的来源。
+          ⚠ 缺口是**取到手之后**重算的 —— 那时手上那份已经进了库存, 所以 `want`
+            正好是"还要再拿几份", 不会多备一份。
+          ⚠ 算不出来(订单栏读不到/出错)⇒ `None` ⇒ **退回老行为**, 不静默改成"不备"。
+
+        ⚠ 每轮都查 `round_active()` —— 别为一局末尾的备料把时间烧光。
         """
+        want = self._toss_budget(km, st, op.target)
+        if want is not None and want <= 0:
+            return                       # 订单(含余量)已经够了 ⇒ 一份都不多拿
         if TOSS_BATCH_MAX <= 1:
             self._toss_to_next(km, st, flow, op.target)
             return
+        budget = TOSS_BATCH_MAX if want is None else min(TOSS_BATCH_MAX, want)
         tossed = 0
-        for k in range(TOSS_BATCH_MAX):
+        for k in range(budget):
             if not self.round_active():
                 break
             if not self._toss_to_next(km, st, flow, op.target):
                 break                      # 没丢成(太近/游戏不收) → 不连备
             tossed += 1
-            if k + 1 >= TOSS_BATCH_MAX:
+            if k + 1 >= budget:            # ⚠ 比的是**这次算出来的额度**, 不是那个上限
                 break
             st = self.state(force=True)
             if not st or not st.get("inRound"):
