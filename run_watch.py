@@ -15,6 +15,16 @@
 
 生命周期是**一局一连**: 进对局才起进程, 对局结束就收掉, 下一局再起一个新的。
 
+⚠☠ **这个脚本必须把游戏切到前台** —— 不是顺手, 是前提:
+  · **大厅里还没装虚拟手柄** ⇒ `Application.runInBackground` 没被打开
+    (`VirtualPad.install` 才顺手打开它, 见 `virtual_pad.py:110-111`)
+    ⇒ 游戏一失焦, Unity 主循环就停 ⇒ **按 A 不生效**, 而且 `get_state()` 会冻在旧快照上。
+  · 所以"从终端起脚本"这件事本身就破坏了前提 —— 前台被终端占了。
+  ⇒ 启动时、以及**每次要按 A 之前**, 都调 `keyboard_input.activate_game()`
+    (它用 `AttachThreadInput` 绕过"只有前台进程能改前台"的限制, `keyboard_input.py:286-313`)。
+  等引擎起来之后就不用管了: 那时 `runInBackground` 已经被打开, 放后台照样跑。
+  `NEKO_WATCH_FOCUS=0` 可关掉这个行为。
+
 ⚠ 桥是**长连接**: 建一条用到最后, **不写重连包装器** ——
   `tools/pathtest.py:20-22` 与 `README.md:78` 都明写: 桥的 `AcceptLoop`
   (`BridgeServer.cs:50-69`)一出异常就 `break`, 之后整个会话不再接新连接。
@@ -37,6 +47,7 @@ import time
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_ROOT, "neko"))
 
+from bridge import keyboard_input as ki                       # noqa: E402
 from bridge.client import BridgeClient, BridgeError           # noqa: E402
 from bridge.virtual_pad import join_player, lobby_users       # noqa: E402
 
@@ -45,6 +56,29 @@ MISSES = int(os.environ.get("NEKO_WATCH_MISSES") or 3)
 HEARTBEAT = float(os.environ.get("NEKO_WATCH_HEARTBEAT") or 30.0)
 #: 收掉子进程时等它自己退多久(秒)。**超时不 kill** —— 见模块 docstring。
 STOP_TIMEOUT = float(os.environ.get("NEKO_WATCH_STOP_TIMEOUT") or 30.0)
+#: 要不要在启动时 / 按 A 之前把游戏切到前台。见模块 docstring 里那条**前提**。
+FOCUS = (os.environ.get("NEKO_WATCH_FOCUS") or "1") not in ("0", "", "false", "False")
+
+
+def focus_game(log=print, when: str = "", quiet_if_already: bool = True) -> bool:
+    """把游戏窗口切到前台。已经是前台就**不打日志**(免得每次按 A 都刷一行)。
+
+    ⚠ 这会**抢焦点** —— 是刻意的: 大厅里游戏一失焦 Unity 主循环就停,
+      按 A 不生效、`get_state()` 也冻住(见模块 docstring)。
+    """
+    if not FOCUS:
+        return False
+    try:
+        if quiet_if_already and ki.game_focused():
+            return True
+        ok = ki.activate_game()
+    except Exception as e:                                         # noqa: BLE001
+        log(f"[看护] ⚠ 切前台失败({when}): {e!r}")
+        return False
+    log("[看护] " + (f"✓ 已把游戏切到前台({when})" if ok
+                     else f"⚠ 没能把游戏切到前台({when}) —— 大厅里按 A 可能不生效"))
+    return ok
+
 
 #: `subprocess.CREATE_NEW_PROCESS_GROUP` —— 让子进程**不**接收控制台的 Ctrl+C。
 #: 这样 Ctrl+C 只到看护, 由看护**转发** `CTRL_BREAK_EVENT` 给子进程,
@@ -249,6 +283,8 @@ def main() -> int:
         log(f"[看护] ✗ 连不上桥: {e}")
         return 1
     log("[看护] ✓ 桥已连上(游戏没开时这里会一直等)")
+    # 桥通了 ⇒ 游戏窗口一定在 ⇒ 现在就把前台切过去(否则大厅里按 A 不生效, 见模块 docstring)。
+    focus_game(log, when="启动", quiet_if_already=False)
 
     eng = ChildEngine(log=log)
 
@@ -268,6 +304,9 @@ def main() -> int:
             log("[看护]   要修: 重编重装 build\\Overcooked2AI.dll, 并**完全退出游戏再开**")
             return
         log(f"[看护] 大厅玩家: {_users_txt(users)} —— 检查是否需要补 P2")
+        # ☠ **按 A 之前必须把游戏切到前台** —— 大厅里还没装虚拟手柄,
+        #   `runInBackground` 没打开, 游戏失焦时 Unity 主循环是停的 ⇒ 按了也不生效。
+        focus_game(log, when="按 A 之前")
         ok = join_player(b, log=log)
         log("[看护] " + ("补 P2 这一步完成(跳过或已按, 见上面那行日志)"
                          if ok else "⚠ 补 P2 没做成 —— 见上面原因; 这一趟大厅不再重试"))

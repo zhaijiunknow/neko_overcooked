@@ -102,12 +102,17 @@ python -u run_team.py
 python -u run_watch.py
 ```
 
+> - ⚠ **它会把游戏切到前台**(启动时、以及每次要按 A 之前)。这不是顺手 —— 大厅里
+>   还没装虚拟手柄, `runInBackground` 没打开, **游戏一失焦 Unity 主循环就停**,
+>   那时候按 A 不生效、`get_state()` 也冻在旧快照上。`NEKO_WATCH_FOCUS=0` 可关。
+>   (代价: 起完脚本后终端会失去焦点; 要 Ctrl+C 得先点回终端。)
 > - **收尾走 `CTRL_BREAK_EVENT`(等价 Ctrl+C), 不 kill** —— 引擎的 `finally` 里要跑
 >   `pad.uninstall()`; 不跑的话那只厨师的输入**持续被虚拟手柄接管**, 直到重开游戏。
 > - `tools\joinp2.py` 现在会**先检查是不是已经双人, 是就跳过** ——
 >   **A 是"加入下一个玩家"不是 toggle**, 按多了会引进第三个人。
 >   判据来自游戏自己的 `ClientUserSystem.m_Users`(反编译依据见 `SceneScanner.ScanUsers`)。
-> - 环境变量: `NEKO_WATCH_INTERVAL` / `NEKO_WATCH_MISSES` / `NEKO_WATCH_HEARTBEAT`。
+> - 环境变量: `NEKO_WATCH_INTERVAL` / `NEKO_WATCH_MISSES` / `NEKO_WATCH_HEARTBEAT` /
+>   `NEKO_WATCH_FOCUS` / `NEKO_WATCH_PY`。
 
 
 > ⚠ **`--mode none` 是调 bug 时的默认档**。`coop` 也带"低概率自然失误"（发呆/绕路/多切/忘盘），
