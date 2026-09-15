@@ -4487,18 +4487,23 @@ class Engine:
             return None
         return min(free, key=lambda s: (s.x - x) ** 2 + (s.z - z) ** 2)
 
-    def _put_down_plate(self, km: KitchenMap, x: float, z: float) -> bool:
-        """手上多出一个盘子(比如从锅里取完菜、菜已经并进台面那盘)时, 先把手腾出来。
+    def _put_down_plate(self, km: KitchenMap, x: float, z: float,
+                        what: str = "盘子") -> bool:
+        """手上多出东西(从锅里取完菜剩下的空盘、或**救锅端起来的那口锅**)时, 先把手腾出来。
 
         为什么需要: 摆盘位那个台面上已经有一个盘子时, 手上这盘菜会**并进它**
         (ServerPlate.TransferToContainer → CombineWithContents, 然后把自己 Empty),
         手上于是剩下一个**空盘**; 端着空盘去送餐口是送不出东西的。
+
+        `what` —— 只为**日志**准确(`救锅` 手上是锅不是盘子; 原来两处都写"盘子",
+        看日志的人会以为端错东西了 —— "日志别把意图写成结果")。
+        ⚠ 落点由 `_free_counter` 选, 它**本来就排除 `CookingStation`** ⇒ 锅不会又被放回灶上。
         """
         spot = self._free_counter(km, x, z)
         if spot is None:
-            self.log("[步骤] 找不到空台面放多余的盘子")
+            self.log(f"[步骤] 找不到空台面放多余的{what}")
             return False
-        self.log(f"[步骤] 手上还端着盘子, 先放到空台面 {spot.id} 上, 把两手腾出来")
+        self.log(f"[步骤] 手上还端着{what}, 先放到空台面 {spot.id} 上, 把两手腾出来")
         if not self.navigate_smart(km, spot.x, spot.z, tight=0.6):
             return False
         return self.interact("pickup", verify_hold_change=True)
@@ -7983,6 +7988,16 @@ class Engine:
         for c in km.cooking or []:
             need = float(getattr(c, "need", 0) or 0)
             prog = float(getattr(c, "prog", 0) or 0)
+            # ☠☠ **锅里没东西就别救了** —— 这一条是"无限救锅"的直接闸门。
+            #   判据原来只有 `prog > need`, **不看锅里还有没有菜** ⇒
+            #   菜已经被取走的**空锅**, 只要游戏还在报 `prog/need`(空锅也挂着
+            #   `CookingHandler`, 进度不清零), 就**每轮照样报"报警中"** ⇒
+            #   紧迫度一路涨到 200+ ⇒ 它是唯一被选中的动作 ⇒ **整单饿死**。
+            #   实机账(`s_sushi_1_3`): 同一段重复约 40 次, 评分 73.7 → 207.0。
+            #   ⇒ `busy` = 锅里有东西/锅里在烧(`Cooking.busy`, 见 `map_model`),
+            #     没有它就没有可救的东西 —— **救到底的终点就是这个判据**。
+            if not getattr(c, "busy", False):
+                continue
             if need <= 0 or prog <= need:
                 continue                      # 还没到点(或数据不全)
             ratio = prog / need
@@ -8037,23 +8052,125 @@ class Engine:
         return out
 
     def op_rescue(self, km, x, z, op: Op, st: dict) -> bool:
-        """把一口**已经在报警窗口里**的锅从灶上端下来, 放到旁边的空台面。
+        """救一口**已经在报警窗口里**的锅: 端下灶 → 放到空台面 → **把菜装进干净盘子**
+        → 盘子进摆盘位 → **锅放回原灶**。
 
-        为什么是"端锅"而不是"取菜": 报警窗口里锅里的东西**已经熟了**(`state == Cooked`),
-        再放下去就是糊(`> 2*need` → Ruined)。端下来 = 停火, 料还在锅里, 之后照常处理。
-        这也是唯一一个"不需要先想清楚这锅是谁的"的动作 —— 糊了对谁都没好处。
+        ☠☠ 为什么必须走到"**锅里空了**"为止(2026-09-15 `s_sushi_1_3` 实机打回来的)。
+          原来只做"端下来 → 放到最近的空台面", 结果是**整局都在救同一口锅**:
+            [救锅] SushiRice 已经过火(16/12 秒, 剩 8 秒糊) —— 端下来
+            [接近] (13.0,9.8) 距 1.02 格, 游戏说可作用 ✓
+            [步骤] 手上还端着盘子, 先放到空台面 counter10 上, 把两手腾出来
+            [引擎] ✓ rescue SushiRice (评分 73.7)
+            …**同一段原样重复约 40 次**, 评分一路涨到 207.0, 而 `prog` 16→24 一路涨到最后糊掉。
+          用户原话:
+            > "**不是假成功, 已经放在旁边了, 但脚本又给锅放回去了**, 放在台面上应该去拿
+            >  干净的盘子去锅里的米装走, 再把锅放回去。"
+
+          根因: **锅里的菜还在** ⇒ (a) 谁把它放回灶上, 它就继续加温;
+            (b) `_rescues` 的判据是 `prog > need`, 而**锅空不空不影响这条** ⇒
+            每轮照样把它报成"报警中" ⇒ 紧迫度涨到 **207**（压过一切）⇒
+            **它是唯一被选中的动作, 整单饿死**。
+          ⇒ 判据的**终点**必须是"**锅里空了**": 菜进盘子、锅回灶上。
+            空了之后 `prog/need` 自然不再成立, **循环自己就断了**。
+
+        ⚠ 每步失败都**只记日志、不假装成功**, 但**第一步(离开灶台)成功就返回 True** ——
+          首要目标是**停火**; 后面的收拾留到下一轮, 别让它因为"没找到空台面"被判成
+          "救锅没做成"再罚一次冷板凳。
         """
         self.log(f"[救锅] {op.note or op.target}")
+        # 手上有东西时先腾 —— 拿/放是**同一个键**(规则 4), 端着东西按拾取 = 把那件放下。
+        _, _, held0 = self.pos(self.state(force=True) or {})
+        if held0:
+            self.log(f"[救锅] 手上还有 {held0!r} —— 先腾手, 免得那一下按成'把它放下'")
+            self._put_down_plate(km, x, z, what=held0)
+
         if not self._approach(km, op.at_x, op.at_z, tight=0.8, want=op.at_name):
             self.log(f"[救锅] 走不到 {op.at_name or op.target} 旁边")
             return False
         if not self.interact("pickup", verify_hold_change=True):
             self.log("[救锅] ✗ 没端起来(锅还在灶上继续烧)")
             return False
-        # 端起来就已经**停火**了(游戏里锅离开灶台就不再加温), 所以下面这步是"收拾干净"。
-        # 放不下也不当失败 —— 端着锅比让它继续烧强。
-        self._put_down_plate(km, x, z)
+        # 手上这口锅叫什么 —— 后面要找"它被放到哪了", 靠名字认
+        _, _, pot = self.pos(self.state(force=True) or {})
+        if not pot:
+            self.log("[救锅] ⚠ 端起来了却读不到手上是什么 —— 当成盘子处理")
+        # ① **离开灶台** = 停火。落点由 `_free_counter` 选(它本来就排除 CookingStation)
+        if not self._put_down_plate(km, x, z, what=pot or "锅"):
+            self.log(f"[救锅] 端起来了, 但找不到空台面放 —— 先端着(至少**停火**了): {pot!r}")
+            return True
+        if not pot:
+            return True                     # 读不到锅名 ⇒ 后面几步没法做, 停火已经是主要收益
+
+        # ② **把锅里的菜装进干净盘子** —— ★ 这一步才是真"救": 锅空了才不会继续报警
+        st2 = self.state(force=True)
+        km2 = self.map(st2) if st2 else None
+        if km2 is None:
+            self.log("[救锅] 读不到地图 —— 锅已停火, 取菜留到下一轮")
+            return True
+        pot_it = None
+        for it in (getattr(km2, "items", None) or []):
+            if it.name == pot and getattr(it, "on", ""):
+                pot_it = it
+                break
+        holder = self._station_named(km2, pot_it.on) if pot_it is not None else None
+        if holder is None:
+            self.log(f"[救锅] 找不到刚放下的锅 {pot!r} 在哪张台面上 —— 取菜留到下一轮")
+            return True
+        plate_type = self._plate_type_now()
+        if not self._get_plate_for_pot(km2, x, z, plate_type, taking=op.target):
+            self.log("[救锅] ⚠ 拿不到干净盘子 —— 锅已在台面上停火, 取菜留到下一轮")
+            return True
+        if not self._take_from_pot(holder, op):
+            self.log("[救锅] ⚠ 菜没取出来 —— 锅已停火(它在台面上, 不会再烧)")
+            return True
+        # ③ 盘子进摆盘位(把菜并进那道菜的那盘), 顺手把手腾空
+        sp = self.assemble_spot
+        if sp is not None:
+            if self.navigate_smart(km2, sp.x, sp.z, tight=0.6):
+                self.interact("pickup", verify_hold_change=True)
+            else:
+                self.log(f"[救锅] 走不到摆盘位 {sp.id} —— 菜先端在手上")
+        # ④ **锅放回原来那口灶** —— 不放回去, 下一道 `cook` 就找不到"灶上放着锅"的灶台
+        st3 = self.state(force=True)
+        km3 = self.map(st3) if st3 else None
+        stove = self._station_named(km3, op.at_name) if km3 is not None else None
+        if stove is None:
+            # `at_name` 没挂载时是**锅自己的名字**(锅原来就在地上/手上), 不是灶 —— 分开说
+            self.log(f"[救锅] 原来那口灶({op.at_name!r})找不到了 —— 锅留在台面上")
+            return True
+        if not self._approach(km3, holder.x, holder.z, tight=0.8, want=holder.name):
+            self.log(f"[救锅] 走不回锅旁边({holder.id}) —— 锅留在台面上")
+            return True
+        if not self.interact("pickup", verify_hold_change=True):
+            self.log("[救锅] 拿不起锅了 —— 它留在台面上(空的, 不会再烧)")
+            return True
+        if not self._approach(km3, stove.x, stove.z, tight=0.8, want=stove.name):
+            self.log(f"[救锅] 走不到灶台 {stove.id} —— 锅留在手上")
+            return True
+        if self.interact("pickup", verify_hold_change=True):
+            self.log(f"[救锅] ✓ 菜已进盘, 锅已放回 {stove.id}")
+        else:
+            self.log("[救锅] ⚠ 锅没能放回灶上(放不上去) —— 菜已经救下来了")
         return True
+
+    def _plate_type_now(self) -> str:
+        """订单要的容器名(Plate)。救锅那条路拿不到 `flow`, 从**订单明细**里现取一个。
+
+        ☠ **绝不能调 `plan()`** —— 它会 `board.claim_order(...)` **顺手占单**,
+          而救锅是"谁的都是救", 在里面占单是纯粹的副作用(而且会改黑板上别人的归属)。
+          `state.details` 里本来就有 `plate`, 直接读。
+        ⚠ 拿不到就返回空串 —— `_get_plate_for_pot` 那边空串等于"不看类型",
+          退回按距离挑(别让它因为读不到类型而**拿不到盘子**)。
+        """
+        try:
+            st = self.state() or {}
+            for d in (st.get("details") or []):
+                p = d.get("plate") or ""
+                if p:
+                    return p
+        except Exception:                                          # noqa: BLE001
+            pass
+        return ""
 
     def _chore_admitted(self, chore, d, flow_ds, used: dict) -> tuple:
         """这件杂活**现在能不能进候选池** —— 返回 `(能不能, 原因)`。**纯函数, 可离线核对。**
