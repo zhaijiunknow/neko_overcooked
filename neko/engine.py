@@ -4078,6 +4078,30 @@ class Engine:
         return done
 
     # ---------------- 锅 ----------------
+    def _cook_req(self, ing: str) -> tuple:
+        """**这道菜要哪种灶 + 允许哪些加热方式** —— 从知识表现取, **一处算好**。
+
+        返回 `(station_type, [cook_steps])`, 两个都可能为空 = **不知道** ⇒ 调用方放行。
+
+        两条判据都是**游戏的**(规则 1/2), 不是我们定的规矩:
+          · `station` ↔ `Station.sub`: `CookingStation.cs:39`
+            `GetRequiredStationType() != m_stationType` ⇒ 游戏拒收
+            (开发约定记过: "把需要 Oven 的菜放到 Hob 上会被拒绝");
+          · `cook_steps` ↔ `Cooking.cook_id`: `CookableContainer.cs:46-47`
+            + `CookableProperties.cs:11-13`(比 `CookingStepData.m_uID`)。
+
+        ⚠ **只此一份**: `_pick_stove` 按它筛, `_cook` 失败时按它打日志 ——
+          免得"筛的时候用一套、报的时候说另一套"(这个文件里踩过)。
+        """
+        if not ing or self.know is None:
+            return "", []
+        n = self._norm(ing)
+        for it in getattr(self.know, "items", []) or []:
+            if self._norm(getattr(it, "ing", "")) == n:
+                return ((getattr(it, "station", "") or ""),
+                        list(getattr(it, "cook_steps", []) or []))
+        return "", []
+
     def _pick_stove(self, km: KitchenMap, x: float, z: float, want_pot: bool,
                     claim: bool = True, ing: str = ""):
         """挑一个灶台。want_pot=True 只挑"灶上已经有锅"的; False 只挑灶上没有锅的。
@@ -4112,13 +4136,8 @@ class Engine:
         旧代码用 `cooking_on(s) is not None` 判占用, 会把所有带锅的灶台都当成"正在煮",
         一个都用不了。
         """
-        #: 这个材料允许的加热方式; 空 = 不知道 ⇒ 一律放行
-        _allow = None
-        if ing and self.know is not None:
-            for it in getattr(self.know, "items", []) or []:
-                if self._norm(getattr(it, "ing", "")) == self._norm(ing):
-                    _allow = list(getattr(it, "cook_steps", []) or [])
-                    break
+        #: 这道菜**要哪种灶** + **允许哪些加热方式**; 空 = 不知道 ⇒ 一律放行
+        _req_station, _allow = self._cook_req(ing)
         for sem in COOK_SEMS:
             for s in km.sorted_by_dist(sem, x, z):
                 pot = s.pot_name()
@@ -4126,6 +4145,26 @@ class Engine:
                     continue
                 if (not want_pot) and pot:
                     continue
+                # ☠☠ **"这道菜要的是这种灶吗"** —— **不看 `want_pot`**, 两条路都要过。
+                #
+                # 依据(反编译, 规则 1): `CookingStation.cs:39`
+                #     `GetRequiredStationType() != m_stationType` ⇒ 游戏**拒绝**这个放置。
+                #   (开发约定里已经记过这条: "一旦遇到'灶台和烤箱并存'的关卡, 把需要 Oven
+                #    的菜放到 Hob 上会被游戏拒绝"。)
+                #   ⇒ 对应我们的: **食材的 `station`**(= `CookingHandler.m_stationType`,
+                #     见 `ItemKnowledge.One`) vs **灶台自己的 `sub`**
+                #     (= `CookingStation.m_stationType`, 见 `DescribeIdentity`)。
+                #     两个字段**都早就在报**, 只是选灶台时**从没用过**。
+                #
+                # ☠ 用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**" ——
+                #   原来这条判据只写在 `want_pot=True` 的分支里(只看"锅里那种加热方式"),
+                #   而 **`want_pot=False` 那条(食物直接放灶台/烤箱)一点校验都没有** ⇒
+                #   同一类错("把菜放到错的设备上")换个维度又发生一次。
+                #   ⚠ **不知道就放行**: 任一边读不到(老 dll / 这食材没报 station)就不拦。
+                if _req_station:
+                    got = (getattr(s, "sub", "") or "").strip()
+                    if got and self._norm(got) != self._norm(_req_station):
+                        continue
                 ck = km.cooking_on(s)
                 if ck is not None and ck.busy:
                     continue
@@ -4340,7 +4379,13 @@ class Engine:
             want_pot = False
             stove, pot, _ = self._pick_stove(km, x, z, False, ing=op.target)
         if stove is None:
-            self.log("[步骤] 没有找到可用的灶台")
+            # ⚠ **报出"这道菜要哪种灶"** —— 否则"没有找到可用的灶台"会让人以为是
+            #   路走不通/全被占, 而真因可能是**这关就是没有那种灶**(或全被占)。
+            #   用户 2026-09-15: "不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅"。
+            _req, _ = self._cook_req(op.target)
+            self.log("[步骤] 没有找到可用的灶台"
+                     + (f"(**这道菜要的是 {_req!r} 那种灶** —— 这关没有, 或全被占了)"
+                        if _req else ""))
             return False
         self._stove_used = stove.id
 
