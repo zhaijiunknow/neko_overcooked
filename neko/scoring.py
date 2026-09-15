@@ -173,7 +173,23 @@ def burn_urgency(ratio: float) -> float:
     """
     if ratio is None or ratio <= 1.0:
         return 0.0
-    return BURN_URGENCY_MAX * min(1.0, float(ratio) - 1.0)
+    return burn_urgency_alert(ratio, 1.0)
+
+
+def burn_urgency_alert(ratio: float, alert: float) -> float:
+    """同上, 但**报警阈值由调用方给** —— 因为"煮"和"搅"的门槛不一样。
+
+    用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"。
+
+    依据(反编译, 规则 1) —— 两者**毁掉**的门槛都是 `> 2×`, 只是**报警**起点不同:
+      · 煮: `> 1×` ⇒ OverDoing;  · 搅: `> 1.3×` ⇒ OverDoing(`ServerMixingHandler.cs:56`)。
+    ⇒ 紧迫度在 `[alert, 2.0]` 之间从 **0 涨到满**:
+      刚报警时 0 分(低于 `YIELD_MIN_SCORE` ⇒ 让位给旁边的人), 越接近毁掉涨得越猛。
+    ⚠ `alert=1.0` 时**与老公式逐字相同**(`(r-1)/(2-1) == r-1`) —— 老调用方行为不变。
+    ⚠ `alert` 必须 < 2.0(等于 2 就是"一报警就毁"), 用 `max(1e-6, ...)` 兜住除零。
+    """
+    span = max(1e-6, 2.0 - float(alert))
+    return BURN_URGENCY_MAX * min(1.0, (float(ratio) - float(alert)) / span)
 
 
 def score(action: str, dist: float | None, follow: float = 0.0,

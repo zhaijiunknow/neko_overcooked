@@ -353,6 +353,17 @@ class Cooking:
     cook_id: int = 0
     #: 上面那个 id 对应的资产名(只为**日志/离线**可读; 判据只用 `cook_id`)。
     cook_name: str = ""
+    #: **这是"煮"还是"搅"** —— `"cook"` / `"mix"`。
+    #: 用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"。
+    #: 搅拌器身上是 `MixingHandler`(不是 `CookingHandler`), 数据形状却**一模一样**
+    #: (prog/need/state/内容物/坐标/挂载) ⇒ 合并进同一个列表, 靠这个字段区分。
+    kind: str = "cook"
+    #: **报警从几倍开始**(`prog/need` 的比值)。这是**游戏的阈值**, 不是我们的偏好:
+    #:   · 煮: `> 1×` ⇒ OverDoing(`ServerCookingHandler`);
+    #:   · 搅: `> 1.3×` ⇒ OverDoing(`ServerMixingHandler.cs:56`)。
+    #: 两者**毁掉**的门槛都是 `> 2×`(Burnt / OverMixed, `MixingHandler.cs:16`)。
+    #: ⚠ 老 dll 没有 → 默认 1.0(等于老行为)。
+    alert: float = 1.0
 
     @property
     def ready(self) -> bool:
@@ -607,7 +618,21 @@ class KitchenMap:
                 tag=c.get("tag", ""), inside=c.get("in", ""),
                 # 老 dll 没有这两个键 ⇒ 0/"" = 未知 ⇒ 调用方退回"离我最近"那条老路
                 cook_id=int(c.get("cookId", 0) or 0),
-                cook_name=c.get("cookName", "") or ""))
+                cook_name=c.get("cookName", "") or "",
+                kind=c.get("kind", "") or "cook",
+                alert=1.0))
+        # 搅拌器**并进同一个列表**(形状一样), 只是报警阈值是 1.3 倍 —— 见 `Cooking.kind/alert`
+        for c in layout.get("mixing") or []:
+            km.cooking.append(Cooking(
+                name=c.get("name", ""), ing=c.get("ing", ""),
+                prog=float(c.get("prog", 0)), need=float(c.get("need", 0)),
+                state=c.get("state", ""), burning=bool(c.get("burning")),
+                station=c.get("station", ""),
+                x=float(c.get("x", 0)), z=float(c.get("z", 0)),
+                tag=c.get("tag", ""), inside=c.get("in", ""),
+                cook_id=int(c.get("cookId", 0) or 0),
+                cook_name=c.get("cookName", "") or "",
+                kind="mix", alert=1.3))
         return km
 
     # ---- 查询 ----

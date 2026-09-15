@@ -1003,6 +1003,149 @@ namespace Overcooked2AI.Game
             return sb.ToString();
         }
 
+        /// <summary>**搅拌进度** —— 形状**照抄 `ScanCooking`**, 因为它就是同一件事:
+        /// 一个"带进度/需时/状态/内容物"的容器挂在某张台面上。
+        ///
+        /// 用户 2026-09-15:
+        ///   > "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"
+        ///
+        /// ☠ 为什么原来完全没有: 搅拌器身上是 **`MixingHandler`**, **不是 `CookingHandler`** ⇒
+        ///   它**根本不在 `cooking` 那一份里** ⇒ "里面有什么、搅了多久"**全看不见**。
+        ///   而过搅会**毁菜**, 依据(反编译, 规则 1):
+        ///     · `ServerMixingHandler.cs:56` —— `_mixingProgress > 1.3f * m_mixingTime`
+        ///       ⇒ `CookingUIController.State.OverDoing`(**这就是"报警"**, 和锅的 OverDoing 同一个状态);
+        ///     · `MixingHandler.cs:16` —— `_mixingProgress > 2f * m_mixingTime`
+        ///       ⇒ `MixingProgress.OverMixed`(**ruined**)。
+        ///   ⇒ 和锅的 `>1×`报警 / `>2×`烧糊**结构完全一样**, 只是报警阈值是 **1.3 倍**。
+        ///
+        /// 字段(来源都是游戏自己的公开面):
+        ///   · `prog` = `ServerMixingHandler.GetMixingProgress()`
+        ///   · `need` = `ServerMixingHandler.AccessMixingTime` → `MixingHandler.m_mixingTime`
+        ///   · `state` = `ServerMixingHandler.GetMixedOrderState()` → Unmixed/Mixed/OverMixed
+        ///   · `in`   = 容器里装了什么(和锅一样靠 `ItemKnowledge.ContentsNames`)
+        ///   · `cookId`/`cookName` = `MixingHandler.m_mixingType`(`CookingStepData`, 同 `cookId` 家族)
+        ///   · `on`/`carrier` = 挂在哪 / 谁拿着(和 `ScanItems` 同一套 `MountOf`)
+        /// ⚠ **`cooking` 那一条一个字都不改** —— 新开一份 `mixing`, 由 Python 侧合并
+        ///   (改老字段会牵动已经在跑的判据)。
+        /// </summary>
+        public static string ScanMixing()
+        {
+            var sb = new StringBuilder();
+            int n = 0;
+            var mt = FindType("ClientMixingHandler");
+            if (mt == null)
+                mt = FindType("MixingHandler");
+            if (mt == null)
+                return "";                          // 这关没有搅拌器
+            // `GetMixingHandler()` 拿到的是那个带 `m_mixingTime` 的组件; 优先用它读配置
+            Type mhType = null;
+            try
+            {
+                var gm = mt.GetMethod("GetMixingHandler");
+                if (gm != null)
+                    mhType = gm.ReturnType;
+            }
+            catch (Exception) { }
+            if (mhType == null)
+                mhType = FindType("MixingHandler");
+
+            try
+            {
+                var objs = UnityEngine.Object.FindObjectsOfType(mt);
+                foreach (var o in objs)
+                {
+                    if (o == null)
+                        continue;
+                    var go = GetGameObject(o);
+                    if (go == null)
+                        continue;
+
+                    float prog = 0f, need = 0f;
+                    string state = "";
+                    try
+                    {
+                        var m = mt.GetMethod("GetMixingProgress");
+                        if (m != null)
+                            prog = (float)m.Invoke(o, null);
+                    }
+                    catch (Exception) { }
+                    try
+                    {
+                        var m = mt.GetMethod("GetMixedOrderState");
+                        if (m != null)
+                        {
+                            var v = m.Invoke(o, null);
+                            state = v == null ? "" : v.ToString();
+                        }
+                    }
+                    catch (Exception) { }
+                    // `m_mixingTime` 声明在 `MixingHandler` 上(`MixingHandler.cs:6`), 不是 Server 那份
+                    try
+                    {
+                        object mh = o;
+                        var gm = mt.GetMethod("GetMixingHandler");
+                        if (gm != null)
+                            mh = gm.Invoke(o, null);
+                        if (mh != null && mhType != null)
+                        {
+                            var hf = mhType.GetField("m_mixingTime");
+                            if (hf != null)
+                                need = (float)hf.GetValue(mh);
+                        }
+                    }
+                    catch (Exception) { }
+
+                    string inside = "";
+                    try { inside = ItemKnowledge.ContentsNames(go); }
+                    catch (Exception) { }
+                    string tag = "";
+                    try { tag = go.tag; }
+                    catch (Exception) { }
+                    // **要哪种搅拌方式**(和 `cookId` 同一个家族, 见 `CookableProperties` 那条)
+                    int cookId = 0;
+                    string cookName = "";
+                    try
+                    {
+                        object mh = o;
+                        var gm = mt.GetMethod("GetMixingHandler");
+                        if (gm != null)
+                            mh = gm.Invoke(o, null);
+                        if (mh != null && mhType != null)
+                        {
+                            var tf = mhType.GetField("m_mixingType");
+                            var step = tf != null ? tf.GetValue(mh) : null;
+                            if (step != null)
+                            {
+                                var so = step as UnityEngine.Object;
+                                if (so != null)
+                                    cookName = SafeName(so.name);
+                                var f = step.GetType().GetField("m_uID");
+                                if (f != null)
+                                    cookId = Convert.ToInt32(f.GetValue(step));
+                            }
+                        }
+                    }
+                    catch (Exception) { }
+                    // 挂在哪 / 谁拿着 —— 和 `ScanItems` **同一套**(别另写一份)
+                    string mount = "", carrier = "";
+                    try { MountOf(go, out mount, out carrier); }
+                    catch (Exception) { }
+                    var pos = go.transform.position;
+                    if (n > 0)
+                        sb.Append(",");
+                    sb.Append(string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{{\"name\":\"{0}\",\"ing\":\"{1}\",\"in\":\"{2}\",\"tag\":\"{3}\",\"prog\":{4:F1},\"need\":{5:F1},\"state\":\"{6}\",\"burning\":false,\"station\":\"\",\"x\":{7:F2},\"z\":{8:F2},\"cookId\":{9},\"cookName\":\"{10}\",\"on\":\"{11}\",\"carrier\":\"{12}\",\"kind\":\"mix\"}}",
+                        SafeName(go.name), "", SafeName(inside), SafeName(tag),
+                        prog, need, SafeName(state), pos.x, pos.z, cookId, cookName,
+                        SafeName(mount), SafeName(carrier)));
+                    n++;
+                }
+            }
+            catch (Exception) { }
+            return sb.ToString();
+        }
+
         /// <summary>烹饪进度(1× FindObjectsOfType + 每口锅几次反射)。由调用方定节奏 ——
         /// 现在挂在 StateCollector 的 0.1 秒档, 不跟台面一起每帧跑。</summary>
         public static string ScanCooking()

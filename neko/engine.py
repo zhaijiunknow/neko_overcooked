@@ -8061,17 +8061,26 @@ class Engine:
             #     没有它就没有可救的东西 —— **救到底的终点就是这个判据**。
             if not getattr(c, "busy", False):
                 continue
-            if need <= 0 or prog <= need:
+            # ☠ **报警从几倍开始, 由容器自己说** —— 煮是 `>1×`, 搅是 `>1.3×`:
+            #   `ServerMixingHandler.cs:56` `> 1.3f * m_mixingTime` ⇒ OverDoing。
+            #   (两者**毁掉**的门槛都是 `>2×`, 所以下面那条 `>= 2.0` 是共用的。)
+            #   用户 2026-09-15: "不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅"。
+            _alert = float(getattr(c, "alert", 1.0) or 1.0)
+            if need <= 0 or prog <= _alert * need:
                 continue                      # 还没到点(或数据不全)
             ratio = prog / need
             if ratio >= 2.0:
-                continue                      # 已经糊了
+                continue                      # 已经毁了(糊了 / OverMixed)
             if str(getattr(c, "burning", "")).lower() in ("true", "1"):
                 continue                      # 烧起来了 → 走灭火那条路
             x, z = getattr(c, "x", None), getattr(c, "z", None)
             if x is None or z is None:
                 continue
-            what = getattr(c, "inside", "") or getattr(c, "name", "") or "锅"
+            _mix = (getattr(c, "kind", "") or "cook") == "mix"
+            what = getattr(c, "inside", "") or getattr(c, "name", "") or ("搅拌碗" if _mix else "锅")
+            # 措辞按**容器形态**分: 说"过火"而实际是搅拌器, 会把人带偏(日志是唯一线索)
+            _past = "已经搅过头了" if _mix else "已经过火"
+            _verb = "取出来" if _mix else "端下来"
             # ☠ **走不到的那口锅要上冷板凳** —— 实测(`s_sushi_1_3`)一口**卡在 14/12 秒
             #   不再变化**的锅让 `rescue` 每轮都被选中(40 分)、每轮都"走不到旁边(差 1.00 格)",
             #   把半局烧在同一个不可能的动作上。杂活那条"本轮不再选它"只在本轮有效,
@@ -8108,10 +8117,11 @@ class Engine:
                     break
             out.append(Op(
                 "rescue", what,
-                "%s 已经过火(%.0f/%.0f 秒, 剩 %.0f 秒糊) —— 端下来" % (
-                    what, prog, need, max(0.0, 2 * need - prog)),
+                "%s %s(%.0f/%.0f 秒, 剩 %.0f 秒就毁) —— %s" % (
+                    what, _past, prog, need, max(0.0, 2 * need - prog), _verb),
                 at_name=_mount or _pot_name, at_x=x, at_z=z,
-                urgency=scoring.burn_urgency(ratio)))
+                vessel=_pot_name,
+                urgency=scoring.burn_urgency_alert(ratio, _alert)))
         return out
 
     def op_rescue(self, km, x, z, op: Op, st: dict) -> bool:
@@ -8141,6 +8151,20 @@ class Engine:
           "救锅没做成"再罚一次冷板凳。
         """
         self.log(f"[救锅] {op.note or op.target}")
+        # ☠☠ **按容器形态分派**(用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱,
+        #   平底锅**"): 下面那一整条"端下灶 → 放台面 → 放回灶"**只对锅成立** ——
+        #   锅/平底锅是 `CookingUtensil`, **能端走**;
+        #   而**搅拌碗/烤箱**是长在设备上的 ⇒ **没有东西可端**, 硬按那条链会在
+        #   "端起来"那一下把**别的**东西端走(或空按), 正解是**只把菜取出来**。
+        #   判据用 `km.items` 的 tag(`ScanItems` 现在扫 `CookingUtensil`)—— **问游戏**, 不猜名字。
+        vessel = (getattr(op, "vessel", "") or "")
+        carryable = False
+        for _it in (getattr(km, "items", None) or []):
+            if _it.name == vessel and (_it.tag or "") == "CookingUtensil":
+                carryable = True
+                break
+        if vessel and not carryable:
+            return self._rescue_in_place(km, x, z, op)
         # 手上有东西时先腾 —— 拿/放是**同一个键**(规则 4), 端着东西按拾取 = 把那件放下。
         _, _, held0 = self.pos(self.state(force=True) or {})
         if held0:
@@ -8214,6 +8238,41 @@ class Engine:
             self.log(f"[救锅] ✓ 菜已进盘, 锅已放回 {stove.id}")
         else:
             self.log("[救锅] ⚠ 锅没能放回灶上(放不上去) —— 菜已经救下来了")
+        return True
+
+    def _rescue_in_place(self, km, x, z, op: Op) -> bool:
+        """**设备端不走的救**: 拿干净盘把里面的东西取出来,**设备一动不动**。
+
+        用在哪: **搅拌碗 / 烤箱 / 炸锅** —— 它们长在台面上, 不是能端走的锅
+        (用户 2026-09-15: "不只是锅, 其他一样的, **搅拌器**, 烤箱, 平底锅")。
+        与"端锅"那条链的区别: **没有"端下来"和"放回去"两步** —— 因为设备本来就在它该在的地方,
+        要停的只是"继续加工"(取空了就不再加温/再搅) ⇒ 取出来之后报警条件自然不成立。
+
+        ⚠ **取菜的机制和锅共用 `_take_from_pot`**(都是"手拿盘对着容器按交互") ——
+          但**搅拌器的转运分支没有离线验证过**(锅那条是反编译 + 实机双证)。
+          所以要盯日志: 若反复 `⚠ 菜没取出来`, 说明搅拌器的取菜走的是另一条路, 得单独查。
+        """
+        what = op.target
+        self.log(f"[救锅] {what} 的容器({op.vessel!r})**端不走**(长在设备上) —— 只把菜取出来")
+        plate_type = self._plate_type_now()
+        if not self._get_plate_for_pot(km, x, z, plate_type, taking=what):
+            self.log("[救锅] ⚠ 拿不到干净盘子 —— 取不出来")
+            return False
+        holder = self._station_named(km, op.at_name)
+        if holder is None:
+            self.log(f"[救锅] 找不到 {op.at_name!r} 那张台面 —— 取不出来")
+            return False
+        if not self._take_from_pot(holder, op):
+            self.log("[救锅] ⚠ 菜没取出来(设备还在继续加工) —— 这一步算失败")
+            return False
+        # 盘子进摆盘位(把菜并进那道菜那盘), 顺手腾空手
+        sp = self.assemble_spot
+        if sp is not None:
+            if self.navigate_smart(km, sp.x, sp.z, tight=0.6):
+                self.interact("pickup", verify_hold_change=True)
+            else:
+                self.log(f"[救锅] 走不到摆盘位 {sp.id} —— 菜先端在手上")
+        self.log(f"[救锅] ✓ {what} 已取出, 设备留在 {holder.id}(空了就不会再报警)")
         return True
 
     def _plate_type_now(self) -> str:

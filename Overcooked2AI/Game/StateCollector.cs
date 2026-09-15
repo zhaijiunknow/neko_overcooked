@@ -21,6 +21,15 @@ namespace Overcooked2AI.Game
         /// <summary>烹饪进度 —— 0.1 秒刷新(1× FindObjectsOfType + 每口锅几次反射)。</summary>
         private string _cookCache = "[]";
         private float _lastCookScan = -10f;
+        /// <summary>**搅拌进度** —— 0.1 秒刷新, 和烹饪同一档。
+        ///
+        /// ☠ 为什么必须单独扫(用户 2026-09-15: "**不只是锅, 其他一样的, 搅拌器, 烤箱, 平底锅**"):
+        ///   搅拌器身上是 `MixingHandler`, **不是 `CookingHandler`** ⇒ 它**根本不在
+        ///   `cooking` 那一份里** ⇒ "里面有什么、搅了多久"**全看不见**,
+        ///   而过搅会**毁菜**(`ServerMixingHandler.cs:56` `>1.3×` 报 OverDoing、
+        ///   `MixingHandler.cs:16` `>2×` 直接 OverMixed) —— 和烧糊是同一类损失, 却零防线。
+        /// 形状**照抄 `ScanCooking`**(同一套 prog/need/state/坐标/挂载), 见那边的注释。</summary>
+        private string _mixCache = "[]";
         /// <summary>**全场景按 tag 找的食材** —— 0.1 秒刷新。
         /// 补的是"不在台面上的食材看不见"这个盲区(掉地上的/移动平台上的)。
         /// 依据: 游戏自己的 `GameUtils.GetAllIngredients()`(GameUtils.cs:504)。</summary>
@@ -196,6 +205,11 @@ namespace Overcooked2AI.Game
                         _cookCache = SceneScanner.ScanCooking();
                     }
                     catch (Exception) { }
+                    try
+                    {
+                        _mixCache = SceneScanner.ScanMixing();     // 同一个 0.1 秒档
+                    }
+                    catch (Exception) { }
                 }
 
                 // 会动的东西(路人/车辆/移动危险物): 0.1 秒 —— 地形快照看不见它们
@@ -266,7 +280,8 @@ namespace Overcooked2AI.Game
                        + ",\"chefs\":" + _chefsCache
                        + ",\"items\":" + _itemsCache
                        + ",\"movers\":" + _moversCache
-                       + ",\"cooking\":[" + _cookCache + "]}";
+                       + ",\"cooking\":[" + _cookCache + "]"
+                       + ",\"mixing\":[" + _mixCache + "]}";
                 recipePool = _recipeCache;
             }
             else
@@ -278,6 +293,7 @@ namespace Overcooked2AI.Game
                 _chefsCache = "[]";
                 _stationsCache = "[]";
                 _cookCache = "[]";
+                _mixCache = "[]";
                 _itemsCache = "[]";
                 _moversCache = "[]";
                 // 台面静态缓存的引用会指向已销毁的对象 —— 换关必须作废重建
