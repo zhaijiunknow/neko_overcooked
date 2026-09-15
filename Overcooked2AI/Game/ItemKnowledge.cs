@@ -177,6 +177,65 @@ namespace Overcooked2AI.Game
             sb.Append(",\"station\":\"").Append(Safe(station)).Append("\"");
             sb.Append(string.Format(",\"cookTime\":{0:F1}", cookTime));
 
+            // ☠☠ **这个食材允许进哪些容器**(加热方式) —— "米进锅、肉进平底锅"那条规矩的
+            //    权威来源, 也是游戏**拒收**时的判据。
+            //
+            // 依据(反编译, 规则 1):
+            //   `CookableContainer.cs:46-47`
+            //       var cp = _object.RequestComponent<CookableProperties>();
+            //       if (cp == null || !cp.AllowsCookingStep(_handler.AccessCookingType)) return false;
+            //   `CookableProperties.cs:11-13`  `AllowedCookingSteps` 是 `CookingStepData[]`,
+            //       判据是 **比 `m_uID`**(`x.m_uID == _stepData.m_uID`)。
+            //   ⇒ 把这张表报出来, Python 侧就能拿它跟 `ScanCooking` 报的
+            //     `容器.cookId` 对上 —— **不再靠"离我最近"猜哪口锅**。
+            //   没有这个组件(生料/成品) ⇒ 空数组, 调用方退回老行为。
+            // ⚠ `m_uID` 是 `[SelfAssignID]` 的运行时整数: **只在同一局内可比值** ——
+            //   而我们两边都现读, 正好够用(不需要跨会话稳定)。
+            // ⚠ 名字只给日志/离线看; **判据只用 id**(名字可能重复或为空)。
+            sb.Append(",\"cookSteps\":[");
+            try
+            {
+                var cpt = SceneScanner.FindType("CookableProperties");
+                if (cpt != null)
+                {
+                    var cp = go.GetComponent(cpt);
+                    if (cp != null)
+                    {
+                        var f = cpt.GetField("AllowedCookingSteps",
+                            System.Reflection.BindingFlags.Instance
+                            | System.Reflection.BindingFlags.Public
+                            | System.Reflection.BindingFlags.NonPublic);
+                        var arr = f != null ? f.GetValue(cp) as Array : null;
+                        if (arr != null)
+                        {
+                            int m = 0;
+                            foreach (var e in arr)
+                            {
+                                if (e == null)
+                                    continue;
+                                var so = e as UnityEngine.Object;
+                                string nm = so != null ? Safe(so.name) : "";
+                                int id = 0;
+                                try
+                                {
+                                    var idf = e.GetType().GetField("m_uID");
+                                    if (idf != null)
+                                        id = Convert.ToInt32(idf.GetValue(e));
+                                }
+                                catch (Exception) { }
+                                if (m > 0)
+                                    sb.Append(",");
+                                sb.Append(string.Format(
+                                    "{{\"id\":{0},\"name\":\"{1}\"}}", id, nm));
+                                m++;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            sb.Append("]");
+
             // 箱子出什么
             string spawn = "";
             string spawnIng = "";    // 箱子直接出的东西的食材名(直接可用)
