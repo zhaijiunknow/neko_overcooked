@@ -3576,10 +3576,13 @@ class Engine:
         if not self._approach(km, mk.x, mk.z, tight=0.8):
             return False
         if held:
-            # 放进容器(游戏把它塞进搅拌台上的那个 IMixable 容器里)
-            if not self.interact("pickup", verify_hold_change=True):
-                self.log(f"[步骤] ✗ {held!r} 放不进搅拌台(是容器不接受它, 还是站位不对?)")
-                return False
+            # ☠☠ **到这里手上不该还有东西** —— 料是由前面那些 `into_bowl` 的
+            #   `assemble` 一步步放进碗的(`derive` 把 mix 组的落点从盘换成了碗)。
+            #   手上还攥着东西说明那一步没做完 ⇒ **别在这儿硬放**(会放错东西/多放一份),
+            #   如实失败, 让外层重选。
+            self.log(f"[步骤] ✗ 手上还有 {held!r} —— 料还没放进碗(前面那步没做完), "
+                     f"这一步不硬放")
+            return False
         before = self._station_items(mk.id)
         # **等**: 搅拌是"放上去自动开始 + 计时"的, 没有按键可连打(见 docstring)。
         t0 = _t.time()
@@ -4785,6 +4788,28 @@ class Engine:
           · 直接放到摆盘位 —— 那儿本来就有盘子时, 手上这盘会并进它。
         """
         _, _, held = self.pos(st)
+        # ☠☠ **目的地是【碗】的那些**(`Op.into_bowl`, mix 组)⇒ 去**搅拌台**放,
+        #   不走摆盘位这条路。用户 2026-09-15: "碗的容量是'<=4 份任意处理过的料'……
+        #   **碗的内容物无法和盘子交互**" ⇒ 这一组料的落点是**碗**, 不是盘。
+        #   ⚠ 动作形状和摆盘**一模一样**(走过去 + 放置键), 只是台子不同 ⇒
+        #     只在**开头**分流; 下面那套摆盘判据(`_ensure_plate`/并盘核对/空盘闸门)
+        #     **一行都不碰** —— 它们的每一条都是踩出来的, 别让新路绕过去。
+        if getattr(op, "into_bowl", False):
+            mk = km.nearest("mix", x, z)
+            if mk is None:
+                self.log("[步骤] 放不进碗: 这关没有搅拌台")
+                return False
+            if not held:
+                self.log(f"[步骤] 放不进碗: 手上是空的({op.target!r} 不在手上)")
+                return False
+            if not self._approach(km, mk.x, mk.z, tight=0.8):
+                self.log(f"[步骤] 走不到搅拌台 {mk.id} 旁边")
+                return False
+            if not self.interact("pickup", verify_hold_change=True):
+                self.log(f"[步骤] ✗ {held!r} 没放进碗(搅拌台 {mk.id})")
+                return False
+            self.log(f"[步骤] ✓ {op.target} 进了碗(搅拌台 {mk.id})")
+            return True
         if not held:
             # ⚠ **手空不能无条件当成功**。手空有两种来路:
             #   ① 这一步本来就没什么可做(极少);
@@ -5780,6 +5805,13 @@ class Engine:
                 s, _p, _c = self._pick_stove(km, x, z, False, claim=False, ing=op.target)
             return ((s.x, s.z), s.id) if s else (None, "没有能用的灶台")
         if a == "assemble":
+            # ☠ **目的地是碗的那些**(mix 组, `Op.into_bowl`)⇒ 去**搅拌台**,
+            #   而不是摆盘位 —— 用户: "碗的内容物无法和盘子交互"。
+            #   ⚠ 复用 `mix` 那条的解析方式(`km.nearest("mix")`), 保证"算分和执行的
+            #     是同一个台子"(和 `mix` 的可行性分支同一行惯用法)。
+            if getattr(op, "into_bowl", False):
+                mk = km.nearest("mix", x, z)
+                return ((mk.x, mk.z), mk.id) if mk else (None, "这关没有搅拌台(放不进碗)")
             sp = self.assemble_spot                     # 只读 —— 见上面那段警告
             return ((sp.x, sp.z), sp.id) if sp else (None, "还没挑摆盘位")
         if a == "deliver":
@@ -6056,6 +6088,16 @@ class Engine:
             return False, (f"手上是 {held!r} 不是 {op.target}" if held
                            else "手上没有可煮的")
         if a == "assemble":
+            # ☠☠ **放进碗**(mix 组): 手上就是要放进去的那份, 而且**这关得有搅拌台**。
+            #   不查"碗在不在/满没满" —— 那要 `ScanMixing` 的实时数据, 由 `op_assemble`
+            #   到跟前再判(探测层刻意不碰那么多), 而且满了游戏会自己拒收。
+            if getattr(op, "into_bowl", False):
+                if self._held_is(held, op.target) and km.nearest("mix", x, z) is not None:
+                    return True, ""
+                if km.nearest("mix", x, z) is None:
+                    return False, "这关没有搅拌台(放不进碗)"
+                return False, (f"手上是 {held!r} 不是 {op.target}" if held
+                               else f"手空, 没东西可放进碗({op.target} 不在手上)")
             # 手上端着盘子也算 —— "用锅煮"的菜取出来时手上已经端着那盘菜了,
             # 见 op_assemble 的 docstring。
             # (⚠ 阶段闸门不在这儿 —— 它必须排在下面 `_preposed_ok` 那条捷径**之前**,

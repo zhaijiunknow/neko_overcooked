@@ -220,6 +220,51 @@ def walk(node, chain: tuple = ()):
         yield from walk(child, chain + (("opt", None),))
 
 
+def walk_groups(tree) -> list:
+    """`walk()` 的**分组版** —— 同一个 `mix` 节点下的叶子**归一组**(共用一个搅拌碗)。
+
+    返回 `[(mix_key, kind, name, chain), …]`, `mix_key`:
+      · `None`     —— 这个叶子**不在**任何 `mix` 节点下 ⇒ 沿用老链(fetch→chop→cook→assemble);
+      · 其它整数   —— **同一个值 = 同一个碗**。用递增整数(而不是 `id(node)`)是为了
+                      **可打印、可离线核对**。
+
+    为什么需要它(用户 2026-09-15 的规格):
+      > "碗的容量是'**≤4 份任意处理过的料**'。……搅完之后**碗里是一个成品**,
+      >  碗的内容物**无法和盘子交互**。"
+      ⇒ **一个 `mix` 节点 = 一个碗 = 一次搅**。而 `derive` 原来对**每个叶子**各发一条
+        `mix` ⇒ 一棵"蛋+面粉"的树会**搅两次、每次一份**(结果完全不同)。
+      ⇒ 分组信息**只有在树的结构里**(`walk()` 的链上看不出"这两个叶子是不是同一个碗")。
+
+    ⚠ **不改用 `walk()`** —— 它还有别的调用方(`tools/brief.py --chain`、自检),
+      改它的产出形状会把那些一起打断。**并列一个新函数, 老的原样不动**。
+    ⚠ 嵌套 `mix` 时取**最近**的那个(内层覆盖外层) —— 内层才是真正那口碗。
+    """
+    out = []
+    counter = [0]
+
+    def rec(node, chain, cur):
+        if not isinstance(node, dict):
+            return
+        k = node.get("k")
+        if k in ("ing", "item"):
+            out.append((cur, k, node.get("n", ""), chain))
+            return
+        if k == "null":
+            return
+        mark = (k, node.get("p"))
+        nxt = cur
+        if k == "mix":
+            counter[0] += 1
+            nxt = counter[0]           # **最近的那个** mix
+        for c in node.get("i") or []:
+            rec(c, chain + (mark,), nxt)
+        for c in node.get("o") or []:
+            rec(c, chain + (("opt", None),), nxt)
+
+    rec(tree, (), None)
+    return out
+
+
 def steps_text(node) -> str:
     """把配方树压成一行人类可读文本。"""
     if not isinstance(node, dict):
@@ -407,6 +452,24 @@ class Op:
     #: ⇒ 给个显式字段, 别让 `op_rescue` 去猜(这个文件里"别赌"的教训写过好几次)。
     #: 空串 = 没填 ⇒ 退回老行为(按锅处理)。
     vessel: str = ""
+    #: **这一条 `mix` 要一起进碗的还有哪几份**(`target` 是其中一份)。
+    #:
+    #: ☠☠ 用户 2026-09-15 的规格(原话):
+    #:   > "碗的容量是'**≤4 份任意处理过的料**'。**蛋和面粉直接放进碗就行**。
+    #:   >  搅完之后**碗里是一个成品**, **碗的内容物无法和盘子交互**。"
+    #: ⇒ **一个 `mix` 节点 = 一个碗 = 一次搅**: 那一组 ≤4 份**一起**进去,
+    #:   而不是像原来那样**每个叶子各搅一次**(那会变成"各自搅一份", 结果完全不同)。
+    #: ⚠ `members` 只对 `mix` 有意义, 其余动作是空列表。
+    members: list = field(default_factory=list)
+    #: **这一步"腾手"的目的地是【搅拌碗】, 不是盘子**(只有 `assemble` 会填)。
+    #:
+    #: 用户 2026-09-15 的规格(原话):
+    #:   > "碗的容量是'**≤4 份任意处理过的料**'。……搅完之后**碗里是一个成品**,
+    #:   >  **碗的内容物无法和盘子交互**。"
+    #: ⇒ mix 组里每份料的落点是**搅拌台上的那个碗**(而不是摆盘位)。
+    #:   形状和普通 `assemble` **完全一样**(走过去 + 放置键), 只是目的地换了一个 ——
+    #:   所以复用 `assemble`, 只加这一个开关, 不新开动作类型。
+    into_bowl: bool = False
 
     def __str__(self) -> str:
         extra = f"  ({self.note})" if self.note else ""
@@ -466,7 +529,47 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
     tree = detail.get("tree")
     ops = []
 
-    for kind, name, chain in walk(tree):
+    #: **同一个 `mix` 节点 = 一个碗** —— 这一组的"收尾"要在它最后一份之后发,
+    #: 所以循环里先记账、到边界(`_flush_group`)再吐 `mix`/`cook`。
+    _seg = {"mk": "__none__", "leads": [], "cooked": False}
+
+    def _flush_group():
+        """一个 `mix` 节点收尾 —— **一个碗、一次搅**。
+
+        用户 2026-09-15 的规格:
+          > "碗的容量是'**≤4 份任意处理过的料**'。……搅完之后**碗里是一个成品**,
+          >  **碗的内容物无法和盘子交互**。"
+        ⇒ ① 这一组 ≤4 份**一起**进碗搅**一次**(而不是每个叶子各搅一次);
+          ② 搅完的产物**不再发 `assemble`**(内容物进不了盘);
+          ③ 如果这条链还带 `cook`(烤箱), 那一步的**前置是"手上端着那个碗"**
+             (用户: "烤箱的前置是搅拌碗") —— 判据在 `_op_actionable` 放宽。
+        """
+        leads = _seg["leads"]
+        if not leads:
+            return
+        lead, rest = leads[0], leads[1:]
+        ops.append(Op("mix", lead,
+                      f"这 {len(leads)} 份**一起进碗**搅一次"
+                      + (f"(还有 {', '.join(rest)})" if rest else ""),
+                      members=list(rest)))
+        if _seg["cooked"]:
+            ops.append(Op("cook", lead,
+                          "搅完的**碗**端到灶前 —— **前置是碗, 不是料**"))
+        # ⚠ 组里每份料的 `assemble` 在前面已经发过了, 但**落点是碗**(`into_bowl=True`)
+        #   —— 这里只补"搅"那一下和它之后的 `cook`。
+
+    for _mk, kind, name, chain in walk_groups(tree) + [(None, "__end__", "", ())]:
+        # **组的边界**: mix_key 变了就把上一组收尾(文档序上同一组的叶子本来就连续)
+        if _mk != _seg["mk"]:
+            if _seg["mk"] is not None:
+                _flush_group()
+            _seg["mk"], _seg["leads"], _seg["cooked"] = _mk, [], False
+        if kind == "__end__":
+            break
+        _grouped = _mk is not None          # 在 mix 组里 ⇒ cook/mix/assemble 都留给收尾
+        if _grouped and kind != "item" and name:
+            _seg["leads"].append(name)
+            _seg["cooked"] = _seg["cooked"] or ("cook" in [c for c, _ in chain])
         kinds = [c for c, _ in chain]
         cooked = "cook" in kinds
         mixed = "mix" in kinds
@@ -514,7 +617,7 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
             ops.append(Op("fetch", name, "⚠ 找不到货源(箱子/生料/成品都没匹配上)",
                           optional=optional, nosrc=True))
 
-        if cooked:
+        if cooked and not _grouped:
             tool = kb.cook_tool_for(name)
             if tool is not None:
                 note = f"用 {tool.station}, {tool.cookTime:.0f}s 熟 / 超 {2 * tool.cookTime:.0f}s 就焦"
@@ -530,12 +633,19 @@ def derive(detail: dict, kb: Knowledge) -> DishFlow:
                 in_pot = True
             ops.append(Op("cook", name, note, wait=wait, optional=optional,
                           in_pot=in_pot))
-        if mixed:
+        if mixed and not _grouped:
             ops.append(Op("mix", name, "需要搅拌", optional=optional))
 
         # 这个材料处理完 → 立刻放到组装台面, 把手腾出来给下一个材料
+        # ☠ 但 **mix 组里的不发** —— 碗的产物进不了盘(见 `_flush_group`)。
         if not optional and not kind == "item":
-            ops.append(Op("assemble", name, "把这个材料放到组装台面"))
+            if _grouped:
+                # ☠ **mix 组里"腾手"的目的地是【碗】** —— 见 `Op.into_bowl`。
+                #   用户: "碗的内容物**无法和盘子交互**" ⇒ 这组料**不能往盘里放**。
+                ops.append(Op("assemble", name, "放进**搅拌碗**(不是盘)",
+                              optional=optional, into_bowl=True))
+            else:
+                ops.append(Op("assemble", name, "把这个材料放到组装台面"))
 
     if any(op.action != "tool" for op in ops):
         # 这里**不生成"取盘子"步骤**: 摆盘不是独立动作。
